@@ -2,7 +2,7 @@
 -- @author kkonstantin2000
 -- @version 1.0
 -- @provides
---   ImportMusicXML.lua
+--   konst_Import MusicXML.lua
 -- @changelog
 --   Initial release
 
