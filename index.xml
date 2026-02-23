@@ -24,15 +24,15 @@
 {\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Creates separate MIDI tracks for each staff\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Installation\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel3 \b \fs24 Via ReaPack (recommended)\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab In REAPER, open {\b Extensions \u8594 ? ReaPack \u8594 ? Manage Repositories}\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Click {\b Add} and enter: {\f1 https://github.com/kkonstantin2000/konst_reascripts/raw/master/index.xml}\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab In REAPER, open {\b Extensions \u8594 ? ReaPack \u8594 ? Import Repositories}\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Paste this link - https://raw.githubusercontent.com/kkonstantin2000/konst_reascripts/master/index.xml\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 3.\tx360\tab Click {\b OK}, then {\b Synchronize}\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab Find the script in the Action List: {\f1 Script: Import MusicXML.lua}\sa180\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab Find the script in the Action List: {\f1 Script: konst_Import MusicXML.lua}\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel3 \b \fs24 Manual\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Download {\f1 konst_Import MusicXML.lua} from the {\f1 ImportMusicXML} folder and place it in your REAPER Scripts directory.\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Usage\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab Run the script from the Action List.\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Select an uncompressed {\f1 .xml} file (MusicXML).\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Press button "Select File" and select uncompressed {\f1 .xml} file (MusicXML) in File Explorer.\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 3.\tx360\tab Choose whether to import tempo/time signature markers.\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab New tracks will be created with MIDI items containing notes and text events.\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 For best results with ReaTab Hero, make sure the target track has the proper string tuning set (the script can now store tuning as track ExtState \u8211- see below).\par}
