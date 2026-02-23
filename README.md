@@ -22,7 +22,7 @@ This script imports an uncompressed MusicXML file (e.g., from Guitar Pro) into R
 
 #### Manual
 
-- Download `ImportMusicXML.lua` from the `ImportMusicXML` folder and place it in your REAPER Scripts directory.
+- Download `konst_Import MusicXML.lua` from the `ImportMusicXML` folder and place it in your REAPER Scripts directory.
 
 ### Usage
 
