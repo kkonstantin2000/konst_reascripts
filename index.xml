@@ -29,7 +29,7 @@
 {\pard \ql \f0 \sa0 \li360 \fi-360 3.\tx360\tab Click {\b OK}, then {\b Synchronize}\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab Find the script in the Action List: {\f1 Script: Import MusicXML.lua}\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel3 \b \fs24 Manual\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Download {\f1 ImportMusicXML.lua} from the {\f1 ImportMusicXML} folder and place it in your REAPER Scripts directory.\sa180\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Download {\f1 konst_Import MusicXML.lua} from the {\f1 ImportMusicXML} folder and place it in your REAPER Scripts directory.\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Usage\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab Run the script from the Action List.\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Select an uncompressed {\f1 .xml} file (MusicXML).\par}
