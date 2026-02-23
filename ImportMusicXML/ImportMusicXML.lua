@@ -1,19 +1,16 @@
--- @description Import MusicXML (with string/fret positions)
+-- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes, supporting custom drum channel mapping and robust repeats
 -- @author kkonstantin2000
 -- @version 1.0
 -- @provides
 --   ImportMusicXML.lua
 -- @changelog
 --   Initial release
---[[
-  Description: Select an uncompressed MusicXML (.xml) file. Creates new tracks
-               and MIDI items for each staff that contains tablature notes or
-               drum notes. Drum parts now use a configurable channel mapping
-               so each drum instrument (kick, snare, etc.) can be placed on a
-               separate MIDI channel.
 
-  Version with repeat expansion (forward/backward repeats are honoured)
-  and robust XML parser that handles CDATA sections and processing instructions.
+--[[
+  Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
+  Drum parts use a configurable channel mapping so instruments like kick, snare, etc. can be assigned to separate MIDI channels.
+
+  This version supports expansion of repeats (forward/backward), with a robust XML parser that handles CDATA sections and processing instructions.
 
   Mute handling:
     - straight mute: type 1 text event, symbol "x", replaces fret, no underscore
@@ -21,9 +18,9 @@
 
   Slide handling (modified):
     - Slides (slide, slide-up, slide-down) are detected as start/stop pairs.
-    - A single text event is placed halfway between the two notes (currently at the second note).
-    - If a slide has no matching partner, it is placed on the note as before.
---]]
+    - Single text event is placed at the second note for paired slides.
+    - If no partner, the slide is placed as before.
+]]
 
 -- ============================================================================
 -- USER‑CONFIGURABLE SETTINGS
