@@ -15,10 +15,10 @@ This script imports an uncompressed MusicXML file (e.g., from Guitar Pro) into R
 
 #### Via ReaPack (recommended)
 
-1. In REAPER, open **Extensions → ReaPack → Manage Repositories**
-2. Click **Add** and enter: `https://github.com/kkonstantin2000/konst_reascripts/raw/master/index.xml`
+1. In REAPER, open **Extensions → ReaPack → Import Repositories**
+2. Paste this link - https://raw.githubusercontent.com/kkonstantin2000/konst_reascripts/master/index.xml
 3. Click **OK**, then **Synchronize**
-4. Find the script in the Action List: `Script: Import MusicXML.lua`
+4. Find the script in the Action List: `Script: konst_Import MusicXML.lua`
 
 #### Manual
 
@@ -27,7 +27,7 @@ This script imports an uncompressed MusicXML file (e.g., from Guitar Pro) into R
 ### Usage
 
 1. Run the script from the Action List.
-2. Select an uncompressed `.xml` file (MusicXML).
+2. Press button "Select File" and select uncompressed `.xml` file (MusicXML) in File Explorer.
 3. Choose whether to import tempo/time signature markers.
 4. New tracks will be created with MIDI items containing notes and text events.
 
