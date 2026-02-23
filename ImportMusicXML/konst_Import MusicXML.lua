@@ -1,4 +1,4 @@
--- @description Import uncompressed MusicXML (.xml) files; create tracks/MIDI for each staff with tablature or drum notes. Supports custom drum channel mapping, robust repeats, and XML parsing.
+-- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes, supporting custom drum channel mapping and robust repeats
 -- @author kkonstantin2000
 -- @version 1.0
 -- @provides
@@ -7,21 +7,19 @@
 --   Initial release
 
 --[[
-  This script lets you select an uncompressed MusicXML (.xml) file and generates new tracks and MIDI items for each staff that contains tablature or drum notes.
-  Drum parts use a configurable channel mapping, so instruments like kick and snare can each go to separate MIDI channels.
+  Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
+  Drum parts use a configurable channel mapping so instruments like kick, snare, etc. can be assigned to separate MIDI channels.
 
-  Features:
-    • Robust repeat expansion (supports forward/backward repeat notation)
-    • Resilient XML parser (handles CDATA, processing instructions, and comments)
-  
+  This version supports expansion of repeats (forward/backward), with a robust XML parser that handles CDATA sections and processing instructions.
+
   Mute handling:
     - straight mute: type 1 text event, symbol "x", replaces fret, no underscore
     - palm mute:    type 6 marker, symbol "P.M___", does not replace fret, no underscore
 
-  Slide handling:
-    - Slides (slide, slide-up, slide-down) are matched as start/stop pairs.
-    - A single text event is placed at the second note for each matched pair.
-    - Lone slides are handled as before.
+  Slide handling (modified):
+    - Slides (slide, slide-up, slide-down) are detected as start/stop pairs.
+    - Single text event is placed at the second note for paired slides.
+    - If no partner, the slide is placed as before.
 ]]
 
 -- ============================================================================
@@ -1883,7 +1881,7 @@ local vertical_margin = 20  -- top/bottom margin
 local button_height_area = 50  -- space for import button
 
 -- Calculate max label width for aligned checkboxes
-gfx.setfont(1, "Outfit", gui.settings.font_size)
+gfx.setfont(1, "Outfit|Arial|Helvetica", gui.settings.font_size)
 local max_label_width = 0
 for i, cb in ipairs(checkboxes_list) do
     local label_width = gfx.measurestr(cb.name)
