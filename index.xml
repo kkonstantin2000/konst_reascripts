@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="f58a293374e08ee8f297e79dd145b6600ae807df">
+<index version="1" name="konst_reascripts" commit="e528b5c58611057b36dd109217d31233bed7583c">
   <category name="Example">
     <reapack name="cfillion_Hello world.lua" type="script" desc="Hello world">
       <metadata>
@@ -22,7 +22,7 @@ Markdown
     </reapack>
   </category>
   <category name="ImportMusicXML">
-    <reapack name="ImportMusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes, supporting custom drum channel mapping and robust repeats">
+    <reapack name="ImportMusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files; create tracks/MIDI for each staff with tablature or drum notes. Supports custom drum channel mapping, robust repeats, and XML parsing.">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T10:24:16Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/f58a293374e08ee8f297e79dd145b6600ae807df/ImportMusicXML/ImportMusicXML.lua</source>
