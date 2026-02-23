@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="4514e4a97ffc9b20d57157653c6fd88105f2384e">
+<index version="1" name="konst_reascripts" commit="421ebe9649f05dcf615649214c5ed17ea88ed633">
   <category name="ImportMusicXML">
-    <reapack name="konst_Import MusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files; create tracks/MIDI for each staff with tablature or drum notes. Supports custom drum channel mapping, robust repeats, and XML parsing.">
+    <reapack name="konst_Import MusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes, supporting custom drum channel mapping and robust repeats">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/4514e4a97ffc9b20d57157653c6fd88105f2384e/ImportMusicXML/konst_Import%20MusicXML.lua</source>
