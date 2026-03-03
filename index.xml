@@ -26,7 +26,12 @@ v1.0 - Initial release]]></changelog>
 {\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Handles drum parts with configurable per\u8209 ?family channel mapping\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Expands repeats (forward/backward) and respects chord offsets\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Optionally imports tempo and time signature markers\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Creates separate MIDI tracks for each staff\sa180\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Creates separate MIDI tracks for each staff\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab {\b Three insertion modes}:\par}
+{\pard \ql \f0 \sa0 \li720 \fi-360 \endash \tx360\tab {\b Create new tracks}: original behavior \u8211- creates a new track for each staff.\par}
+{\pard \ql \f0 \sa0 \li720 \fi-360 \endash \tx360\tab {\b Insert on existing tracks}: places MIDI items on currently selected tracks (one staff per selected track, in order).\par}
+{\pard \ql \f0 \sa0 \li720 \fi-360 \endash \tx360\tab {\b Match tracks by name}: automatically maps staves to existing tracks based on track names (e.g., "Guitar", "Bass", etc.).\sa180\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Stores string tuning as track ExtState for compatibility with ReaTab Hero (ensures correct display of tablature).\sa180\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Installation\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel3 \b \fs24 Via ReaPack (recommended)\par}
 {\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab In REAPER, open {\b Extensions \u8594 ? ReaPack \u8594 ? Import Repositories}\par}
