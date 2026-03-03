@@ -1,10 +1,11 @@
--- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes, supporting custom drum channel mapping and robust repeats
+-- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.
 -- @author kkonstantin2000
--- @version 1.0
+-- @version 1.1
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
---   Initial release
+--   v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
+--   v1.0 - Initial release
 
 --[[
   Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
@@ -1165,7 +1166,9 @@ function ImportMusicXMLWithOptions(filepath, options)
   -- 3. Use options from GUI (or defaults if not provided)
   local import_markers = (options and options.import_markers) or false
   local import_regions = (options and options.import_regions) or false
-  local insert_at_cursor = (options and options.insert_at_cursor) or false
+  local insert_on_new_tracks = (options and options.insert_on_new_tracks) or false
+  local insert_on_existing_tracks = (options and options.insert_on_existing_tracks) or false
+  local insert_on_tracks_by_name = (options and options.insert_on_tracks_by_name) or true
 
   -- 5. Get project's ticks per quarter note (PPQ)
   local ppq = reaper.SNM_GetIntConfigVar("miditicksperbeat", 960)
@@ -1717,6 +1720,15 @@ function ImportMusicXMLWithOptions(filepath, options)
   -- 12. Create tracks for each part/staff that has notes (in MusicXML order)
   local initial_track_count = reaper.CountTracks(0)
   local tracks_created = 0
+  local next_existing_track_idx = 0  -- Track index for "insert on existing tracks" mode
+  
+  -- Determine insertion mode
+  local mode = "new_tracks"  -- default
+  if insert_on_existing_tracks then
+    mode = "existing_tracks"
+  elseif insert_on_tracks_by_name then
+    mode = "tracks_by_name"
+  end
   
   for _, part_id in ipairs(parts_order) do
     local data = all_parts_data[part_id]
@@ -1734,17 +1746,61 @@ function ImportMusicXMLWithOptions(filepath, options)
     for staff = 1, max_staff do
       local notes = staff_notes[staff]
       if notes and #notes > 0 then
-        -- Create track at proper index (works for both empty and non-empty projects)
-        local insert_index = initial_track_count + tracks_created
-        reaper.InsertTrackAtIndex(insert_index, true)
-        local track = reaper.GetTrack(0, insert_index)
-        tracks_created = tracks_created + 1
-
+        local track = nil
         local track_name = base_track_name
         if max_staff > 1 then
           track_name = track_name
         end
-        reaper.GetSetMediaTrackInfo_String(track, "P_NAME", track_name, true)
+        
+        -- Determine which track to insert on based on mode
+        if mode == "new_tracks" then
+          -- Create a new track
+          local insert_index = initial_track_count + tracks_created
+          reaper.InsertTrackAtIndex(insert_index, true)
+          track = reaper.GetTrack(0, insert_index)
+          tracks_created = tracks_created + 1
+          reaper.GetSetMediaTrackInfo_String(track, "P_NAME", track_name, true)
+          
+        elseif mode == "existing_tracks" then
+          -- Try to use existing tracks, starting from the first (or selected) track
+          local total_tracks = reaper.CountTracks(0)
+          
+          if next_existing_track_idx < total_tracks then
+            -- Use existing track
+            track = reaper.GetTrack(0, next_existing_track_idx)
+            next_existing_track_idx = next_existing_track_idx + 1
+          else
+            -- No more existing tracks, create a new one
+            local insert_index = next_existing_track_idx
+            reaper.InsertTrackAtIndex(insert_index, true)
+            track = reaper.GetTrack(0, insert_index)
+            next_existing_track_idx = next_existing_track_idx + 1
+            reaper.GetSetMediaTrackInfo_String(track, "P_NAME", track_name, true)
+          end
+          
+        elseif mode == "tracks_by_name" then
+          -- Try to find a track with matching name
+          local total_tracks = reaper.CountTracks(0)
+          track = nil
+          
+          for i = 0, total_tracks - 1 do
+            local existing_track = reaper.GetTrack(0, i)
+            if existing_track then
+              local _, existing_name = reaper.GetSetMediaTrackInfo_String(existing_track, "P_NAME", "", false)
+              if existing_name == track_name then
+                track = existing_track
+                break
+              end
+            end
+          end
+          
+          -- If no matching track found, create a new one
+          if not track then
+            reaper.InsertTrackAtIndex(reaper.CountTracks(0), true)
+            track = reaper.GetTrack(0, reaper.CountTracks(0) - 1)
+            reaper.GetSetMediaTrackInfo_String(track, "P_NAME", track_name, true)
+          end
+        end
         
         -- Set ReaTabHero configuration (drum exstate or guitar/bass tuning)
         local tuning = staff_tunings[staff]
@@ -1781,11 +1837,8 @@ function ImportMusicXMLWithOptions(filepath, options)
           end
         end
 
-        -- Determine item position: edit cursor if requested, otherwise at 0
+        -- Determine item position (always at 0 in new implementation)
         local item_position = 0
-        if insert_at_cursor then
-          item_position = reaper.GetCursorPosition()
-        end
 
         -- Create MIDI item (length = max_seconds)
         local item = reaper.CreateNewMIDIItemInProj(track, item_position, item_position + max_seconds, false)
@@ -1868,7 +1921,9 @@ local selected_file_track_count = nil
 local checkboxes_list = {
     {name = "Import tempo and time signature", checked = true},
     {name = "Import segments as regions", checked = true},
-    {name = "Insert items at edit cursor", checked = false},
+    {name = "Insert items on new tracks", checked = false},
+    {name = "Insert items on existing tracks", checked = false},
+    {name = "Insert items on tracks by name", checked = true},
 }
 
 -- Dimensions
@@ -2144,7 +2199,9 @@ function main_loop()
                 local options = {
                     import_markers = checkboxes_list[1].checked,
                     import_regions = checkboxes_list[2].checked,
-                    insert_at_cursor = checkboxes_list[3].checked
+                    insert_on_new_tracks = checkboxes_list[3].checked,
+                    insert_on_existing_tracks = checkboxes_list[4].checked,
+                    insert_on_tracks_by_name = checkboxes_list[5].checked
                 }
                 -- Execute import with selected options
                 ImportMusicXMLWithOptions(selected_file_path, options)
@@ -2160,7 +2217,18 @@ function main_loop()
             local cb_y = header_height + vertical_margin + (i - 1) * checkbox_row_height
             if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
                mouse_y > cb_y and mouse_y < cb_y + checkbox_size then
-                checkboxes_list[i].checked = not checkboxes_list[i].checked
+                -- Handle mutually exclusive checkboxes for insertion modes (indices 3, 4, 5)
+                if i >= 3 and i <= 5 then
+                    -- Uncheck other insertion mode options
+                    for j = 3, 5 do
+                        checkboxes_list[j].checked = false
+                    end
+                    -- Check the clicked one
+                    checkboxes_list[i].checked = true
+                else
+                    -- Regular toggle for other options
+                    checkboxes_list[i].checked = not checkboxes_list[i].checked
+                end
                 break
             end
         end
