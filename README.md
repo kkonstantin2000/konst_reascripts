@@ -10,6 +10,11 @@ This script imports an uncompressed MusicXML file (e.g., from Guitar Pro) into R
 - Expands repeats (forward/backward) and respects chord offsets
 - Optionally imports tempo and time signature markers
 - Creates separate MIDI tracks for each staff
+- **Three insertion modes**:
+  - **Create new tracks**: original behavior – creates a new track for each staff.
+  - **Insert on existing tracks**: places MIDI items on currently selected tracks (one staff per selected track, in order).
+  - **Match tracks by name**: automatically maps staves to existing tracks based on track names (e.g., "Guitar", "Bass", etc.).
+- Stores string tuning as track ExtState for compatibility with ReaTab Hero (ensures correct display of tablature).
 
 ### Installation
 
