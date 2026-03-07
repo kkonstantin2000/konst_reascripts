@@ -1,9 +1,15 @@
 -- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.
 -- @author kkonstantin2000
--- @version 1.1
+-- @version 1.2
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
+--   v1.2 - Added track list with checkboxes to select specific tracks for import
+--        - Case‑insensitive track name matching
+--        - UI: integrated file selection directly into the "No file selected" area (removed separate button)
+--        - Persistent storage of last imported file path
+--        - Improved text selection: text elements can now be selected with left‑click dragging (standard mouse behavior)
+--        - Added undo point after import for safer CTRL+Z
 --   v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
 --   v1.0 - Initial release
 
@@ -31,6 +37,14 @@
 -- The first note keeps its original position, the second is moved forward by
 -- this amount, the third by 2×, etc. Set to 0 to disable.
 local chord_offset_ticks = 1
+
+-- Case-insensitive track name matching for "Insert items on tracks by name" mode
+-- Set to true to match track names regardless of case (e.g., "guitar" matches "Guitar" or "GUITAR")
+local CASE_INSENSITIVE = true
+
+-- Maximum window dimensions (pixels). Window will not grow beyond these limits.
+local MAX_WINDOW_WIDTH = 800
+local MAX_WINDOW_HEIGHT = 900
 
 -- ============================================================================
 -- DRUM NAME TO TEXT MAPPING
@@ -1141,9 +1155,13 @@ end
 -- Import function with GUI-provided options
 -- ============================================================================
 function ImportMusicXMLWithOptions(filepath, options)
+  -- Begin undo block for all import operations
+  reaper.Undo_BeginBlock()
+  
   -- Validate filepath
   if not filepath or filepath == "" then
     reaper.ShowMessageBox("No file path provided.", "Error", 0)
+    reaper.Undo_EndBlock("Import MusicXML", -1)
     return
   end
 
@@ -1151,6 +1169,7 @@ function ImportMusicXMLWithOptions(filepath, options)
   local f = io.open(filepath, "r")
   if not f then
     reaper.ShowMessageBox("Could not open file.", "Error", 0)
+    reaper.Undo_EndBlock("Import MusicXML", -1)
     return
   end
   local content = f:read("*all")
@@ -1160,6 +1179,7 @@ function ImportMusicXMLWithOptions(filepath, options)
   local root = parseXML(content)
   if not root then
     reaper.ShowMessageBox("Failed to parse XML.", "Error", 0)
+    reaper.Undo_EndBlock("Import MusicXML", -1)
     return
   end
 
@@ -1169,6 +1189,16 @@ function ImportMusicXMLWithOptions(filepath, options)
   local insert_on_new_tracks = (options and options.insert_on_new_tracks) or false
   local insert_on_existing_tracks = (options and options.insert_on_existing_tracks) or false
   local insert_on_tracks_by_name = (options and options.insert_on_tracks_by_name) or true
+  local selected_tracks = options and options.selected_tracks  -- nil means import all
+
+  -- Build a lookup set of selected track names for quick filtering
+  local selected_tracks_set = nil
+  if selected_tracks then
+    selected_tracks_set = {}
+    for _, name in ipairs(selected_tracks) do
+      selected_tracks_set[name] = true
+    end
+  end
 
   -- 5. Get project's ticks per quarter note (PPQ)
   local ppq = reaper.SNM_GetIntConfigVar("miditicksperbeat", 960)
@@ -1733,10 +1763,16 @@ function ImportMusicXMLWithOptions(filepath, options)
   for _, part_id in ipairs(parts_order) do
     local data = all_parts_data[part_id]
     if data then
+    local base_track_name = part_names[part_id] or ("Part " .. part_id)
+
+    -- Skip this part if it wasn't selected in the GUI track list
+    if selected_tracks_set and not selected_tracks_set[base_track_name] then
+      goto continue_part
+    end
+
     local staff_notes = data.staff_notes
     local staff_texts = data.staff_texts
     local staff_tunings = data.staff_tunings or {}
-    local base_track_name = part_names[part_id] or ("Part " .. part_id)
 
     local max_staff = 0
     for staff in pairs(staff_notes) do
@@ -1787,7 +1823,15 @@ function ImportMusicXMLWithOptions(filepath, options)
             local existing_track = reaper.GetTrack(0, i)
             if existing_track then
               local _, existing_name = reaper.GetSetMediaTrackInfo_String(existing_track, "P_NAME", "", false)
-              if existing_name == track_name then
+              -- Compare names with case sensitivity option
+              local names_match = false
+              if CASE_INSENSITIVE then
+                names_match = (existing_name:lower() == track_name:lower())
+              else
+                names_match = (existing_name == track_name)
+              end
+              
+              if names_match then
                 track = existing_track
                 break
               end
@@ -1868,10 +1912,14 @@ function ImportMusicXMLWithOptions(filepath, options)
         reaper.MIDI_Sort(take)
       end
     end
+    ::continue_part::
     end
   end
 
   reaper.UpdateArrange()
+  
+  -- End undo block
+  reaper.Undo_EndBlock("Import MusicXML", -1)
 end
 
 -- Main() will be called by GUI when user clicks Import
@@ -1916,6 +1964,55 @@ gui = {
 local selected_file_path = nil
 local selected_file_name = nil
 local selected_file_track_count = nil
+local last_import_dir = nil  -- Store the last imported file directory
+local track_checkboxes = {}  -- Dynamic list: { {name="...", checked=true, part_id="..."}, ... }
+local import_all_checked = true  -- "Import All" master checkbox state
+local track_scroll_offset = 0  -- Scroll offset (in rows) for the track list
+local scrollbar_dragging = false  -- Whether we're dragging the scrollbar
+
+-- Text selection state
+local text_sel = {
+    active = false,        -- whether a selection drag is in progress
+    element_id = nil,      -- id of the selected text element
+    start_char = 0,        -- character index where selection started
+    end_char = 0,          -- current character index of selection end
+    display_text = "",     -- displayed text of the element
+    full_text = "",        -- original (non-truncated) text for clipboard
+    text_x = 0,            -- x position of the text element
+}
+local text_elements_frame = {} -- rebuilt each frame for hit testing
+local file_info_click_pending = false  -- track file info click for drag detection
+local file_info_click_x = 0  -- mouse x when file info was clicked
+local file_info_click_y = 0  -- mouse y when file info was clicked
+local text_sel_mouse_start_x = 0  -- mouse x at selection start
+local text_sel_mouse_start_y = 0  -- mouse y at selection start
+local DRAG_THRESHOLD = 3  -- minimum pixels to distinguish drag from click
+
+-- ============================================================================
+-- PATH PERSISTENCE FUNCTIONS
+-- ============================================================================
+function save_last_import_path(filepath)
+    if filepath and filepath ~= "" then
+        -- Extract directory and normalize separators
+        local dir = filepath:gsub("\\", "/")  -- Convert all backslashes to forward slashes
+        dir = dir:match("^(.+)/") or ""  -- Extract everything before the last slash
+        if dir ~= "" then
+            -- Append trailing slash for consistent behavior with GetUserFileNameForRead
+            if not dir:match("/$") then
+                dir = dir .. "/"
+            end
+            reaper.SetExtState("konst_ImportMusicXML", "last_import_dir", dir, true)
+        end
+    end
+end
+
+function load_last_import_path()
+    local saved_dir = reaper.GetExtState("konst_ImportMusicXML", "last_import_dir")
+    if saved_dir and saved_dir ~= "" then
+        return saved_dir
+    end
+    return ""
+end
 
 -- Checkbox items (add your items here)
 local checkboxes_list = {
@@ -1947,7 +2044,7 @@ end
 
 -- Calculate window dimensions dynamically (vertical layout)
 gui.width = horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin
-gui.height = header_height + file_info_height + vertical_margin + (#checkboxes_list * checkbox_row_height) + vertical_margin + button_height_area
+gui.height = header_height + vertical_margin + (#checkboxes_list * checkbox_row_height) + vertical_margin + file_info_height + vertical_margin + button_height_area
 
 -- Global state
 local last_mouse_cap = 0
@@ -1975,15 +2072,181 @@ end
 gfx.setfont(1, "Outfit", gui.settings.font_size)
 gfx.clear = 2829099   -- dark gray
 
+-- Load last import directory at startup
+last_import_dir = load_last_import_path()
 
--- Helper function to count parts/tracks in XML
-function count_tracks_in_xml(xml_content)
-    -- Simple count: look for <part-list> and count <score-part> elements
-    local part_count = 0
-    for _ in string.gmatch(xml_content, "<score%-part") do
-        part_count = part_count + 1
+
+-- Helper function to extract track names and count from XML content
+function get_tracks_from_xml(xml_content)
+    local tracks = {}
+    -- Extract part-name from each score-part block
+    for score_part_block in xml_content:gmatch("<score%-part[^>]*>(.-)</score%-part>") do
+        local part_name = score_part_block:match("<part%-name>([^<]*)</part%-name>")
+        if part_name and part_name ~= "" then
+            table.insert(tracks, part_name)
+        end
     end
-    return part_count > 0 and part_count or 0
+    return tracks 
+end
+
+-- Find character index (0 to #text) in text closest to pixel position px
+function char_index_at_x(text, base_x, px)
+    if not text or #text == 0 then return 0 end
+    if px <= base_x then return 0 end
+    local total_w = gfx.measurestr(text)
+    if px >= base_x + total_w then return #text end
+    for i = 1, #text do
+        local w = gfx.measurestr(text:sub(1, i))
+        if base_x + w >= px then
+            local prev_w = (i > 1) and gfx.measurestr(text:sub(1, i - 1)) or 0
+            if (px - base_x - prev_w) < (base_x + w - px) then
+                return i - 1
+            else
+                return i
+            end
+        end
+    end
+    return #text
+end
+
+-- Register a text element for hit testing this frame
+function register_text_element(id, display_text, full_text, x, y, w, h)
+    table.insert(text_elements_frame, {
+        id = id, display_text = display_text, full_text = full_text,
+        x = x, y = y, w = w, h = h
+    })
+end
+
+-- Draw text with selection highlight and register for hit testing
+function draw_selectable_text(id, display_text, full_text, x, y, color)
+    local w = gfx.measurestr(display_text)
+    local h = gfx.texth
+    register_text_element(id, display_text, full_text, x, y, w, h)
+    -- Draw selection highlight if this element has a selection
+    if text_sel.element_id == id and text_sel.start_char ~= text_sel.end_char then
+        local s = math.min(text_sel.start_char, text_sel.end_char)
+        local e = math.max(text_sel.start_char, text_sel.end_char)
+        s = math.max(0, math.min(s, #display_text))
+        e = math.max(0, math.min(e, #display_text))
+        local pre_w = (s > 0) and gfx.measurestr(display_text:sub(1, s)) or 0
+        local sel_w = gfx.measurestr(display_text:sub(1, e)) - pre_w
+        gfx.set(0.17, 0.45, 0.39, 0.7)
+        gfx.rect(x + pre_w, y, sel_w, h, 1)
+    end
+    -- Draw the text
+    gfx.set(table.unpack(color))
+    gfx.x = x
+    gfx.y = y
+    gfx.drawstr(display_text)
+end
+
+-- Copy selected text to clipboard
+function copy_selected_text()
+    if text_sel.element_id and text_sel.start_char ~= text_sel.end_char then
+        local s = math.min(text_sel.start_char, text_sel.end_char)
+        local e = math.max(text_sel.start_char, text_sel.end_char)
+        local text = text_sel.display_text
+        s = math.max(0, math.min(s, #text))
+        e = math.max(0, math.min(e, #text))
+        local selected = text:sub(s + 1, e)
+        if selected ~= "" and reaper.CF_SetClipboard then
+            reaper.CF_SetClipboard(selected)
+        end
+    end
+end
+
+-- Find text element at a given pixel position
+function find_text_element_at(mx, my)
+    for _, elem in ipairs(text_elements_frame) do
+        if mx >= elem.x and mx <= elem.x + elem.w and
+           my >= elem.y and my <= elem.y + elem.h then
+            return elem
+        end
+    end
+    return nil
+end
+
+-- Truncate text to fit within max_pixel_width, appending "..." if needed
+function truncate_text(text, max_pixel_width)
+    if not text or max_pixel_width <= 0 then return "" end
+    local w = gfx.measurestr(text)
+    if w <= max_pixel_width then return text end
+    local ellipsis = "..."
+    local ew = gfx.measurestr(ellipsis)
+    -- Binary search for the longest prefix that fits
+    local lo, hi = 0, #text
+    while lo < hi do
+        local mid = math.ceil((lo + hi) / 2)
+        local sub = text:sub(1, mid)
+        if gfx.measurestr(sub) + ew <= max_pixel_width then
+            lo = mid
+        else
+            hi = mid - 1
+        end
+    end
+    return text:sub(1, lo) .. ellipsis
+end
+
+-- Recalculate and resize the GUI window based on current content
+function resize_window()
+    -- Recalculate max_label_width including track names and filename
+    max_label_width = 0
+    for _, cb in ipairs(checkboxes_list) do
+        local w = gfx.measurestr(cb.name)
+        if w > max_label_width then max_label_width = w end
+    end
+    local import_all_w = gfx.measurestr("Import All")
+    if import_all_w > max_label_width then max_label_width = import_all_w end
+    for _, tcb in ipairs(track_checkboxes) do
+        local w = gfx.measurestr(tcb.name)
+        if w > max_label_width then max_label_width = w end
+    end
+    -- Account for file info text width
+    if selected_file_name then
+        local info_text = selected_file_name .. " [" .. (selected_file_track_count or 0) .. " tracks]"
+        local fw = gfx.measurestr(info_text)
+        -- File info needs some margin on both sides
+        local needed_for_file = fw + horizontal_margin * 2
+        local needed_for_labels = horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin
+        local new_width = math.max(needed_for_file, needed_for_labels)
+        if new_width > gui.width then
+            gui.width = math.min(new_width, MAX_WINDOW_WIDTH)
+        end
+    else
+        local new_width = horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin
+        if new_width > gui.width then
+            gui.width = math.min(new_width, MAX_WINDOW_WIDTH)
+        end
+    end
+
+    -- Clamp max_label_width so checkboxes + labels fit within gui.width
+    local available_label_width = gui.width - horizontal_margin - 5 - checkbox_size - horizontal_margin
+    if max_label_width > available_label_width then
+        max_label_width = available_label_width
+    end
+
+    local track_section_height = 0
+    if #track_checkboxes > 0 then
+        -- "Import All" row + one row per track + spacing
+        track_section_height = vertical_margin + (1 + #track_checkboxes) * checkbox_row_height
+    end
+    gui.height = header_height + vertical_margin
+                 + (#checkboxes_list * checkbox_row_height)
+                 + vertical_margin + file_info_height
+                 + track_section_height
+                 + vertical_margin + button_height_area
+    -- Clamp height and reset scroll offset
+    if gui.height > MAX_WINDOW_HEIGHT then
+        gui.height = MAX_WINDOW_HEIGHT
+    end
+    track_scroll_offset = 0
+    -- Resize the gfx window using JS_Window for reliable borderless resize
+    if window_script then
+        reaper.JS_Window_Resize(window_script, gui.width, gui.height)
+    else
+        local _, x, y = gfx.dock(-1, 0, 0, 0, 0)
+        gfx.init(SCRIPT_TITLE, gui.width, gui.height, gui.settings.docker_id, x, y)
+    end
 end
 
 -- Helper function to extract filename from path
@@ -2011,13 +2274,22 @@ function draw_header(title, height, colors)
     gfx.drawstr(title)
 end
 
--- Draw a single checkbox with label
-function draw_checkbox(checkbox_x, checkbox_y, size, label_x, label_text, is_checked, colors)
-    -- Draw text label first
-    gfx.set(table.unpack(colors.TEXT))
-    gfx.x = label_x
-    gfx.y = checkbox_y + (size - gfx.texth) / 2
-    gfx.drawstr(label_text)
+-- Draw a single checkbox with label (truncates label if max_text_w provided)
+function draw_checkbox(checkbox_x, checkbox_y, size, label_x, label_text, is_checked, colors, max_text_w, text_id)
+    -- Draw text label first (possibly truncated)
+    local display_text = label_text
+    if max_text_w then
+        display_text = truncate_text(label_text, max_text_w)
+    end
+    local text_y = checkbox_y + (size - gfx.texth) / 2
+    if text_id then
+        draw_selectable_text(text_id, display_text, label_text, label_x, text_y, colors.TEXT)
+    else
+        gfx.set(table.unpack(colors.TEXT))
+        gfx.x = label_x
+        gfx.y = text_y
+        gfx.drawstr(display_text)
+    end
 
     -- Checkbox background - highlight only when checked
     if is_checked then
@@ -2045,27 +2317,32 @@ function draw_checkbox(checkbox_x, checkbox_y, size, label_x, label_text, is_che
 end
 
 -- Draw file info section with filename and track count
-function draw_file_info(y_offset, height, filename, track_count, colors)
-    -- Fill background
-    gfx.set(table.unpack(colors.FILE_INFO_BG))
+function draw_file_info(y_offset, height, filename, track_count, colors, is_hovered)
+    -- Fill background - highlight when hovered
+    if is_hovered then
+        gfx.set(table.unpack(colors.CHECKBOX_BG_HOVER))
+    else
+        gfx.set(table.unpack(colors.FILE_INFO_BG))
+    end
     gfx.rect(0, y_offset, gfx.w, height, 1)
     
     -- Draw border
     gfx.set(table.unpack(colors.BORDER))
     gfx.rect(0, y_offset, gfx.w, height, 0)
     
-    -- Draw filename and track count (centered)
+    -- Draw filename and track count (centered, truncated if needed)
     gfx.set(table.unpack(colors.TEXT))
     local text_y = y_offset + (height - gfx.texth) / 2
+    local max_text_w = gfx.w - horizontal_margin * 2
     
     if filename then
-        local info_text = filename .. " [" .. (track_count or 0) .. " tracks]"
+        local full_info_text = filename .. " [" .. (track_count or 0) .. " tracks]"
+        local info_text = truncate_text(full_info_text, max_text_w)
         local text_width = gfx.measurestr(info_text)
-        gfx.x = (gfx.w - text_width) / 2
-        gfx.y = text_y
-        gfx.drawstr(info_text)
+        local text_x = (gfx.w - text_width) / 2
+        draw_selectable_text("file_info", info_text, full_info_text, text_x, text_y, colors.TEXT)
     else
-        local no_file_text = "No file selected"
+        local no_file_text = "Click to select a file"
         local text_width = gfx.measurestr(no_file_text)
         gfx.x = (gfx.w - text_width) / 2
         gfx.y = text_y
@@ -2098,9 +2375,9 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
     for i, cb in ipairs(checkboxes) do
         local label_x = h_margin
         local cb_y = header_h + v_margin + (i - 1) * checkbox_h
-        local cb_x = h_margin + max_width + 5
+        local cb_x = gfx.w - h_margin - cb_size
         
-        draw_checkbox(cb_x, cb_y, cb_size, label_x, cb.name, cb.checked, colors)
+        draw_checkbox(cb_x, cb_y, cb_size, label_x, cb.name, cb.checked, colors, nil, "option_" .. i)
     end
 end
 
@@ -2114,6 +2391,36 @@ function main_loop()
     local mouse_down = (gfx.mouse_cap & 1 == 1)
     local mouse_clicked = mouse_down and (last_mouse_cap & 1 == 0)
     local mouse_released = (last_mouse_cap & 1 == 1) and (gfx.mouse_cap & 1 == 0)
+    
+    -- Text selection handling (uses previous frame's text_elements_frame)
+    if mouse_clicked then
+        local elem = find_text_element_at(mouse_x, mouse_y)
+        if elem then
+            text_sel.active = true
+            text_sel.element_id = elem.id
+            text_sel.display_text = elem.display_text
+            text_sel.full_text = elem.full_text
+            text_sel.text_x = elem.x
+            text_sel.start_char = char_index_at_x(elem.display_text, elem.x, mouse_x)
+            text_sel.end_char = text_sel.start_char
+            text_sel_mouse_start_x = mouse_x
+            text_sel_mouse_start_y = mouse_y
+        else
+            -- Clear selection when clicking outside text
+            text_sel.active = false
+            text_sel.element_id = nil
+            text_sel.start_char = 0
+            text_sel.end_char = 0
+        end
+    elseif mouse_down and text_sel.active then
+        -- Continue dragging - update end position
+        text_sel.end_char = char_index_at_x(text_sel.display_text, text_sel.text_x, mouse_x)
+    elseif mouse_released and text_sel.active then
+        text_sel.active = false  -- stop tracking active drag, but keep selection visible
+    end
+    
+    -- Clear text elements for this frame (will be rebuilt during drawing)
+    text_elements_frame = {}
     
     -- Check if mouse is over header area
     local header_hovered = (mouse_y > 0 and mouse_y < header_height)
@@ -2135,35 +2442,66 @@ function main_loop()
     -- Handle drag end
     if mouse_released then
         is_dragging = false
+        
+        -- File info click: open dialog only if no significant drag occurred
+        if file_info_click_pending then
+            local dx = math.abs(mouse_x - file_info_click_x)
+            local dy = math.abs(mouse_y - file_info_click_y)
+            if dx <= DRAG_THRESHOLD and dy <= DRAG_THRESHOLD then
+                -- It was a click, not a drag - open file dialog
+                local retval, filepath = reaper.GetUserFileNameForRead(last_import_dir, "Select MusicXML file", "*.xml")
+                if retval then
+                    selected_file_path = filepath
+                    selected_file_name = get_filename_from_path(filepath)
+                    save_last_import_path(filepath)
+                    last_import_dir = load_last_import_path()
+                    
+                    local f = io.open(filepath, "r")
+                    if f then
+                        local content = f:read("*all")
+                        f:close()
+                        local track_names = get_tracks_from_xml(content)
+                        selected_file_track_count = #track_names
+                        track_checkboxes = {}
+                        for _, name in ipairs(track_names) do
+                            table.insert(track_checkboxes, {name = name, checked = true})
+                        end
+                        import_all_checked = true
+                    else
+                        selected_file_track_count = 0
+                        track_checkboxes = {}
+                    end
+                    resize_window()
+                end
+                -- Clear any selection started during click
+                text_sel.element_id = nil
+                text_sel.start_char = 0
+                text_sel.end_char = 0
+            end
+            file_info_click_pending = false
+        end
     end
 
-    -- Button area - bottom with three buttons side by side
+    -- Button area - bottom with two buttons side by side
     local btn_width = 110
     local btn_height = 30
     local btn_spacing = 10
-    local total_btn_width = btn_width * 3 + btn_spacing * 2
+    local total_btn_width = btn_width * 2 + btn_spacing
     local btn_y = gfx.h - btn_height - 10
     local btn_start_x = (gfx.w - total_btn_width) / 2
     
-    -- Select New File button (left)
-    local select_file_btn_x = btn_start_x
-    local select_file_btn_y = btn_y
-    
-    -- Import button (middle)
-    local import_btn_x = select_file_btn_x + btn_width + btn_spacing
+    -- Import button (left)
+    local import_btn_x = btn_start_x
     local import_btn_y = btn_y
     
     -- Cancel button (right)
     local cancel_btn_x = import_btn_x + btn_width + btn_spacing
     local cancel_btn_y = btn_y
-
-    -- Hover states
-    local select_file_btn_hovered = (mouse_x > select_file_btn_x and mouse_x < select_file_btn_x + btn_width and
-                                     mouse_y > select_file_btn_y and mouse_y < select_file_btn_y + btn_height)
-    import_btn_hovered = (mouse_x > import_btn_x and mouse_x < import_btn_x + btn_width and
-                          mouse_y > import_btn_y and mouse_y < import_btn_y + btn_height)
-    cancel_btn_hovered = (mouse_x > cancel_btn_x and mouse_x < cancel_btn_x + btn_width and
-                          mouse_y > cancel_btn_y and mouse_y < cancel_btn_y + btn_height)
+    
+    -- File info area for clicking to select file
+    local file_info_y = header_height + vertical_margin + (#checkboxes_list * checkbox_row_height) + vertical_margin
+    local file_info_hovered = (mouse_x > 0 and mouse_x < gfx.w and
+                               mouse_y > file_info_y and mouse_y < file_info_y + file_info_height)
 
     -- Handle clicks
     if mouse_clicked then
@@ -2173,35 +2511,31 @@ function main_loop()
             return
         end
 
-        -- Select New File button
-        if select_file_btn_hovered then
-            local retval, filepath = reaper.GetUserFileNameForRead("", "Select MusicXML file", "*.xml")
-            if retval then
-                selected_file_path = filepath
-                selected_file_name = get_filename_from_path(filepath)
-                
-                -- Read and parse the XML file to count tracks
-                local f = io.open(filepath, "r")
-                if f then
-                    local content = f:read("*all")
-                    f:close()
-                    selected_file_track_count = count_tracks_in_xml(content)
-                else
-                    selected_file_track_count = 0
-                end
-            end
+        -- File info area - defer to mouse release so drag = text selection, click = file dialog
+        if file_info_hovered then
+            file_info_click_pending = true
+            file_info_click_x = mouse_x
+            file_info_click_y = mouse_y
         end
 
         -- Import button
         if import_btn_hovered then
             if selected_file_path then
+                -- Build list of selected track names
+                local selected_tracks = {}
+                for _, tcb in ipairs(track_checkboxes) do
+                    if tcb.checked then
+                        table.insert(selected_tracks, tcb.name)
+                    end
+                end
                 -- Collect checkbox states into options table
                 local options = {
                     import_markers = checkboxes_list[1].checked,
                     import_regions = checkboxes_list[2].checked,
                     insert_on_new_tracks = checkboxes_list[3].checked,
                     insert_on_existing_tracks = checkboxes_list[4].checked,
-                    insert_on_tracks_by_name = checkboxes_list[5].checked
+                    insert_on_tracks_by_name = checkboxes_list[5].checked,
+                    selected_tracks = selected_tracks
                 }
                 -- Execute import with selected options
                 ImportMusicXMLWithOptions(selected_file_path, options)
@@ -2213,7 +2547,7 @@ function main_loop()
 
         -- Checkboxes (vertical layout - aligned)
         for i, cb in ipairs(checkboxes_list) do
-            local cb_x = horizontal_margin + max_label_width + 5
+            local cb_x = gfx.w - horizontal_margin - checkbox_size
             local cb_y = header_height + vertical_margin + (i - 1) * checkbox_row_height
             if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
                mouse_y > cb_y and mouse_y < cb_y + checkbox_size then
@@ -2232,20 +2566,133 @@ function main_loop()
                 break
             end
         end
+
+        -- Track checkboxes (only visible when file is loaded)
+        if #track_checkboxes > 0 then
+            local track_section_y = file_info_y + file_info_height + vertical_margin
+            local cb_x = gfx.w - horizontal_margin - checkbox_size
+
+            -- "Import All" checkbox
+            local all_y = track_section_y
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
+               mouse_y > all_y and mouse_y < all_y + checkbox_size then
+                import_all_checked = not import_all_checked
+                for _, tcb in ipairs(track_checkboxes) do
+                    tcb.checked = import_all_checked
+                end
+            else
+                -- Individual track checkboxes (account for scroll offset)
+                local tracks_area_top = track_section_y + checkbox_row_height
+                local tracks_area_bottom = btn_y - 10
+                local tracks_area_height = tracks_area_bottom - tracks_area_top
+                local max_visible_tracks = math.floor(tracks_area_height / checkbox_row_height)
+                
+                for i, tcb in ipairs(track_checkboxes) do
+                    local scrolled_i = i - track_scroll_offset
+                    if scrolled_i >= 1 and scrolled_i <= max_visible_tracks then
+                        local tcb_y = tracks_area_top + (scrolled_i - 1) * checkbox_row_height
+                        if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
+                           mouse_y > tcb_y and mouse_y < tcb_y + checkbox_size then
+                            tcb.checked = not tcb.checked
+                            -- Update "Import All" state based on individual checkboxes
+                            local all_checked = true
+                            for _, t in ipairs(track_checkboxes) do
+                                if not t.checked then all_checked = false; break end
+                            end
+                            import_all_checked = all_checked
+                            break
+                        end
+                    end
+                end
+            end
+        end
     end
 
-    -- Calculate file info position (after checkboxes)
-    local file_info_y = header_height + vertical_margin + (#checkboxes_list * checkbox_row_height) + vertical_margin
+    -- Handle mousewheel scrolling for track list
+    if #track_checkboxes > 0 and gfx.mouse_wheel ~= 0 then
+        local track_section_y = file_info_y + file_info_height + vertical_margin
+        local tracks_area_top = track_section_y + checkbox_row_height
+        local tracks_area_bottom = btn_y - 10
+        -- Only scroll when mouse is over the track list area
+        if mouse_y >= tracks_area_top and mouse_y <= tracks_area_bottom then
+            local scroll_delta = -math.floor(gfx.mouse_wheel / 120)
+            track_scroll_offset = track_scroll_offset + scroll_delta
+            local tracks_area_height = tracks_area_bottom - tracks_area_top
+            local max_visible_tracks = math.floor(tracks_area_height / checkbox_row_height)
+            local max_scroll = math.max(0, #track_checkboxes - max_visible_tracks)
+            if track_scroll_offset < 0 then track_scroll_offset = 0 end
+            if track_scroll_offset > max_scroll then track_scroll_offset = max_scroll end
+        end
+        gfx.mouse_wheel = 0
+    end
+
+    -- Hover states for buttons
+    import_btn_hovered = (mouse_x > import_btn_x and mouse_x < import_btn_x + btn_width and
+                          mouse_y > import_btn_y and mouse_y < import_btn_y + btn_height)
+    cancel_btn_hovered = (mouse_x > cancel_btn_x and mouse_x < cancel_btn_x + btn_width and
+                          mouse_y > cancel_btn_y and mouse_y < cancel_btn_y + btn_height)
     
     -- Draw all UI elements using modular functions
     draw_header("IMPORT MUSICXML", header_height, gui.colors)
     draw_checkboxes_list(checkboxes_list, header_height, horizontal_margin, vertical_margin, 
                         checkbox_row_height, checkbox_size, max_label_width, gui.colors)
-    draw_file_info(file_info_y, file_info_height, selected_file_name, selected_file_track_count, gui.colors)
+    draw_file_info(file_info_y, file_info_height, selected_file_name, selected_file_track_count, gui.colors, file_info_hovered)
     
-    -- Draw buttons
-    draw_button(select_file_btn_x, select_file_btn_y, btn_width, btn_height, "Select File",
-                select_file_btn_hovered, "BTN", gui.colors.BORDER, gui.colors.TEXT)
+    -- Draw track checkboxes section (after file info)
+    if #track_checkboxes > 0 then
+        local track_section_y = file_info_y + file_info_height + vertical_margin
+        local cb_x = gfx.w - horizontal_margin - checkbox_size
+        
+        -- Draw "Import All" checkbox (always visible, not scrolled)
+        local trunc_w = cb_x - horizontal_margin - 5
+        draw_checkbox(cb_x, track_section_y, checkbox_size, horizontal_margin,
+                      "Import All", import_all_checked, gui.colors, trunc_w, "import_all")
+        
+        -- Draw separator line after "Import All"
+        local line_y = track_section_y + checkbox_size + math.floor((checkbox_row_height - checkbox_size) / 2)
+        gfx.set(table.unpack(gui.colors.BORDER))
+        gfx.line(horizontal_margin, line_y, gfx.w - horizontal_margin, line_y)
+        
+        -- Calculate visible area for track list (between separator and buttons)
+        local tracks_area_top = track_section_y + checkbox_row_height
+        local tracks_area_bottom = btn_y - 10
+        local tracks_area_height = tracks_area_bottom - tracks_area_top
+        local max_visible_tracks = math.floor(tracks_area_height / checkbox_row_height)
+        local total_tracks = #track_checkboxes
+        local max_scroll = math.max(0, total_tracks - max_visible_tracks)
+        
+        -- Clamp scroll offset
+        if track_scroll_offset > max_scroll then track_scroll_offset = max_scroll end
+        if track_scroll_offset < 0 then track_scroll_offset = 0 end
+        
+        -- Draw visible track checkboxes with clipping
+        for i, tcb in ipairs(track_checkboxes) do
+            local scrolled_i = i - track_scroll_offset
+            if scrolled_i >= 1 and scrolled_i <= max_visible_tracks then
+                local tcb_y = tracks_area_top + (scrolled_i - 1) * checkbox_row_height
+                draw_checkbox(cb_x, tcb_y, checkbox_size, horizontal_margin,
+                              tcb.name, tcb.checked, gui.colors, trunc_w, "track_" .. i)
+            end
+        end
+        
+        -- Draw scrollbar if needed
+        if total_tracks > max_visible_tracks then
+            local scrollbar_width = 8
+            local scrollbar_x = gfx.w - scrollbar_width - 4
+            local scrollbar_track_height = tracks_area_height
+            local thumb_height = math.max(20, math.floor(scrollbar_track_height * max_visible_tracks / total_tracks))
+            local thumb_y = tracks_area_top + math.floor((scrollbar_track_height - thumb_height) * track_scroll_offset / max_scroll)
+            
+            -- Scrollbar track
+            gfx.set(0.15, 0.15, 0.15, 1)
+            gfx.rect(scrollbar_x, tracks_area_top, scrollbar_width, scrollbar_track_height, 1)
+            -- Scrollbar thumb
+            gfx.set(0.4, 0.4, 0.4, 1)
+            gfx.rect(scrollbar_x, thumb_y, scrollbar_width, thumb_height, 1)
+        end
+    end
+    
+    -- Draw buttons (Import and Cancel)
     draw_button(import_btn_x, import_btn_y, btn_width, btn_height, "Import",
                 import_btn_hovered, "IMPORT_BTN", gui.colors.BORDER, gui.colors.TEXT)
     draw_button(cancel_btn_x, cancel_btn_y, btn_width, btn_height, "Cancel",
@@ -2255,7 +2702,12 @@ function main_loop()
     last_mouse_cap = gfx.mouse_cap
 
     -- Continue or quit
-    if gfx.getchar() >= 0 then
+    local char = gfx.getchar()
+    -- Handle Ctrl+C for copying selected text
+    if char == 3 then
+        copy_selected_text()
+    end
+    if char >= 0 then
         reaper.defer(main_loop)
     else
         gfx.quit()
