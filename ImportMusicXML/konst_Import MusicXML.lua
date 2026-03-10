@@ -1,9 +1,18 @@
 -- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.
 -- @author kkonstantin2000
--- @version 1.2
+-- @version 1.3
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
+--   v1.3 - Added Settings panel with per-articulation controls:
+--            symbol text, event type (Text/Marker/Cue), Replace Fret checkbox, underscore prefix toggle, enable/disable
+--          - Fret Number global setting: event type selector and enable/disable checkbox
+--          - Duration Lines toggle: consecutive Marker/Cue span articulations emit "----" / "-|" instead of repeating the label
+--          - Highlight Used toggle: optionally scan the MusicXML to highlight which articulations appear in the file
+--          - All settings persisted via ExtState (Save/Restore Defaults buttons)
+--          - Fixed vibrato, bends, let ring parsing
+--          - Bend variants (bend, bend release, pre-bend, 1/2 bend, full bend, etc.) treated as standard articulation rows
+--          - Fixed harmonics: natural uses <fret> format, artificial uses "fret <fret+12>" format; vibrato and other suffix articulations now combine with the base symbol (e.g. "1 <13>~")
 --   v1.2 - Added track list with checkboxes to select specific tracks for import
 --        - Case‑insensitive track name matching
 --        - UI: integrated file selection directly into the "No file selected" area (removed separate button)
@@ -422,35 +431,44 @@ local region_color_map = {
 -- ============================================================================
 local articulation_map = {
     -- Articulations (usually under <articulations>)
-    accent        = { type = 1, symbol = ">" },
-    staccato      = { type = 1, symbol = "." },
-    tenuto        = { type = 1, symbol = "-" },
+    accent        = { type = 6, symbol = ">", no_prefix = true },
+    staccato      = { type = 7, symbol = ".", no_prefix = true },
+    tenuto        = { type = 7, symbol = "-", no_prefix = true },
     -- ["strong-accent"] = { type = 1, symbol = "^" },   -- upbow accent
-    staccatissimo = { type = 1, symbol = "'" },
-    spiccato      = { type = 1, symbol = "!" },
-    scoop         = { type = 1, symbol = "s" },
-    falloff       = { type = 1, symbol = "\\" },      -- downward slide
-    doit          = { type = 1, symbol = "/" },       -- upward slide
+    staccatissimo = { type = 7, symbol = "'", no_prefix = true },
+    spiccato      = { type = 7, symbol = "!", no_prefix = true },
+    scoop         = { type = 1, symbol = "/%d", replaces_fret = true },
+    falloff       = { type = 1, symbol = "%d\\", replaces_fret = true },      -- downward slide
+    doit          = { type = 1, symbol = "/%d", replaces_fret = true },       -- upward slide
     breathmark    = { type = 1, symbol = "," },
 
     -- Technical indications (under <technical>)
-    ["palm"]      = { type = 6, symbol = "P.M___", no_prefix = true },
-    ["straight"]  = { type = 1, symbol = "x", replaces_fret = true, no_prefix = true },
+    ["palm mute"]      = { type = 6, symbol = "P.M---", no_prefix = true },
+    ["straight mute"]  = { type = 1, symbol = "x", replaces_fret = true, no_prefix = true },
+    ["letring"]        = { type = 6, symbol = "let ring---",  no_prefix = true },
 
-    ["hammer-on"] = { type = 1, symbol = "H" },
-    ["pull-off"]  = { type = 1, symbol = "P" },
-    ["tap"]       = { type = 1, symbol = "T" },
+    ["hammer-on"] = { type = 6, symbol = "H", no_prefix = true },
+    ["pull-off"]  = { type = 6, symbol = "P", no_prefix = true },
+    ["tap"]       = { type = 6, symbol = "T", no_prefix = true },
     ["fingering"] = { type = 1, symbol = "%d" },      -- finger number
     ["harmonic"]  = { type = 1, symbol = "<%d>", replaces_fret = true },
-    ["natural-harmonic"]   = { type = 1, symbol = "<%d>", replaces_fret = true },
-    ["artificial-harmonic"]= { type = 1, symbol = "<%d>", replaces_fret = true },
-    ["vibrato"]   = { type = 1, symbol = "~" },
+    ["natural-harmonic"]   = { type = 1, symbol = "<%d>",    replaces_fret = true },
+    ["artificial-harmonic"]= { type = 1, symbol = "%d <%h>", replaces_fret = true },
+    ["vibrato"]   = { type = 1, symbol = "~", replaces_fret = true, is_suffix = true },
     -- Slide entries are kept here for symbol lookup, but they are handled separately in the main loop.
-    ["slide"]     = { type = 6, symbol = "sl.", no_prefix = true },
-    ["slide-up"]  = { type = 1, symbol = "/" },
-    ["slide-down"]= { type = 1, symbol = "\\" },
-    ["bend"]      = { type = 1, symbol = "^" },
-    ["bend-release"] = { type = 1, symbol = "^^" },
+    ["slide"]     = { type = 1, symbol = "/%d", replaces_fret = true },
+    ["slide-up"]  = { type = 1, symbol = "/%d", replaces_fret = true },
+    ["slide-down"]= { type = 1, symbol = "%d\\", replaces_fret = true },
+    ["bend"]         = { type = 1, symbol = "%d˄",  replaces_fret = true },
+    ["bend release"] = { type = 1, symbol = "%d˄˅", replaces_fret = true },
+    ["pre-bend"]     = { type = 1, symbol = "%d|",  replaces_fret = true },
+    -- Amount label markers (type 6, one row per bend amount)
+    ["1/2 bend"]     = { type = 6, symbol = "1/2",   no_prefix = true },
+    ["full bend"]    = { type = 6, symbol = "full",  no_prefix = true },
+    ["1 1/2 bend"]   = { type = 6, symbol = "1 1/2", no_prefix = true },
+    ["2 bend"]       = { type = 6, symbol = "2",     no_prefix = true },
+    ["2 1/2 bend"]   = { type = 6, symbol = "2 1/2", no_prefix = true },
+    ["3 bend"]       = { type = 6, symbol = "3",     no_prefix = true },
     ["grace-note"]   = { type = 1, symbol = "gr" },
 
     -- Markers (type 6) – for strum directions, below the tab
@@ -460,29 +478,6 @@ local articulation_map = {
     -- Cues (type 7) – for sections, chords, lyrics, above the tab
     ["chord"]       = { type = 7, symbol = "%s" },    -- chord name (needs separate parsing)
     ["lyric"]       = { type = 7, symbol = "%s" },    -- lyric text (needs separate parsing)
-
-    -- Play/mute elements (under <play>)
-    ["mute"]        = {
-        type = function(node)
-            local mute_text = getNodeText(node)
-            return mute_text == "straight" and 1 or 6
-        end,
-        symbol = function(node)
-            local mute_text = getNodeText(node)
-            if mute_text == "palm" then
-                return "P.M___"
-            elseif mute_text == "straight" then
-                return "_x"
-            else
-                return "Mute"
-            end
-        end,
-        replaces_fret = function(node)
-            local mute_text = getNodeText(node)
-            return mute_text == "straight"
-        end,
-        no_prefix = true,   -- no underscore for any mute
-    },
 }
 
 -- Names of slide elements – these will be handled separately in the main loop.
@@ -491,6 +486,259 @@ local slide_names = {
     ["slide-up"] = true,
     ["slide-down"] = true
 }
+
+-- Names of bend elements – collected as a sequence rather than processed individually.
+local bend_names = {
+    ["bend"] = true,
+}
+
+-- ============================================================================
+-- ARTICULATION SETTINGS (enabled / disabled per articulation)
+-- ============================================================================
+-- Ordered list of articulation names for a stable display in Settings UI
+local articulation_names_ordered = {
+    "accent", "staccato", "tenuto", "staccatissimo", "spiccato",
+    "scoop", "falloff", "doit", "breathmark",
+    "palm", "straight", "letring",
+    "hammer-on", "pull-off", "tap", "fingering",
+    "harmonic", "natural-harmonic", "artificial-harmonic",
+    "vibrato",
+    "slide", "slide-up", "slide-down",
+    "bend", "bend release", "pre-bend",
+    "1/2 bend", "full bend", "1 1/2 bend", "2 bend", "2 1/2 bend", "3 bend",
+    "grace-note",
+    "up-stroke", "down-stroke",
+    "chord", "lyric",
+}
+
+-- Map XML element names that differ from articulation_names_ordered entries
+local xml_to_settings_name = {
+    ["palm mute"] = "palm",
+    ["straight mute"] = "straight",
+}
+
+-- Build a set of articulation_names_ordered for quick lookup
+local settings_name_set = {}
+for _, name in ipairs(articulation_names_ordered) do
+    settings_name_set[name] = true
+end
+
+-- Table: articulation_name -> true/false (enabled)
+local articulation_enabled = {}
+-- Table: articulation_name -> custom symbol string (nil = use default)
+local articulation_symbol_override = {}
+-- Table: articulation_name -> custom type number (nil = use default)
+local articulation_type_override = {}
+-- Table: articulation_name -> custom replaces_fret override (nil = use default)
+local articulation_replaces_fret_override = {}
+-- Table: articulation_name -> custom no_prefix override (nil = use default)
+local articulation_no_prefix_override = {}
+-- Table: articulation_name -> default symbol string (from articulation_map)
+local articulation_default_symbol = {}
+-- Table: articulation_name -> default type number (from articulation_map)
+local articulation_default_type = {}
+-- Table: articulation_name -> default replaces_fret (from articulation_map)
+local articulation_default_replaces_fret = {}
+-- Table: articulation_name -> default no_prefix (from articulation_map)
+local articulation_default_no_prefix = {}
+-- Valid type values and their labels
+local art_type_values = {1, 6, 7}
+local art_type_labels = {[1] = "Text", [6] = "Marker", [7] = "Cue"}
+-- Fret number global settings
+local fret_number_enabled = true
+local fret_number_type = 1
+local FRET_NUMBER_TYPE_DEFAULT = 1
+-- Duration line (span) feature: draw "----" / "-|" for consecutive span arts
+local span_line_enabled = false
+-- Highlight articulations used in file (requires XML scan on track selection change)
+local highlight_scan_enabled = true
+
+-- Reverse mapping: settings name -> XML element name (for names that differ)
+local settings_to_xml_name = {}
+for xml_name, settings_name in pairs(xml_to_settings_name) do
+    settings_to_xml_name[settings_name] = xml_name
+end
+
+-- Initialize all to true (default) and capture defaults from articulation_map
+for _, name in ipairs(articulation_names_ordered) do
+    articulation_enabled[name] = true
+    local entry = articulation_map[name] or articulation_map[settings_to_xml_name[name]]
+    if entry then
+        if type(entry.symbol) ~= "function" then
+            articulation_default_symbol[name] = entry.symbol or ""
+        else
+            articulation_default_symbol[name] = "(dynamic)"
+        end
+        if type(entry.type) ~= "function" then
+            articulation_default_type[name] = entry.type
+        else
+            articulation_default_type[name] = 1
+        end
+        if type(entry.replaces_fret) ~= "function" then
+            articulation_default_replaces_fret[name] = entry.replaces_fret or false
+        else
+            articulation_default_replaces_fret[name] = false
+        end
+        if type(entry.no_prefix) ~= "function" then
+            articulation_default_no_prefix[name] = entry.no_prefix or false
+        else
+            articulation_default_no_prefix[name] = false
+        end
+    else
+        articulation_default_symbol[name] = ""
+        articulation_default_type[name] = 1
+        articulation_default_replaces_fret[name] = false
+        articulation_default_no_prefix[name] = false
+    end
+end
+
+local EXTSTATE_SECTION = "konst_ImportMusicXML"
+local EXTSTATE_ART_KEY = "articulation_settings"
+
+-- Get the effective symbol for an articulation (override or default)
+local function get_art_symbol(name)
+    return articulation_symbol_override[name] or articulation_default_symbol[name]
+end
+
+-- Get the effective type for an articulation (override or default)
+local function get_art_type(name)
+    return articulation_type_override[name] or articulation_default_type[name]
+end
+
+-- Get the effective replaces_fret for an articulation (override or default)
+local function get_art_replaces_fret(name)
+    if articulation_replaces_fret_override[name] ~= nil then
+        return articulation_replaces_fret_override[name]
+    end
+    return articulation_default_replaces_fret[name]
+end
+
+-- Get the effective no_prefix for an articulation (override or default)
+local function get_art_no_prefix(name)
+    if articulation_no_prefix_override[name] ~= nil then
+        return articulation_no_prefix_override[name]
+    end
+    return articulation_default_no_prefix[name]
+end
+
+-- Serialize all articulation settings to a string
+-- Format: "name|enabled|symbol|type;name2|enabled|symbol|type;..."
+-- Symbol uses base64-like URL encoding to avoid delimiter collisions
+local function encode_sym(s)
+    -- Percent-encode | ; and % characters
+    return s:gsub("%%", "%%%%25"):gsub("|", "%%7C"):gsub(";", "%%3B")
+end
+local function decode_sym(s)
+    return s:gsub("%%3B", ";"):gsub("%%7C", "|"):gsub("%%25", "%%")
+end
+
+local function serialize_articulation_settings()
+    local parts = {}
+    -- Fret number global settings as special entry
+    local fret_en = fret_number_enabled and "1" or "0"
+    local fret_typ = (fret_number_type ~= FRET_NUMBER_TYPE_DEFAULT) and tostring(fret_number_type) or ""
+    table.insert(parts, "__fret__|" .. fret_en .. "||" .. fret_typ .. "||")
+    -- Span line (duration lines) toggle
+    local span_en = span_line_enabled and "1" or "0"
+    table.insert(parts, "__span__|" .. span_en .. "||||")
+    -- Highlight scan toggle
+    local hl_en = highlight_scan_enabled and "1" or "0"
+    table.insert(parts, "__hlscan__|" .. hl_en .. "||||")
+    for _, name in ipairs(articulation_names_ordered) do
+        local en = articulation_enabled[name] and "1" or "0"
+        local sym = articulation_symbol_override[name] or ""
+        local typ = articulation_type_override[name] or ""
+        local rf = articulation_replaces_fret_override[name]
+        local rf_str = rf == nil and "" or (rf and "1" or "0")
+        local np = articulation_no_prefix_override[name]
+        local np_str = np == nil and "" or (np and "1" or "0")
+        table.insert(parts, name .. "|" .. en .. "|" .. encode_sym(sym) .. "|" .. tostring(typ) .. "|" .. rf_str .. "|" .. np_str)
+    end
+    return table.concat(parts, ";")
+end
+
+-- Deserialize string back to articulation settings tables
+local function deserialize_articulation_settings(str)
+    if not str or str == "" then return end
+    -- Support old format "name=0,name2=1,..." for backward compatibility
+    if str:find("=") and not str:find("|") then
+        for pair in str:gmatch("[^,]+") do
+            local k, v = pair:match("^(.+)=(%d)$")
+            if k and v and articulation_enabled[k] ~= nil then
+                articulation_enabled[k] = (v == "1")
+            end
+        end
+        return
+    end
+    -- New format "name|enabled|symbol|type|replaces_fret|no_prefix;..."
+    for entry_str in str:gmatch("[^;]+") do
+        local fields = {}
+        for field in (entry_str .. "|"):gmatch("([^|]*)|?") do
+            table.insert(fields, field)
+        end
+        -- Remove trailing empty from gmatch
+        if fields[#fields] == "" then table.remove(fields) end
+        local name = fields[1]
+        if name == "__fret__" then
+            -- Fret number global settings
+            if fields[2] then fret_number_enabled = (fields[2] == "1") end
+            if fields[4] and fields[4] ~= "" then
+                local t = tonumber(fields[4])
+                if t then fret_number_type = t end
+            end
+        elseif name == "__span__" then
+            -- Span line (duration lines) toggle
+            if fields[2] then span_line_enabled = (fields[2] == "1") end
+        elseif name == "__hlscan__" then
+            -- Highlight scan toggle
+            if fields[2] then highlight_scan_enabled = (fields[2] == "1") end
+        elseif name and articulation_enabled[name] ~= nil then
+            if fields[2] then articulation_enabled[name] = (fields[2] == "1") end
+            if fields[3] and fields[3] ~= "" then
+                articulation_symbol_override[name] = decode_sym(fields[3])
+            end
+            if fields[4] and fields[4] ~= "" then
+                local t = tonumber(fields[4])
+                if t then articulation_type_override[name] = t end
+            end
+            if fields[5] and fields[5] ~= "" then
+                articulation_replaces_fret_override[name] = (fields[5] == "1")
+            end
+            if fields[6] and fields[6] ~= "" then
+                articulation_no_prefix_override[name] = (fields[6] == "1")
+            end
+        end
+    end
+end
+
+-- Load from EXTSTATE (call at startup)
+local function load_articulation_settings()
+    local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_ART_KEY)
+    deserialize_articulation_settings(saved)
+end
+
+-- Save to EXTSTATE (persist = true)
+local function save_articulation_settings()
+    reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_ART_KEY, serialize_articulation_settings(), true)
+end
+
+-- Restore defaults: re-enable everything, clear overrides
+local function restore_default_articulation_settings()
+    fret_number_enabled = true
+    fret_number_type = FRET_NUMBER_TYPE_DEFAULT
+    span_line_enabled = false
+    highlight_scan_enabled = true
+    for _, name in ipairs(articulation_names_ordered) do
+        articulation_enabled[name] = true
+        articulation_symbol_override[name] = nil
+        articulation_type_override[name] = nil
+        articulation_replaces_fret_override[name] = nil
+        articulation_no_prefix_override[name] = nil
+    end
+end
+
+-- Load settings on script start
+load_articulation_settings()
 
 -- ============================================================================
 -- Helper: convert drum instrument name to short text
@@ -661,6 +909,36 @@ local function isDrumTrack(track_name)
     if not track_name then return false end
     local name_lower = track_name:lower()
     return name_lower:find("drum") ~= nil or name_lower:find("percussion") ~= nil or name_lower:find("kit") ~= nil
+end
+
+-- ============================================================================
+-- Pre-process Guitar Pro processing instructions (<?GP ... ?>)
+-- Converts them to parseable <_gp_> elements so their content is accessible
+-- in the parsed tree (e.g. <letring/> detection).
+-- ============================================================================
+local function preprocess_gp_pis(xml)
+  local pieces = {}
+  local pos = 1
+  local len = #xml
+  while pos <= len do
+    local s = xml:find("<%?GP", pos)
+    if not s then
+      pieces[#pieces + 1] = xml:sub(pos)
+      break
+    end
+    pieces[#pieces + 1] = xml:sub(pos, s - 1)
+    local e = xml:find("%?>", s + 4)
+    if not e then
+      pieces[#pieces + 1] = xml:sub(s)
+      break
+    end
+    local content = xml:sub(s + 4, e - 1)
+    pieces[#pieces + 1] = "<_gp_>"
+    pieces[#pieces + 1] = content
+    pieces[#pieces + 1] = "</_gp_>"
+    pos = e + 2
+  end
+  return table.concat(pieces)
 end
 
 -- ============================================================================
@@ -876,41 +1154,123 @@ end
 -- ============================================================================
 -- Articulation processing (modified to skip slides)
 -- ============================================================================
+
+-- Analyse a sequence of <bend> nodes and return up to two events:
+--   1. A fret-replacing shape event (bend / bend release / pre-bend articulation)
+--   2. An amount label event (1/2 bend, full bend, … articulation)
+-- Everything is controlled via the standard articulation settings rows.
+local function make_bend_events(bend_nodes, default_fret)
+  if #bend_nodes == 0 then return {} end
+
+  local n1      = bend_nodes[1]
+  local a1_node = findChild(n1, "bend-alter")
+  local a1      = (a1_node and tonumber(getNodeText(a1_node))) or 0
+  local has_pre = findChild(n1, "pre-bend") ~= nil
+  local has_release = false
+  for _, bn in ipairs(bend_nodes) do
+    if findChild(bn, "release") then has_release = true; break end
+  end
+
+  -- Shape articulation name
+  local shape_name
+  if has_release then
+    shape_name = "bend release"
+  elseif has_pre then
+    shape_name = "pre-bend"
+  else
+    shape_name = "bend"
+  end
+
+  -- Amount articulation name mapped from semitone count
+  local amount_name_map = {
+    [1] = "1/2 bend", [2] = "full bend", [3] = "1 1/2 bend",
+    [4] = "2 bend",   [5] = "2 1/2 bend", [6] = "3 bend",
+  }
+  local amount_name = amount_name_map[a1]
+
+  local result = {}
+
+  -- Shape event
+  if articulation_enabled[shape_name] ~= false then
+    local sym = get_art_symbol(shape_name) or ""
+    sym = sym:gsub("%%d", tostring(default_fret))
+    table.insert(result, {
+      type          = get_art_type(shape_name),
+      symbol        = sym,
+      no_prefix     = get_art_no_prefix(shape_name),
+      replaces_fret = get_art_replaces_fret(shape_name),
+    })
+  end
+
+  -- Amount label event
+  if amount_name and articulation_enabled[amount_name] ~= false then
+    local sym = get_art_symbol(amount_name) or ""
+    if sym ~= "" then
+      table.insert(result, {
+        type          = get_art_type(amount_name),
+        symbol        = sym,
+        no_prefix     = get_art_no_prefix(amount_name),
+        replaces_fret = get_art_replaces_fret(amount_name),
+      })
+    end
+  elseif not amount_name and a1 > 0 then
+    -- Fallback for unusual semitone counts not covered by the named articulations
+    local steps = a1 / 2
+    local whole = math.floor(steps)
+    local label = (steps - whole >= 0.4) and
+        (whole == 0 and "1/2" or (tostring(whole) .. " 1/2")) or tostring(whole)
+    table.insert(result, { type = 6, symbol = label, no_prefix = true, replaces_fret = false })
+  end
+
+  return result
+end
+
 local function getArticulationEvents(note_node, default_fret)
   local events = {}
   if not note_node then return events end
 
   local notations = findChild(note_node, "notations")
 
-  local function addEvent(entry, node)
+  local function addEvent(entry, node, art_name)
     if not entry then return end
+    -- Check if this articulation is disabled in settings
+    local lookup = art_name or (node and node.name)
+    if lookup and articulation_enabled[lookup] == false then return end
 
     local ev = {}
 
-    -- Resolve type (could be a function)
-    if type(entry.type) == "function" then
+    -- Resolve type (could be a function), then apply override
+    if articulation_type_override[lookup] then
+      ev.type = articulation_type_override[lookup]
+    elseif type(entry.type) == "function" then
       ev.type = entry.type(node)
     else
       ev.type = entry.type
     end
 
-    -- Resolve symbol
+    -- Resolve symbol, then apply override
     local sym
-    if type(entry.symbol) == "function" then
+    if articulation_symbol_override[lookup] then
+      sym = articulation_symbol_override[lookup]
+    elseif type(entry.symbol) == "function" then
       sym = entry.symbol(node)
     else
       sym = entry.symbol
     end
 
-    -- Resolve replaces_fret
-    if type(entry.replaces_fret) == "function" then
+    -- Resolve replaces_fret, then apply override
+    if articulation_replaces_fret_override[lookup] ~= nil then
+      ev.replaces_fret = articulation_replaces_fret_override[lookup]
+    elseif type(entry.replaces_fret) == "function" then
       ev.replaces_fret = entry.replaces_fret(node)
     else
       ev.replaces_fret = entry.replaces_fret
     end
 
-    -- Resolve no_prefix
-    if type(entry.no_prefix) == "function" then
+    -- Resolve no_prefix, then apply override
+    if articulation_no_prefix_override[lookup] ~= nil then
+      ev.no_prefix = articulation_no_prefix_override[lookup]
+    elseif type(entry.no_prefix) == "function" then
       ev.no_prefix = entry.no_prefix(node)
     else
       ev.no_prefix = entry.no_prefix or false
@@ -919,18 +1279,13 @@ local function getArticulationEvents(note_node, default_fret)
     if sym and sym:find("%%d") then
       sym = sym:gsub("%%d", tostring(default_fret))
     end
-
-    if node and (node.name == "harmonic" or node.name:match("harmonic")) then
-      local fret_child = findChild(node, "fret")
-      if fret_child then
-        local f = tonumber(getNodeText(fret_child))
-        if f then
-          sym = entry.symbol:gsub("%%d", tostring(f))
-        end
-      end
+    if sym and sym:find("%%h") then
+      sym = sym:gsub("%%h", tostring(default_fret + 12))
     end
 
     ev.symbol = sym
+    ev.is_suffix = entry.is_suffix or false
+    ev.art_name = lookup   -- store resolved name for span tracking
     table.insert(events, ev)
   end
 
@@ -939,15 +1294,35 @@ local function getArticulationEvents(note_node, default_fret)
     if articulations and articulations.children then
       for _, child in ipairs(articulations.children) do
         local entry = articulation_map[child.name]
-        if entry then addEvent(entry, child) end
+        if entry then addEvent(entry, child, xml_to_settings_name[child.name]) end
       end
     end
 
     local technical = findChild(notations, "technical")
     if technical and technical.children then
       for _, child in ipairs(technical.children) do
-        local entry = articulation_map[child.name]
-        if entry then addEvent(entry, child) end
+        if not bend_names[child.name] then  -- bends handled as a sequence below
+          if child.name == "harmonic" then
+            -- Distinguish natural (<harmonic><natural/>…) from artificial (<harmonic/>)
+            local art_key = findChild(child, "natural") and "natural-harmonic" or "artificial-harmonic"
+            local art_entry = articulation_map[art_key]
+            if art_entry then addEvent(art_entry, child, art_key) end
+          else
+            local entry = articulation_map[child.name]
+            if entry then addEvent(entry, child, xml_to_settings_name[child.name]) end
+          end
+        end
+      end
+    end
+
+    -- Process all <bend> children of <technical> as one or more marker events
+    if technical then
+      local bend_nodes = {}
+      for _, child in ipairs(technical.children or {}) do
+        if child.name == "bend" then table.insert(bend_nodes, child) end
+      end
+      for _, bev in ipairs(make_bend_events(bend_nodes, default_fret)) do
+        table.insert(events, bev)
       end
     end
 
@@ -956,18 +1331,55 @@ local function getArticulationEvents(note_node, default_fret)
       if child.name ~= "articulations" and child.name ~= "technical" then
         if not slide_names[child.name] then   -- <-- skip slides
           local entry = articulation_map[child.name]
-          if entry then addEvent(entry, child) end
+          if entry then addEvent(entry, child, xml_to_settings_name[child.name]) end
         end
       end
     end
   end
 
+  -- Route <play>/<mute> to the appropriate static entry based on mute text
   local play = findChild(note_node, "play")
   if play and play.children then
     for _, child in ipairs(play.children) do
       if child.name == "mute" then
-        local entry = articulation_map["mute"]
-        if entry then addEvent(entry, child) end
+        local mute_text = getNodeText(child)
+        if mute_text == "palm" then
+          local entry = articulation_map["palm mute"]
+          if entry then addEvent(entry, child, "palm") end
+        elseif mute_text == "straight" then
+          local entry = articulation_map["straight mute"]
+          if entry then addEvent(entry, child, "straight") end
+        end
+      end
+    end
+  end
+
+  -- Detect let ring from GP processing instructions (<?GP <root><letring/></root>?>)
+  -- converted to <_gp_> elements by preprocess_gp_pis() before parsing.
+  if articulation_enabled["letring"] ~= false then
+    for _, child in ipairs(note_node.children or {}) do
+      if child.name == "_gp_" then
+        local gp_root = findChild(child, "root")
+        if gp_root and findChild(gp_root, "letring") then
+          local entry = articulation_map["letring"]
+          if entry then addEvent(entry, nil, "letring") end
+          break
+        end
+      end
+    end
+  end
+
+  -- Detect vibrato from GP processing instructions (<?GP <root><vibrato type="..."/></root>?>)
+  -- converted to <_gp_> elements by preprocess_gp_pis() before parsing.
+  if articulation_enabled["vibrato"] ~= false then
+    for _, child in ipairs(note_node.children or {}) do
+      if child.name == "_gp_" then
+        local gp_root = findChild(child, "root")
+        if gp_root and findChild(gp_root, "vibrato") then
+          local entry = articulation_map["vibrato"]
+          if entry then addEvent(entry, nil, "vibrato") end
+          break
+        end
       end
     end
   end
@@ -979,17 +1391,24 @@ end
 -- Helper to resolve slide info from the articulation map
 -- ============================================================================
 local function getSlideInfo(slide_node, default_fret)
+  -- Check if this slide articulation is disabled in settings
+  if slide_node and articulation_enabled[slide_node.name] == false then return nil end
   local entry = articulation_map[slide_node.name]
   if not entry then return nil end
   local info = {}
-  -- resolve type
-  if type(entry.type) == "function" then
+  local slide_name = slide_node.name
+  -- resolve type, then apply override
+  if articulation_type_override[slide_name] then
+    info.type = articulation_type_override[slide_name]
+  elseif type(entry.type) == "function" then
     info.type = entry.type(slide_node)
   else
     info.type = entry.type
   end
-  -- resolve symbol
-  if type(entry.symbol) == "function" then
+  -- resolve symbol, then apply override
+  if articulation_symbol_override[slide_name] then
+    info.symbol = articulation_symbol_override[slide_name]
+  elseif type(entry.symbol) == "function" then
     info.symbol = entry.symbol(slide_node)
   else
     info.symbol = entry.symbol
@@ -997,11 +1416,21 @@ local function getSlideInfo(slide_node, default_fret)
   if info.symbol and info.symbol:find("%%d") then
     info.symbol = info.symbol:gsub("%%d", tostring(default_fret))
   end
-  -- resolve no_prefix
-  if type(entry.no_prefix) == "function" then
+  -- resolve no_prefix, then apply override
+  if articulation_no_prefix_override[slide_name] ~= nil then
+    info.no_prefix = articulation_no_prefix_override[slide_name]
+  elseif type(entry.no_prefix) == "function" then
     info.no_prefix = entry.no_prefix(slide_node)
   else
     info.no_prefix = entry.no_prefix or false
+  end
+  -- resolve replaces_fret, then apply override
+  if articulation_replaces_fret_override[slide_name] ~= nil then
+    info.replaces_fret = articulation_replaces_fret_override[slide_name]
+  elseif type(entry.replaces_fret) == "function" then
+    info.replaces_fret = entry.replaces_fret(slide_node)
+  else
+    info.replaces_fret = entry.replaces_fret or false
   end
   return info
 end
@@ -1175,7 +1604,8 @@ function ImportMusicXMLWithOptions(filepath, options)
   local content = f:read("*all")
   f:close()
 
-  -- 2. Parse XML
+  -- 2. Parse XML (preprocess Guitar Pro PIs so letring etc. are accessible)
+  content = preprocess_gp_pis(content)
   local root = parseXML(content)
   if not root then
     reaper.ShowMessageBox("Failed to parse XML.", "Error", 0)
@@ -1280,6 +1710,10 @@ function ImportMusicXMLWithOptions(filepath, options)
 
     -- Per‑staff pending slides (for start/stop pairing)
     local staff_pending_slides = {}
+
+    -- Per‑staff span state for duration line feature
+    -- [staff_num][art_name] = { last_idx, last_pos, count }
+    local staff_span_state = {}
 
     -- Time tracking for this part
     local cur_pos_ticks = 0
@@ -1532,41 +1966,139 @@ function ImportMusicXMLWithOptions(filepath, options)
                       -- --- Process non‑slide articulations ---
                       local articulation_events = getArticulationEvents(elem, fret_num)
 
-                      local fret_replaced = false
+                      -- Combine replaces_fret events: first non-suffix is the "main" symbol;
+                      -- suffix events (e.g. vibrato "~") are appended to it.
+                      -- If only suffix events exist, fret_num is used as the base.
+                      local main_ev = nil
+                      local suffix_chars = ""
+                      local suffix_type = 1
                       for _, ev in ipairs(articulation_events) do
                         if ev.replaces_fret then
-                          fret_replaced = true
-                          if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
-                          local text = ev.symbol
-                          if not ev.no_prefix then text = "_" .. text end
-                          table.insert(staff_texts[staff_num], {
-                            pos = start_ticks,
-                            text = text,
-                            type = ev.type
-                          })
-                          break
+                          if ev.is_suffix then
+                            suffix_chars = suffix_chars .. (ev.symbol or "")
+                            suffix_type = ev.type
+                          elseif not main_ev then
+                            main_ev = ev
+                          end
+                        end
+                      end
+
+                      local fret_replaced = false
+                      if main_ev ~= nil or suffix_chars ~= "" then
+                        fret_replaced = true
+                        if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                        local base_sym, ev_type, no_pfx
+                        if main_ev then
+                          base_sym = main_ev.symbol
+                          ev_type  = main_ev.type
+                          no_pfx   = main_ev.no_prefix
+                        else
+                          -- Only suffix(es), no main: prepend fret_num as base
+                          base_sym = tostring(fret_num)
+                          ev_type  = suffix_type
+                          no_pfx   = false
+                        end
+                        local text = base_sym .. suffix_chars
+                        if not no_pfx then text = "_" .. text end
+                        table.insert(staff_texts[staff_num], {
+                          pos = start_ticks,
+                          text = text,
+                          type = ev_type
+                        })
+                      end
+
+                      -- Pre-check: if a slide-stop/standalone with replaces_fret exists, suppress separate fret event
+                      if not fret_replaced and notations then
+                        for _, child in ipairs(notations.children or {}) do
+                          if slide_names[child.name] then
+                            local stype = child.attrs and child.attrs.type
+                            if stype ~= "start" then
+                              local slide_entry = articulation_map[child.name]
+                              local slide_rf = (articulation_replaces_fret_override[child.name] ~= nil)
+                                  and articulation_replaces_fret_override[child.name]
+                                  or (slide_entry and slide_entry.replaces_fret)
+                              if slide_rf then
+                                fret_replaced = true
+                                break
+                              end
+                            end
+                          end
                         end
                       end
 
                       if not fret_replaced then
-                        if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
-                        table.insert(staff_texts[staff_num], {
-                          pos = start_ticks,
-                          text = "_" .. fret_num,
-                          type = 1
-                        })
+                        if fret_number_enabled then
+                          if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                          table.insert(staff_texts[staff_num], {
+                            pos = start_ticks,
+                            text = "_" .. fret_num,
+                            type = fret_number_type
+                          })
+                        end
                       end
 
+                      local seen_span_arts = {}
                       for _, ev in ipairs(articulation_events) do
                         if not ev.replaces_fret then
                           if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
-                          local text = ev.symbol
-                          if not ev.no_prefix then text = "_" .. text end
-                          table.insert(staff_texts[staff_num], {
-                            pos = start_ticks,
-                            text = text,
-                            type = ev.type
-                          })
+                          local is_span_art = span_line_enabled
+                              and (ev.type == 6 or ev.type == 7)
+                              and ev.art_name ~= nil
+                          if is_span_art then
+                            local aname = ev.art_name
+                            seen_span_arts[aname] = true
+                            if not chord then
+                              -- Only advance spans on non-chord (new time position) notes
+                              if not staff_span_state[staff_num] then
+                                staff_span_state[staff_num] = {}
+                              end
+                              local span = staff_span_state[staff_num][aname]
+                              if not span then
+                                -- First occurrence: emit normal label
+                                local text = ev.symbol
+                                if not ev.no_prefix then text = "_" .. text end
+                                table.insert(staff_texts[staff_num], {
+                                  pos = start_ticks, text = text, type = ev.type
+                                })
+                                staff_span_state[staff_num][aname] = {
+                                  last_idx = #staff_texts[staff_num],
+                                  last_pos = start_ticks,
+                                  count = 1
+                                }
+                              else
+                                -- Continuation: upgrade previous "-|" to "----" if needed
+                                if span.count >= 2 then
+                                  staff_texts[staff_num][span.last_idx].text = "----"
+                                end
+                                -- Emit closing mark for now (upgraded to "----" if more follow)
+                                table.insert(staff_texts[staff_num], {
+                                  pos = start_ticks, text = "-|", type = ev.type
+                                })
+                                span.last_idx = #staff_texts[staff_num]
+                                span.last_pos = start_ticks
+                                span.count = span.count + 1
+                              end
+                            end
+                            -- chord notes: just mark seen, no text emitted
+                          else
+                            -- Normal (non-span or span feature disabled) emission
+                            local text = ev.symbol
+                            if not ev.no_prefix then text = "_" .. text end
+                            table.insert(staff_texts[staff_num], {
+                              pos = start_ticks,
+                              text = text,
+                              type = ev.type
+                            })
+                          end
+                        end
+                      end
+
+                      -- Close spans that were not present on this non-chord note
+                      if not chord and staff_span_state[staff_num] then
+                        for aname_k, _ in pairs(staff_span_state[staff_num]) do
+                          if not seen_span_arts[aname_k] then
+                            staff_span_state[staff_num][aname_k] = nil
+                          end
                         end
                       end
 
@@ -1592,10 +2124,12 @@ function ImportMusicXMLWithOptions(filepath, options)
                                 -- look for matching start on the same string
                                 if staff_pending_slides[staff_num] and staff_pending_slides[staff_num][string_num] then
                                   local pending = staff_pending_slides[staff_num][string_num]
-                                  -- Place slide event at the start of the second note (stop position)
+                                  -- Place slide event at the start of the second note (stop position).
+                                  -- Use info.symbol (resolved at stop/destination note) so the fret
+                                  -- number embedded via %d reflects the destination note's fret.
                                   if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
-                                  local text = pending.symbol
-                                  if not pending.no_prefix then text = "_" .. text end
+                                  local text = info.symbol
+                                  if not info.no_prefix then text = "_" .. text end
                                   table.insert(staff_texts[staff_num], {
                                     pos = start_ticks,   -- at second note's start
                                     text = text,
@@ -1897,6 +2431,9 @@ function ImportMusicXMLWithOptions(filepath, options)
           take = reaper.AddTakeToMediaItem(item)
         end
 
+        -- Name the take after the track
+        reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", track_name, true)
+
         -- Insert notes
         for _, n in ipairs(notes) do
           reaper.MIDI_InsertNote(take, false, false, n.pos, n.endpos, n.channel, n.pitch, n.vel, false)
@@ -1969,6 +2506,12 @@ local track_checkboxes = {}  -- Dynamic list: { {name="...", checked=true, part_
 local import_all_checked = true  -- "Import All" master checkbox state
 local track_scroll_offset = 0  -- Scroll offset (in rows) for the track list
 local scrollbar_dragging = false  -- Whether we're dragging the scrollbar
+local settings_mode = false  -- Whether the settings view is active
+local settings_scroll_offset = 0  -- Scroll offset for settings articulation list
+local settings_btn_hovered = false  -- Hover state for settings button in main view
+local pre_settings_width = nil  -- Window width before entering settings mode
+local pre_settings_height = nil -- Window height before entering settings mode
+local articulations_in_file = {}  -- Set of articulation names found in the selected file's checked tracks
 
 -- Text selection state
 local text_sel = {
@@ -2043,7 +2586,8 @@ for i, cb in ipairs(checkboxes_list) do
 end
 
 -- Calculate window dimensions dynamically (vertical layout)
-gui.width = horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin
+local min_btn_area_width = 110 * 3 + 10 * 2 + horizontal_margin * 2  -- 3 buttons + margins
+gui.width = math.max(horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin, min_btn_area_width)
 gui.height = header_height + vertical_margin + (#checkboxes_list * checkbox_row_height) + vertical_margin + file_info_height + vertical_margin + button_height_area
 
 -- Global state
@@ -2087,6 +2631,147 @@ function get_tracks_from_xml(xml_content)
         end
     end
     return tracks 
+end
+
+-- Scan a MusicXML file for articulations present in checked tracks
+function scan_articulations_in_xml()
+    articulations_in_file = {}
+    if not selected_file_path then return end
+
+    local f = io.open(selected_file_path, "r")
+    if not f then return end
+    local xml_content = f:read("*all")
+    f:close()
+
+    xml_content = preprocess_gp_pis(xml_content)
+    local root = parseXML(xml_content)
+    if not root then return end
+
+    -- Build set of checked track names
+    local checked_names = {}
+    for _, tcb in ipairs(track_checkboxes) do
+        if tcb.checked then
+            checked_names[tcb.name] = true
+        end
+    end
+
+    -- Map part IDs to names from <part-list>
+    local part_names = {}
+    local part_list = findChild(root, "part-list")
+    if part_list then
+        for _, score_part in ipairs(findChildren(part_list, "score-part")) do
+            local id = getAttribute(score_part, "id")
+            local name = getChildText(score_part, "part-name")
+            if id and name then
+                part_names[id] = name
+            end
+        end
+    end
+
+    local found = {}
+
+    -- Helper: register a found articulation by its XML element name
+    local function mark_found(xml_name)
+        local settings_name = xml_to_settings_name[xml_name] or xml_name
+        if settings_name_set[settings_name] then
+            found[settings_name] = true
+        end
+    end
+
+    -- Scan each <part>
+    local parts = findChildren(root, "part")
+    for _, part_node in ipairs(parts) do
+        local part_id = getAttribute(part_node, "id")
+        local base_track_name = part_names[part_id] or ("Part " .. (part_id or "?"))
+
+        -- Skip parts not checked for import
+        if not checked_names[base_track_name] then goto continue_scan_part end
+
+        local measures = findChildren(part_node, "measure")
+        for _, measure_node in ipairs(measures) do
+            for _, elem in ipairs(measure_node.children or {}) do
+                -- Check for <harmony> at measure level → "chord"
+                if elem.name == "harmony" then
+                    found["chord"] = true
+                end
+
+                if elem.name == "note" then
+                    -- Check for <grace> child → "grace-note"
+                    if findChild(elem, "grace") then
+                        found["grace-note"] = true
+                    end
+
+                    -- Check for <lyric> child → "lyric"
+                    if findChild(elem, "lyric") then
+                        found["lyric"] = true
+                    end
+
+                    -- Check <notations> subtree
+                    local notations = findChild(elem, "notations")
+                    if notations then
+                        local articulations = findChild(notations, "articulations")
+                        if articulations and articulations.children then
+                            for _, child in ipairs(articulations.children) do
+                                mark_found(child.name)
+                            end
+                        end
+
+                        local technical = findChild(notations, "technical")
+                        if technical and technical.children then
+                            for _, child in ipairs(technical.children) do
+                                if child.name == "harmonic" then
+                                    -- Distinguish natural from artificial
+                                    if findChild(child, "natural") then
+                                        found["natural-harmonic"] = true
+                                    else
+                                        found["artificial-harmonic"] = true
+                                    end
+                                else
+                                    mark_found(child.name)
+                                end
+                            end
+                        end
+
+                        -- Other notations children (including slides)
+                        for _, child in ipairs(notations.children or {}) do
+                            if child.name ~= "articulations" and child.name ~= "technical" then
+                                mark_found(child.name)
+                            end
+                        end
+                    end
+
+                    -- Check <play>/<mute>
+                    local play = findChild(elem, "play")
+                    if play and play.children then
+                        for _, child in ipairs(play.children) do
+                            if child.name == "mute" then
+                                local mute_text = getNodeText(child)
+                                if mute_text == "palm" then
+                                    found["palm"] = true
+                                elseif mute_text == "straight" then
+                                    found["straight"] = true
+                                end
+                            end
+                        end
+                    end
+
+                    -- Check for let ring from GP PI (<_gp_> elements)
+                    for _, child in ipairs(elem.children or {}) do
+                        if child.name == "_gp_" then
+                            local gp_root = findChild(child, "root")
+                            if gp_root and findChild(gp_root, "letring") then
+                                found["letring"] = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        ::continue_scan_part::
+    end
+
+    articulations_in_file = found
 end
 
 -- Find character index (0 to #text) in text closest to pixel position px
@@ -2202,18 +2887,19 @@ function resize_window()
         if w > max_label_width then max_label_width = w end
     end
     -- Account for file info text width
+    local min_btn_width = 110 * 3 + 10 * 2 + horizontal_margin * 2  -- 3 buttons + margins
     if selected_file_name then
         local info_text = selected_file_name .. " [" .. (selected_file_track_count or 0) .. " tracks]"
         local fw = gfx.measurestr(info_text)
         -- File info needs some margin on both sides
         local needed_for_file = fw + horizontal_margin * 2
         local needed_for_labels = horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin
-        local new_width = math.max(needed_for_file, needed_for_labels)
+        local new_width = math.max(needed_for_file, needed_for_labels, min_btn_width)
         if new_width > gui.width then
             gui.width = math.min(new_width, MAX_WINDOW_WIDTH)
         end
     else
-        local new_width = horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin
+        local new_width = math.max(horizontal_margin + max_label_width + 5 + checkbox_size + horizontal_margin, min_btn_width)
         if new_width > gui.width then
             gui.width = math.min(new_width, MAX_WINDOW_WIDTH)
         end
@@ -2382,6 +3068,739 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
 end
 
 -- ============================================================================
+-- SETTINGS VIEW (articulation checkboxes, symbol input, type selector)
+-- ============================================================================
+local settings_save_hovered = false
+local settings_restore_hovered = false
+local settings_close_hovered = false
+
+-- Text input state for symbol editing
+local sym_edit_active = false   -- whether a symbol input is being edited
+local sym_edit_index = nil      -- index into articulation_names_ordered
+local sym_edit_text = ""        -- current text being edited
+local sym_edit_cursor = 0       -- cursor position in text
+
+-- Column widths for settings layout
+local SYM_BOX_WIDTH = 100      -- symbol text input box width
+local TYPE_BTN_WIDTH = 80      -- type selector button width
+local REPL_COL_WIDTH = 100     -- replace fret column width (wide enough for header label)
+local COL_SPACING = 8          -- spacing between columns
+
+-- Tooltip definitions for column headers and special elements
+local settings_tooltips = {
+    Sym   = "Symbol text written as event.\nClick to edit, Enter to confirm.",
+    Type  = "Event type: Text (note-level),\nMarker (below tab), Cue (above tab).\nMousewheel to cycle.",
+    RF    = "Replace Fret: when checked,\nthis articulation replaces the\nfret number instead of adding\na separate event.",
+    Prefix = "Underscore Prefix: when checked,\nthe symbol is prefixed with '_'\nfor note-level text events.",
+    On    = "Enable/Disable: when unchecked,\nthis articulation will be skipped\nduring import.",
+    Fret  = "Fret Number: the base fret number\nwritten as a text event. Disable to\nskip fret numbers entirely.",
+    FretType = "Event type for fret numbers.\nMousewheel to cycle.",
+}
+
+-- Tooltip state
+local settings_tooltip_text = nil  -- current tooltip to show
+local settings_tooltip_x = 0
+local settings_tooltip_y = 0
+
+-- Draw a tooltip box near the given position
+local function draw_tooltip(text, mx, my)
+    if not text then return end
+    local pad = 6
+    local lines = {}
+    for line in text:gmatch("[^\n]+") do
+        table.insert(lines, line)
+    end
+    local max_w = 0
+    for _, line in ipairs(lines) do
+        local lw = gfx.measurestr(line)
+        if lw > max_w then max_w = lw end
+    end
+    local box_w = max_w + pad * 2
+    local box_h = #lines * gfx.texth + pad * 2
+    -- Position: below and to the right of mouse, clamped to window
+    local tx = mx + 12
+    local ty = my + 16
+    if tx + box_w > gfx.w - 4 then tx = gfx.w - 4 - box_w end
+    if ty + box_h > gfx.h - 4 then ty = my - box_h - 4 end
+    if tx < 4 then tx = 4 end
+    if ty < 4 then ty = 4 end
+    -- Background
+    gfx.set(0.12, 0.12, 0.14, 0.95)
+    gfx.rect(tx, ty, box_w, box_h, 1)
+    -- Border
+    gfx.set(0.35, 0.35, 0.4, 1)
+    gfx.rect(tx, ty, box_w, box_h, 0)
+    -- Text
+    gfx.set(0.85, 0.85, 0.85, 1)
+    for i, line in ipairs(lines) do
+        gfx.x = tx + pad
+        gfx.y = ty + pad + (i - 1) * gfx.texth
+        gfx.drawstr(line)
+    end
+end
+
+function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, screen_x, screen_y, mouse_down, char_input)
+    -- Clear text elements for this frame
+    text_elements_frame = {}
+
+    -- Header drag handling
+    local header_hovered = (mouse_y > 0 and mouse_y < header_height)
+    if mouse_clicked and header_hovered then
+        is_dragging = true
+        drag_offset_x = mouse_x
+        drag_offset_y = mouse_y
+    end
+    if is_dragging and window_script then
+        local new_x = math.floor(screen_x - drag_offset_x)
+        local new_y = math.floor(screen_y - drag_offset_y)
+        reaper.JS_Window_Move(window_script, new_x, new_y)
+    end
+    if mouse_released then
+        is_dragging = false
+    end
+
+    -- Button area
+    local btn_width = 130
+    local btn_height = 30
+    local btn_spacing = 10
+    local total_btn_width = btn_width * 3 + btn_spacing * 2
+    local btn_y = gfx.h - btn_height - 10
+    local btn_start_x = (gfx.w - total_btn_width) / 2
+
+    local save_btn_x = btn_start_x
+    local restore_btn_x = save_btn_x + btn_width + btn_spacing
+    local close_btn_x = restore_btn_x + btn_width + btn_spacing
+
+    -- Fret number row, span line row, and highlight scan row (above scrollable list)
+    local fret_row_y = header_height + vertical_margin
+    local span_row_y = fret_row_y + checkbox_row_height
+    local hlscan_row_y = span_row_y + checkbox_row_height
+    local separator_y = hlscan_row_y + checkbox_row_height
+    local col_header_h = math.floor(gfx.texth) + 4
+    local col_header_y = separator_y + 4
+    local list_top = separator_y + 2 + col_header_h + 2
+    local list_bottom = btn_y - 10
+    local list_height = list_bottom - list_top
+    local max_visible = math.floor(list_height / checkbox_row_height)
+    local total_items = #articulation_names_ordered
+    local max_scroll = math.max(0, total_items - max_visible)
+
+    -- Right-side element positions:
+    -- [name_label] ... [sym_box] [type_btn] [repl_fret_cb] [prefix_cb] [enabled_cb]
+    local cb_x = gfx.w - horizontal_margin - checkbox_size
+    local prefix_cb_x = cb_x - COL_SPACING - checkbox_size
+    local repl_col_x = prefix_cb_x - COL_SPACING - REPL_COL_WIDTH
+    local repl_cb_x = repl_col_x + math.floor((REPL_COL_WIDTH - checkbox_size) / 2)
+    local type_btn_x = repl_col_x - COL_SPACING - TYPE_BTN_WIDTH
+    local sym_box_x = type_btn_x - COL_SPACING - SYM_BOX_WIDTH
+    local name_max_w = sym_box_x - horizontal_margin - COL_SPACING
+
+    -- Handle clicks
+    if mouse_clicked then
+        -- Save button
+        if settings_save_hovered then
+            -- Commit any active edit first
+            if sym_edit_active and sym_edit_index then
+                local art_name = articulation_names_ordered[sym_edit_index]
+                if sym_edit_text ~= articulation_default_symbol[art_name] then
+                    articulation_symbol_override[art_name] = sym_edit_text
+                else
+                    articulation_symbol_override[art_name] = nil
+                end
+            end
+            sym_edit_active = false
+            sym_edit_index = nil
+            save_articulation_settings()
+        end
+        -- Restore defaults button
+        if settings_restore_hovered then
+            sym_edit_active = false
+            sym_edit_index = nil
+            restore_default_articulation_settings()
+        end
+        -- Close settings button
+        if settings_close_hovered then
+            -- Commit any active edit
+            if sym_edit_active and sym_edit_index then
+                local art_name = articulation_names_ordered[sym_edit_index]
+                if sym_edit_text ~= articulation_default_symbol[art_name] then
+                    articulation_symbol_override[art_name] = sym_edit_text
+                else
+                    articulation_symbol_override[art_name] = nil
+                end
+            end
+            sym_edit_active = false
+            sym_edit_index = nil
+            settings_mode = false
+            -- Restore pre-settings window size
+            local need_resize = false
+            if pre_settings_width and pre_settings_width ~= gui.width then
+                gui.width = pre_settings_width
+                need_resize = true
+            end
+            if pre_settings_height and pre_settings_height ~= gui.height then
+                gui.height = pre_settings_height
+                need_resize = true
+            end
+            if need_resize then
+                if window_script then
+                    reaper.JS_Window_Resize(window_script, gui.width, gui.height)
+                else
+                    local _, wx, wy = gfx.dock(-1, 0, 0, 0, 0)
+                    gfx.init(SCRIPT_TITLE, gui.width, gui.height, gui.settings.docker_id, wx, wy)
+                end
+            end
+            pre_settings_width = nil
+            pre_settings_height = nil
+            return
+        end
+
+        -- Check click on fret number row
+        if mouse_y > fret_row_y and mouse_y < fret_row_y + checkbox_size then
+            -- Fret number enabled checkbox
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                fret_number_enabled = not fret_number_enabled
+            -- Fret number type button click -> dropdown menu
+            elseif mouse_x > type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH then
+                local menu_str = ""
+                for j, v in ipairs(art_type_values) do
+                    if j > 1 then menu_str = menu_str .. "|" end
+                    if v == fret_number_type then menu_str = menu_str .. "!" end
+                    menu_str = menu_str .. art_type_labels[v]
+                end
+                gfx.x = type_btn_x
+                gfx.y = fret_row_y + checkbox_size
+                local choice = gfx.showmenu(menu_str)
+                if choice > 0 then
+                    fret_number_type = art_type_values[choice]
+                end
+            end
+        end
+
+        -- Check click on span line (duration lines) row
+        if mouse_y > span_row_y and mouse_y < span_row_y + checkbox_size then
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                span_line_enabled = not span_line_enabled
+            end
+        end
+
+        -- Check click on highlight scan row
+        if mouse_y > hlscan_row_y and mouse_y < hlscan_row_y + checkbox_size then
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                highlight_scan_enabled = not highlight_scan_enabled
+                if not highlight_scan_enabled then
+                    articulations_in_file = {}
+                else
+                    scan_articulations_in_xml()
+                end
+            end
+        end
+
+        -- Check clicks on articulation rows
+        local clicked_sym_box = false
+        for i, art_name in ipairs(articulation_names_ordered) do
+            local scrolled_i = i - settings_scroll_offset
+            if scrolled_i >= 1 and scrolled_i <= max_visible then
+                local row_y = list_top + (scrolled_i - 1) * checkbox_row_height
+
+                -- Enabled checkbox click
+                if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
+                   mouse_y > row_y and mouse_y < row_y + checkbox_size then
+                    articulation_enabled[art_name] = not articulation_enabled[art_name]
+                    break
+                end
+
+                -- Prefix checkbox click (checked = uses prefix = no_prefix false)
+                if mouse_x > prefix_cb_x and mouse_x < prefix_cb_x + checkbox_size and
+                   mouse_y > row_y and mouse_y < row_y + checkbox_size then
+                    local current_no_prefix = get_art_no_prefix(art_name)
+                    local new_val = not current_no_prefix
+                    if new_val ~= articulation_default_no_prefix[art_name] then
+                        articulation_no_prefix_override[art_name] = new_val
+                    else
+                        articulation_no_prefix_override[art_name] = nil
+                    end
+                    break
+                end
+
+                -- Replace fret checkbox click
+                if mouse_x > repl_cb_x and mouse_x < repl_cb_x + checkbox_size and
+                   mouse_y > row_y and mouse_y < row_y + checkbox_size then
+                    local current_rf = get_art_replaces_fret(art_name)
+                    local new_val = not current_rf
+                    if new_val ~= articulation_default_replaces_fret[art_name] then
+                        articulation_replaces_fret_override[art_name] = new_val
+                    else
+                        articulation_replaces_fret_override[art_name] = nil
+                    end
+                    break
+                end
+
+                -- Type button click -> dropdown menu
+                if mouse_x > type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH and
+                   mouse_y > row_y and mouse_y < row_y + checkbox_size then
+                    local current_type = get_art_type(art_name)
+                    local menu_str = ""
+                    for j, v in ipairs(art_type_values) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if v == current_type then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. art_type_labels[v]
+                    end
+                    gfx.x = type_btn_x
+                    gfx.y = row_y + checkbox_size
+                    local choice = gfx.showmenu(menu_str)
+                    if choice > 0 then
+                        local new_type = art_type_values[choice]
+                        if new_type ~= articulation_default_type[art_name] then
+                            articulation_type_override[art_name] = new_type
+                        else
+                            articulation_type_override[art_name] = nil
+                        end
+                    end
+                    break
+                end
+
+                -- Symbol box click - activate text editing
+                if mouse_x > sym_box_x and mouse_x < sym_box_x + SYM_BOX_WIDTH and
+                   mouse_y > row_y and mouse_y < row_y + checkbox_size then
+                    -- Commit previous edit if different index
+                    if sym_edit_active and sym_edit_index and sym_edit_index ~= i then
+                        local prev_name = articulation_names_ordered[sym_edit_index]
+                        if sym_edit_text ~= articulation_default_symbol[prev_name] then
+                            articulation_symbol_override[prev_name] = sym_edit_text
+                        else
+                            articulation_symbol_override[prev_name] = nil
+                        end
+                    end
+                    sym_edit_active = true
+                    sym_edit_index = i
+                    sym_edit_text = get_art_symbol(art_name)
+                    sym_edit_cursor = #sym_edit_text
+                    clicked_sym_box = true
+                    break
+                end
+            end
+        end
+
+        -- Click outside any symbol box: commit and deactivate
+        if not clicked_sym_box and sym_edit_active then
+            local art_name = articulation_names_ordered[sym_edit_index]
+            if sym_edit_text ~= articulation_default_symbol[art_name] then
+                articulation_symbol_override[art_name] = sym_edit_text
+            else
+                articulation_symbol_override[art_name] = nil
+            end
+            sym_edit_active = false
+            sym_edit_index = nil
+        end
+    end
+
+    -- Handle keyboard input for symbol editing
+    if sym_edit_active and char_input then
+        if char_input == 8 then  -- Backspace
+            if sym_edit_cursor > 0 then
+                sym_edit_text = sym_edit_text:sub(1, sym_edit_cursor - 1) .. sym_edit_text:sub(sym_edit_cursor + 1)
+                sym_edit_cursor = sym_edit_cursor - 1
+            end
+        elseif char_input == 6579564 then  -- Delete key
+            if sym_edit_cursor < #sym_edit_text then
+                sym_edit_text = sym_edit_text:sub(1, sym_edit_cursor) .. sym_edit_text:sub(sym_edit_cursor + 2)
+            end
+        elseif char_input == 1818584692 then  -- Left arrow
+            if sym_edit_cursor > 0 then sym_edit_cursor = sym_edit_cursor - 1 end
+        elseif char_input == 1919379572 then  -- Right arrow
+            if sym_edit_cursor < #sym_edit_text then sym_edit_cursor = sym_edit_cursor + 1 end
+        elseif char_input == 1752132965 then  -- Home
+            sym_edit_cursor = 0
+        elseif char_input == 6647396 then  -- End
+            sym_edit_cursor = #sym_edit_text
+        elseif char_input == 13 then  -- Enter: commit
+            local art_name = articulation_names_ordered[sym_edit_index]
+            if sym_edit_text ~= articulation_default_symbol[art_name] then
+                articulation_symbol_override[art_name] = sym_edit_text
+            else
+                articulation_symbol_override[art_name] = nil
+            end
+            sym_edit_active = false
+            sym_edit_index = nil
+        elseif char_input == 27 then  -- Escape: cancel
+            sym_edit_active = false
+            sym_edit_index = nil
+        elseif char_input >= 32 and char_input < 127 then  -- Printable ASCII
+            local ch = string.char(char_input)
+            sym_edit_text = sym_edit_text:sub(1, sym_edit_cursor) .. ch .. sym_edit_text:sub(sym_edit_cursor + 1)
+            sym_edit_cursor = sym_edit_cursor + 1
+        end
+    end
+
+    -- Handle mousewheel: scroll list OR cycle type on type buttons
+    if gfx.mouse_wheel ~= 0 then
+        local wheel_handled = false
+        -- Check if mouse is over fret number type button
+        if mouse_x > type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH and
+           mouse_y > fret_row_y and mouse_y < fret_row_y + checkbox_size then
+            local current_idx = 1
+            for j, v in ipairs(art_type_values) do
+                if v == fret_number_type then current_idx = j; break end
+            end
+            local delta = gfx.mouse_wheel > 0 and -1 or 1
+            current_idx = current_idx + delta
+            if current_idx < 1 then current_idx = #art_type_values end
+            if current_idx > #art_type_values then current_idx = 1 end
+            fret_number_type = art_type_values[current_idx]
+            wheel_handled = true
+        end
+        -- Check if mouse is over an articulation type button
+        if not wheel_handled then
+        for i, art_name in ipairs(articulation_names_ordered) do
+            local scrolled_i = i - settings_scroll_offset
+            if scrolled_i >= 1 and scrolled_i <= max_visible then
+                local row_y = list_top + (scrolled_i - 1) * checkbox_row_height
+                if mouse_x > type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH and
+                   mouse_y > row_y and mouse_y < row_y + checkbox_size then
+                    -- Cycle through type values
+                    local current_type = get_art_type(art_name)
+                    local current_idx = 1
+                    for j, v in ipairs(art_type_values) do
+                        if v == current_type then current_idx = j; break end
+                    end
+                    local delta = gfx.mouse_wheel > 0 and -1 or 1
+                    current_idx = current_idx + delta
+                    if current_idx < 1 then current_idx = #art_type_values end
+                    if current_idx > #art_type_values then current_idx = 1 end
+                    local new_type = art_type_values[current_idx]
+                    if new_type ~= articulation_default_type[art_name] then
+                        articulation_type_override[art_name] = new_type
+                    else
+                        articulation_type_override[art_name] = nil
+                    end
+                    wheel_handled = true
+                    break
+                end
+            end
+        end
+        end  -- if not wheel_handled (articulation type buttons)
+        if not wheel_handled then
+            if mouse_y >= list_top and mouse_y <= list_bottom then
+                local scroll_delta = -math.floor(gfx.mouse_wheel / 120)
+                settings_scroll_offset = settings_scroll_offset + scroll_delta
+                if settings_scroll_offset < 0 then settings_scroll_offset = 0 end
+                if settings_scroll_offset > max_scroll then settings_scroll_offset = max_scroll end
+            end
+        end
+        gfx.mouse_wheel = 0
+    end
+
+    -- Hover states
+    settings_save_hovered = (mouse_x > save_btn_x and mouse_x < save_btn_x + btn_width and
+                             mouse_y > btn_y and mouse_y < btn_y + btn_height)
+    settings_restore_hovered = (mouse_x > restore_btn_x and mouse_x < restore_btn_x + btn_width and
+                                mouse_y > btn_y and mouse_y < btn_y + btn_height)
+    settings_close_hovered = (mouse_x > close_btn_x and mouse_x < close_btn_x + btn_width and
+                              mouse_y > btn_y and mouse_y < btn_y + btn_height)
+
+    -- Determine tooltip for current mouse position
+    settings_tooltip_text = nil
+    -- Column header hover area
+    if mouse_y >= col_header_y and mouse_y < list_top then
+        if mouse_x >= sym_box_x and mouse_x < sym_box_x + SYM_BOX_WIDTH then
+            settings_tooltip_text = settings_tooltips.Sym
+        elseif mouse_x >= type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH then
+            settings_tooltip_text = settings_tooltips.Type
+        elseif mouse_x >= repl_col_x and mouse_x < repl_col_x + REPL_COL_WIDTH then
+            settings_tooltip_text = settings_tooltips.RF
+        elseif mouse_x >= prefix_cb_x and mouse_x < prefix_cb_x + checkbox_size then
+            settings_tooltip_text = settings_tooltips.Prefix
+        elseif mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+            settings_tooltip_text = settings_tooltips.On
+        end
+    end
+    -- Fret number row hover
+    if mouse_y >= fret_row_y and mouse_y < span_row_y then
+        if mouse_x >= type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH then
+            settings_tooltip_text = settings_tooltips.FretType
+        elseif mouse_x >= horizontal_margin and mouse_x < sym_box_x then
+            settings_tooltip_text = settings_tooltips.Fret
+        elseif mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+            settings_tooltip_text = settings_tooltips.Fret
+        end
+    end
+    -- Duration Lines row hover
+    if mouse_y >= span_row_y and mouse_y < hlscan_row_y then
+        if mouse_x >= horizontal_margin and mouse_x < sym_box_x then
+            settings_tooltip_text = "Duration Lines: when enabled,\nconsecutive span articulations\n(Marker/Cue type) emit '----' and '-|'\ninstead of repeating the label."
+        elseif mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+            settings_tooltip_text = "Duration Lines: when enabled,\nconsecutive span articulations\n(Marker/Cue type) emit '----' and '-|'\ninstead of repeating the label."
+        end
+    end
+    -- Highlight scan row hover
+    if mouse_y >= hlscan_row_y and mouse_y < separator_y then
+        if mouse_x >= horizontal_margin and mouse_x < sym_box_x or
+           mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+            settings_tooltip_text = "Highlight Used: scan the selected MusicXML file\nto highlight articulations that are actually used.\nDisable to avoid slowdowns on large files."
+        end
+    end
+
+    -- Draw header
+    draw_header("ARTICULATION SETTINGS", header_height, gui.colors)
+
+    -- Draw fret number row
+    local fret_text_y = fret_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = fret_text_y
+    gfx.drawstr("Fret Number")
+    -- Fret number type button
+    local fret_type_label = art_type_labels[fret_number_type] or ("T" .. tostring(fret_number_type))
+    local fret_type_hovered = (mouse_x > type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH and
+                               mouse_y > fret_row_y and mouse_y < fret_row_y + checkbox_size)
+    local fret_type_is_override = (fret_number_type ~= FRET_NUMBER_TYPE_DEFAULT)
+    if fret_type_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(type_btn_x, fret_row_y, TYPE_BTN_WIDTH, checkbox_size, 1)
+    if fret_type_is_override then
+        gfx.set(0.45, 0.35, 0.17, 1)
+    else
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    end
+    gfx.rect(type_btn_x, fret_row_y, TYPE_BTN_WIDTH, checkbox_size, 0)
+    if fret_type_is_override then
+        gfx.set(1.0, 0.85, 0.5, 1)
+    else
+        gfx.set(table.unpack(gui.colors.TEXT))
+    end
+    local fret_lbl_w = gfx.measurestr(fret_type_label)
+    gfx.x = type_btn_x + (TYPE_BTN_WIDTH - fret_lbl_w) / 2
+    gfx.y = fret_text_y
+    gfx.drawstr(fret_type_label)
+    -- Fret number enabled checkbox
+    draw_checkbox(cb_x, fret_row_y, checkbox_size, cb_x, "", fret_number_enabled, gui.colors, 0, nil)
+
+    -- Draw span line (duration lines) row
+    local span_text_y = span_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = span_text_y
+    gfx.drawstr("Duration Lines")
+    draw_checkbox(cb_x, span_row_y, checkbox_size, cb_x, "", span_line_enabled, gui.colors, 0, nil)
+
+    -- Draw highlight scan row
+    local hlscan_text_y = hlscan_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = hlscan_text_y
+    gfx.drawstr("Highlight Used")
+    draw_checkbox(cb_x, hlscan_row_y, checkbox_size, cb_x, "", highlight_scan_enabled, gui.colors, 0, nil)
+
+    -- Separator line
+    gfx.set(0.3, 0.3, 0.3, 1)
+    gfx.line(horizontal_margin, separator_y, gfx.w - horizontal_margin, separator_y)
+
+    -- Column headers
+    gfx.set(0.5, 0.5, 0.5, 1)
+    local function draw_col_header(x, w, label)
+        local lw = gfx.measurestr(label)
+        gfx.x = x + (w - lw) / 2
+        gfx.y = col_header_y
+        gfx.drawstr(label)
+    end
+    draw_col_header(sym_box_x, SYM_BOX_WIDTH, "Symbol")
+    draw_col_header(type_btn_x, TYPE_BTN_WIDTH, "Type")
+    draw_col_header(repl_col_x, REPL_COL_WIDTH, "Replace Fret")
+    draw_col_header(prefix_cb_x, checkbox_size, "_")
+    draw_col_header(cb_x, checkbox_size, "On")
+
+    -- Draw articulation rows
+    for i, art_name in ipairs(articulation_names_ordered) do
+        local scrolled_i = i - settings_scroll_offset
+        if scrolled_i >= 1 and scrolled_i <= max_visible then
+            local row_y = list_top + (scrolled_i - 1) * checkbox_row_height
+            local text_y = row_y + (checkbox_size - gfx.texth) / 2
+
+            -- Highlight row if this articulation is present in the file
+            if articulations_in_file[art_name] then
+                gfx.set(0.18, 0.25, 0.22, 1)
+                gfx.rect(horizontal_margin - 4, row_y, gfx.w - 2 * horizontal_margin + 8, checkbox_size, 1)
+            end
+
+            -- 1) Draw articulation name (left side, truncated)
+            local display_name = truncate_text(art_name, name_max_w)
+            gfx.set(table.unpack(gui.colors.TEXT))
+            gfx.x = horizontal_margin
+            gfx.y = text_y
+            gfx.drawstr(display_name)
+
+            -- 2) Draw symbol text input box
+            local is_editing = (sym_edit_active and sym_edit_index == i)
+            local sym_display = is_editing and sym_edit_text or get_art_symbol(art_name)
+            local sym_is_override = (articulation_symbol_override[art_name] ~= nil)
+
+            -- Box background
+            if is_editing then
+                gfx.set(0.25, 0.25, 0.25, 1)
+            else
+                gfx.set(0.17, 0.17, 0.17, 1)
+            end
+            gfx.rect(sym_box_x, row_y, SYM_BOX_WIDTH, checkbox_size, 1)
+            -- Box border (highlight if editing or overridden)
+            if is_editing then
+                gfx.set(0.17, 0.45, 0.39, 1)
+            elseif sym_is_override then
+                gfx.set(0.45, 0.35, 0.17, 1)
+            else
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+            end
+            gfx.rect(sym_box_x, row_y, SYM_BOX_WIDTH, checkbox_size, 0)
+
+            -- Symbol text (truncated to fit, with cursor if editing)
+            local sym_text_x = sym_box_x + 4
+            local sym_max_w = SYM_BOX_WIDTH - 8
+            local sym_truncated = truncate_text(sym_display, sym_max_w)
+            if sym_is_override then
+                gfx.set(1.0, 0.85, 0.5, 1)  -- gold tint for overridden
+            else
+                gfx.set(table.unpack(gui.colors.TEXT))
+            end
+            gfx.x = sym_text_x
+            gfx.y = text_y
+            gfx.drawstr(sym_truncated)
+
+            -- Draw cursor if editing
+            if is_editing then
+                local cursor_text = sym_edit_text:sub(1, sym_edit_cursor)
+                local cursor_px = gfx.measurestr(cursor_text)
+                -- Blink cursor (~every 30 frames)
+                if math.floor(os.clock() * 2) % 2 == 0 then
+                    gfx.set(1, 1, 1, 0.9)
+                    gfx.line(sym_text_x + cursor_px, row_y + 2, sym_text_x + cursor_px, row_y + checkbox_size - 2)
+                end
+            end
+
+            -- 3) Draw type selector button
+            local current_type = get_art_type(art_name)
+            local type_label = art_type_labels[current_type] or ("T" .. tostring(current_type))
+            local type_is_override = (articulation_type_override[art_name] ~= nil)
+            local type_hovered = (mouse_x > type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH and
+                                  mouse_y > row_y and mouse_y < row_y + checkbox_size)
+            -- Button background
+            if type_hovered then
+                gfx.set(0.17, 0.45, 0.39, 1)
+            else
+                gfx.set(0.2, 0.2, 0.2, 1)
+            end
+            gfx.rect(type_btn_x, row_y, TYPE_BTN_WIDTH, checkbox_size, 1)
+            -- Button border (highlight if overridden)
+            if type_is_override then
+                gfx.set(0.45, 0.35, 0.17, 1)
+            else
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+            end
+            gfx.rect(type_btn_x, row_y, TYPE_BTN_WIDTH, checkbox_size, 0)
+            -- Button label
+            if type_is_override then
+                gfx.set(1.0, 0.85, 0.5, 1)
+            else
+                gfx.set(table.unpack(gui.colors.TEXT))
+            end
+            local lbl_w = gfx.measurestr(type_label)
+            gfx.x = type_btn_x + (TYPE_BTN_WIDTH - lbl_w) / 2
+            gfx.y = text_y
+            gfx.drawstr(type_label)
+
+            -- 4) Draw replace-fret checkbox
+            local rf_checked = get_art_replaces_fret(art_name)
+            local rf_is_override = (articulation_replaces_fret_override[art_name] ~= nil)
+            -- Background
+            if rf_checked then
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+            else
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+            end
+            gfx.rect(repl_cb_x, row_y, checkbox_size, checkbox_size, 1)
+            -- Border (gold if overridden)
+            if rf_is_override then
+                gfx.set(0.45, 0.35, 0.17, 1)
+            else
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+            end
+            gfx.rect(repl_cb_x, row_y, checkbox_size, checkbox_size, 0)
+            gfx.set(table.unpack(gui.colors.CHECKBOX_INNER_BORDER))
+            gfx.rect(repl_cb_x + 1, row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+            if rf_checked then
+                if rf_is_override then
+                    gfx.set(1.0, 0.85, 0.5, 1)
+                else
+                    gfx.set(table.unpack(gui.colors.CHECKMARK))
+                end
+                gfx.x = repl_cb_x + (checkbox_size - gfx.measurestr("✓")) / 2
+                gfx.y = row_y + (checkbox_size - gfx.texth) / 2
+                gfx.drawstr("✓")
+            end
+
+            -- 5) Draw prefix checkbox (checked = uses _ prefix = no_prefix is false)
+            local pfx_checked = not get_art_no_prefix(art_name)
+            local pfx_is_override = (articulation_no_prefix_override[art_name] ~= nil)
+            if pfx_checked then
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+            else
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+            end
+            gfx.rect(prefix_cb_x, row_y, checkbox_size, checkbox_size, 1)
+            if pfx_is_override then
+                gfx.set(0.45, 0.35, 0.17, 1)
+            else
+                gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+            end
+            gfx.rect(prefix_cb_x, row_y, checkbox_size, checkbox_size, 0)
+            gfx.set(table.unpack(gui.colors.CHECKBOX_INNER_BORDER))
+            gfx.rect(prefix_cb_x + 1, row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+            if pfx_checked then
+                if pfx_is_override then
+                    gfx.set(1.0, 0.85, 0.5, 1)
+                else
+                    gfx.set(table.unpack(gui.colors.CHECKMARK))
+                end
+                gfx.x = prefix_cb_x + (checkbox_size - gfx.measurestr("✓")) / 2
+                gfx.y = row_y + (checkbox_size - gfx.texth) / 2
+                gfx.drawstr("✓")
+            end
+
+            -- 6) Draw checkbox (enabled/disabled)
+            draw_checkbox(cb_x, row_y, checkbox_size, cb_x, "", articulation_enabled[art_name], gui.colors, 0, nil)
+        end
+    end
+
+    -- Draw scrollbar if needed
+    if total_items > max_visible then
+        local scrollbar_width = 8
+        local scrollbar_x = gfx.w - scrollbar_width - 4
+        local scrollbar_track_height = list_height
+        local thumb_height = math.max(20, math.floor(scrollbar_track_height * max_visible / total_items))
+        local current_max_scroll = math.max(1, max_scroll)
+        local thumb_y = list_top + math.floor((scrollbar_track_height - thumb_height) * settings_scroll_offset / current_max_scroll)
+
+        gfx.set(0.15, 0.15, 0.15, 1)
+        gfx.rect(scrollbar_x, list_top, scrollbar_width, scrollbar_track_height, 1)
+        gfx.set(0.4, 0.4, 0.4, 1)
+        gfx.rect(scrollbar_x, thumb_y, scrollbar_width, thumb_height, 1)
+    end
+
+    -- Draw buttons
+    draw_button(save_btn_x, btn_y, btn_width, btn_height, "Save",
+                settings_save_hovered, "IMPORT_BTN", gui.colors.BORDER, gui.colors.TEXT)
+    draw_button(restore_btn_x, btn_y, btn_width, btn_height, "Restore",
+                settings_restore_hovered, "BTN", gui.colors.BORDER, gui.colors.TEXT)
+    draw_button(close_btn_x, btn_y, btn_width, btn_height, "Close",
+                settings_close_hovered, "CLOSE_BTN", gui.colors.BORDER, gui.colors.TEXT)
+
+    -- Draw tooltip (on top of everything)
+    draw_tooltip(settings_tooltip_text, mouse_x, mouse_y)
+end
+
+-- ============================================================================
 -- MAIN LOOP
 -- ============================================================================
 
@@ -2392,6 +3811,21 @@ function main_loop()
     local mouse_clicked = mouse_down and (last_mouse_cap & 1 == 0)
     local mouse_released = (last_mouse_cap & 1 == 1) and (gfx.mouse_cap & 1 == 0)
     
+    -- Settings view branch
+    if settings_mode then
+        local char = gfx.getchar()
+        local char_input = (char > 0) and char or nil
+        draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, screen_x, screen_y, mouse_down, char_input)
+        gfx.update()
+        last_mouse_cap = gfx.mouse_cap
+        if char >= 0 then
+            reaper.defer(main_loop)
+        else
+            gfx.quit()
+        end
+        return
+    end
+
     -- Text selection handling (uses previous frame's text_elements_frame)
     if mouse_clicked then
         local elem = find_text_element_at(mouse_x, mouse_y)
@@ -2472,6 +3906,7 @@ function main_loop()
                         track_checkboxes = {}
                     end
                     resize_window()
+                    if highlight_scan_enabled then scan_articulations_in_xml() end
                 end
                 -- Clear any selection started during click
                 text_sel.element_id = nil
@@ -2482,11 +3917,11 @@ function main_loop()
         end
     end
 
-    -- Button area - bottom with two buttons side by side
+    -- Button area - bottom with three buttons side by side
     local btn_width = 110
     local btn_height = 30
     local btn_spacing = 10
-    local total_btn_width = btn_width * 2 + btn_spacing
+    local total_btn_width = btn_width * 3 + btn_spacing * 2
     local btn_y = gfx.h - btn_height - 10
     local btn_start_x = (gfx.w - total_btn_width) / 2
     
@@ -2494,8 +3929,12 @@ function main_loop()
     local import_btn_x = btn_start_x
     local import_btn_y = btn_y
     
+    -- Settings button (center)
+    local settings_btn_x = import_btn_x + btn_width + btn_spacing
+    local settings_btn_y = btn_y
+    
     -- Cancel button (right)
-    local cancel_btn_x = import_btn_x + btn_width + btn_spacing
+    local cancel_btn_x = settings_btn_x + btn_width + btn_spacing
     local cancel_btn_y = btn_y
     
     -- File info area for clicking to select file
@@ -2545,6 +3984,31 @@ function main_loop()
             end
         end
 
+        -- Settings button
+        if settings_btn_hovered then
+            settings_mode = true
+            settings_scroll_offset = 0
+            sym_edit_active = false
+            sym_edit_index = nil
+            -- Save current size and resize for settings view
+            pre_settings_width = gui.width
+            pre_settings_height = gui.height
+            local min_settings_w = horizontal_margin + 150 + COL_SPACING + SYM_BOX_WIDTH + COL_SPACING + TYPE_BTN_WIDTH + COL_SPACING + REPL_COL_WIDTH + COL_SPACING + checkbox_size + COL_SPACING + checkbox_size + horizontal_margin
+            local settings_w = math.max(min_settings_w, 660)
+            local settings_h = math.min(MAX_WINDOW_HEIGHT, 700)
+            local need_resize = false
+            if gfx.w < settings_w then gui.width = settings_w; need_resize = true end
+            if gfx.h < settings_h then gui.height = settings_h; need_resize = true end
+            if need_resize then
+                if window_script then
+                    reaper.JS_Window_Resize(window_script, gui.width, gui.height)
+                else
+                    local _, wx, wy = gfx.dock(-1, 0, 0, 0, 0)
+                    gfx.init(SCRIPT_TITLE, gui.width, gui.height, gui.settings.docker_id, wx, wy)
+                end
+            end
+        end
+
         -- Checkboxes (vertical layout - aligned)
         for i, cb in ipairs(checkboxes_list) do
             local cb_x = gfx.w - horizontal_margin - checkbox_size
@@ -2580,6 +4044,7 @@ function main_loop()
                 for _, tcb in ipairs(track_checkboxes) do
                     tcb.checked = import_all_checked
                 end
+                if highlight_scan_enabled then scan_articulations_in_xml() end
             else
                 -- Individual track checkboxes (account for scroll offset)
                 local tracks_area_top = track_section_y + checkbox_row_height
@@ -2600,6 +4065,7 @@ function main_loop()
                                 if not t.checked then all_checked = false; break end
                             end
                             import_all_checked = all_checked
+                            if highlight_scan_enabled then scan_articulations_in_xml() end
                             break
                         end
                     end
@@ -2629,6 +4095,8 @@ function main_loop()
     -- Hover states for buttons
     import_btn_hovered = (mouse_x > import_btn_x and mouse_x < import_btn_x + btn_width and
                           mouse_y > import_btn_y and mouse_y < import_btn_y + btn_height)
+    settings_btn_hovered = (mouse_x > settings_btn_x and mouse_x < settings_btn_x + btn_width and
+                            mouse_y > settings_btn_y and mouse_y < settings_btn_y + btn_height)
     cancel_btn_hovered = (mouse_x > cancel_btn_x and mouse_x < cancel_btn_x + btn_width and
                           mouse_y > cancel_btn_y and mouse_y < cancel_btn_y + btn_height)
     
@@ -2692,9 +4160,11 @@ function main_loop()
         end
     end
     
-    -- Draw buttons (Import and Cancel)
+    -- Draw buttons (Import, Settings, and Cancel)
     draw_button(import_btn_x, import_btn_y, btn_width, btn_height, "Import",
                 import_btn_hovered, "IMPORT_BTN", gui.colors.BORDER, gui.colors.TEXT)
+    draw_button(settings_btn_x, settings_btn_y, btn_width, btn_height, "Settings",
+                settings_btn_hovered, "BTN", gui.colors.BORDER, gui.colors.TEXT)
     draw_button(cancel_btn_x, cancel_btn_y, btn_width, btn_height, "Cancel",
                 cancel_btn_hovered, "CLOSE_BTN", gui.colors.BORDER, gui.colors.TEXT)
 
