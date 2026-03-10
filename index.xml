@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="29d9944678878b4aa47aed8e6ad3413ae4b4948d">
+<index version="1" name="konst_reascripts" commit="c4d290653b0f42c3ace386fd690c2acf716c795d">
   <category name="ImportMusicXML">
     <reapack name="konst_Import MusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
@@ -21,6 +21,26 @@ v1.0 - Initial release]]></changelog>
 v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
 v1.0 - Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/29d9944678878b4aa47aed8e6ad3413ae4b4948d/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+      <version name="1.3" author="kkonstantin2000" time="2026-03-10T18:02:42Z">
+        <changelog><![CDATA[v1.3 - Added Settings panel with per-articulation controls:
+         symbol text, event type (Text/Marker/Cue), Replace Fret checkbox, underscore prefix toggle, enable/disable
+       - Fret Number global setting: event type selector and enable/disable checkbox
+       - Duration Lines toggle: consecutive Marker/Cue span articulations emit "----" / "-|" instead of repeating the label
+       - Highlight Used toggle: optionally scan the MusicXML to highlight which articulations appear in the file
+       - All settings persisted via ExtState (Save/Restore Defaults buttons)
+       - Fixed vibrato, bends, let ring parsing
+       - Bend variants (bend, bend release, pre-bend, 1/2 bend, full bend, etc.) treated as standard articulation rows
+       - Fixed harmonics: natural uses <fret> format, artificial uses "fret <fret+12>" format; vibrato and other suffix articulations now combine with the base symbol (e.g. "1 <13>~")
+v1.2 - Added track list with checkboxes to select specific tracks for import
+     - Case‑insensitive track name matching
+     - UI: integrated file selection directly into the "No file selected" area (removed separate button)
+     - Persistent storage of last imported file path
+     - Improved text selection: text elements can now be selected with left‑click dragging (standard mouse behavior)
+     - Added undo point after import for safer CTRL+Z
+v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
+v1.0 - Initial release]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/c4d290653b0f42c3ace386fd690c2acf716c795d/ImportMusicXML/konst_Import%20MusicXML.lua</source>
       </version>
     </reapack>
   </category>
