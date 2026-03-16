@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="c4d290653b0f42c3ace386fd690c2acf716c795d">
+<index version="1" name="konst_reascripts" commit="f0e026f6d3772c3f5dba59623bb17712154f310e">
   <category name="ImportMusicXML">
     <reapack name="konst_Import MusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
@@ -41,6 +41,46 @@ v1.2 - Added track list with checkboxes to select specific tracks for import
 v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
 v1.0 - Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/c4d290653b0f42c3ace386fd690c2acf716c795d/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+      <version name="1.4" author="kkonstantin2000" time="2026-03-16T03:59:25Z">
+        <changelog><![CDATA[v1.4 - MusicXML Export: full export of selected MIDI items to MusicXML with staff grouping, measures, notes, and articulations
+     - Import/Export Key Signatures: bidirectional key signature support via REAPER KSIG notation events
+     - Key Signature UI: interactive root and scale buttons in EXPORT settings to set key signature on selected items
+     - Import MIDI Program Banks: preserves bank/program data from MusicXML (Bank Select MSB/LSB + Program Change)
+     - Open After Export: option to auto-open specified application after export
+     - Open Folder After Export: option to reveal the exported file in Windows Explorer
+     - Drag & Drop: MusicXML files can be dropped directly from file explorer onto the script window
+     - Clickable Articulation Labels: click articulation names in settings to insert text events on selected MIDI notes; Alt+Click to remove
+     - Settings Sections: organized settings panel into GENERAL, EXPORT, IMPORT, and ARTICULATION sections
+     - Auto-Focus: optional automatic window focus on mouse hover
+     - Stay on Top: keep the script window above other windows
+     - Docker: dock the script window to Bottom, Left, Top, or Right
+     - Font Selection: choose from a list of fonts for the UI
+     - Default Path / Last Path: file browser opens to a configured default path or the last used directory
+     - Show in Menu (M checkbox): per-setting toggle to show or hide import checkboxes in the main menu
+     - Window Position Memory: remember and restore the last script window position, or open at mouse cursor
+     - Custom context menu: dark-themed scrollable popup menus replacing REAPER's default light menus
+     - Custom Message Box: non-blocking in-GUI message dialogs with dark theme and text wrapping
+     - Unified Scrollbar: proportional scrollbar with mouse wheel and drag support for settings and track lists
+     - Added confirmation label for saving settings export
+v1.3 - Added Settings panel with per-articulation controls:
+     - symbol text, event type (Text/Marker/Cue), Replace Fret checkbox, underscore prefix toggle, enable/disable
+     - Fret Number global setting: event type selector and enable/disable checkbox
+     - Duration Lines toggle: consecutive Marker/Cue span articulations emit "----" / "-|" instead of repeating the label
+     - Highlight Used toggle: optionally scan the MusicXML to highlight which articulations appear in the file
+     - All settings persisted via ExtState (Save/Restore Defaults buttons)
+     - Fixed vibrato, bends, let ring parsing
+     - Bend variants (bend, bend release, pre-bend, 1/2 bend, full bend, etc.) treated as standard articulation rows
+     - Fixed harmonics: natural uses <fret> format, artificial uses "fret <fret+12>" format; vibrato and other suffix articulations now combine with the base symbol (e.g. "1 <13>~")
+v1.2 - Added track list with checkboxes to select specific tracks for import
+     - Case‑insensitive track name matching
+     - UI: integrated file selection directly into the "No file selected" area (removed separate button)
+     - Persistent storage of last imported file path
+     - Improved text selection: text elements can now be selected with left‑click dragging (standard mouse behavior)
+     - Added undo point after import for safer CTRL+Z
+v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
+v1.0 - Initial release]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/f0e026f6d3772c3f5dba59623bb17712154f310e/ImportMusicXML/konst_Import%20MusicXML.lua</source>
       </version>
     </reapack>
   </category>
