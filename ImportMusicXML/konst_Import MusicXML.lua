@@ -1,29 +1,10 @@
--- @description Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.
+-- @description Import and export MusicXML (.xml) 
 -- @author kkonstantin2000
--- @version 1.4
+-- @version 1.4.1
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
---   v1.4 - MusicXML Export: full export of selected MIDI items to MusicXML with staff grouping, measures, notes, and articulations
---        - Import/Export Key Signatures: bidirectional key signature support via REAPER KSIG notation events
---        - Key Signature UI: interactive root and scale buttons in EXPORT settings to set key signature on selected items
---        - Import MIDI Program Banks: preserves bank/program data from MusicXML (Bank Select MSB/LSB + Program Change)
---        - Open After Export: option to auto-open specified application after export
---        - Open Folder After Export: option to reveal the exported file in Windows Explorer
---        - Drag & Drop: MusicXML files can be dropped directly from file explorer onto the script window
---        - Clickable Articulation Labels: click articulation names in settings to insert text events on selected MIDI notes; Alt+Click to remove
---        - Settings Sections: organized settings panel into GENERAL, EXPORT, IMPORT, and ARTICULATION sections
---        - Auto-Focus: optional automatic window focus on mouse hover
---        - Stay on Top: keep the script window above other windows
---        - Docker: dock the script window to Bottom, Left, Top, or Right
---        - Font Selection: choose from a list of fonts for the UI
---        - Default Path / Last Path: file browser opens to a configured default path or the last used directory
---        - Show in Menu (M checkbox): per-setting toggle to show or hide import checkboxes in the main menu
---        - Window Position Memory: remember and restore the last script window position, or open at mouse cursor
---        - Custom context menu: dark-themed scrollable popup menus replacing REAPER's default light menus
---        - Custom Message Box: non-blocking in-GUI message dialogs with dark theme and text wrapping
---        - Unified Scrollbar: proportional scrollbar with mouse wheel and drag support for settings and track lists
---        - Added confirmation label for saving settings export
+--   v1.4.1 - Fixed settings scrollbar: thumb is now draggable with the mouse
 
 
 --[[
