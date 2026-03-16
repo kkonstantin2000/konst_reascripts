@@ -93,42 +93,98 @@ v1.0 - Initial release]]></changelog>
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55356 ?\u57272 ? Import MusicXML\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 This script imports an uncompressed MusicXML file (e.g., from Guitar Pro) into REAPER, preserving string/fret positions via MIDI channels and text events. It's designed to work seamlessly with {\b ReaTab Hero}, eliminating the need to manually reassign strings and frets after exporting MIDI.\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Features\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Parses {\f1 <string>} and {\f1 <fret>} elements and maps string numbers to MIDI channels (string 1 \u8594 ? channel 7, etc.)\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Converts fret numbers and articulations (slides, hammer-ons, harmonics, mutes, etc.) into text or marker events\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Handles drum parts with configurable per\u8209 ?family channel mapping\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Expands repeats (forward/backward) and respects chord offsets\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Optionally imports tempo and time signature markers\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Creates separate MIDI tracks for each staff\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab {\b Three insertion modes}:\par}
-{\pard \ql \f0 \sa0 \li720 \fi-360 \endash \tx360\tab {\b Create new tracks}: original behavior \u8211- creates a new track for each staff.\par}
-{\pard \ql \f0 \sa0 \li720 \fi-360 \endash \tx360\tab {\b Insert on existing tracks}: places MIDI items on currently selected tracks (one staff per selected track, in order).\par}
-{\pard \ql \f0 \sa0 \li720 \fi-360 \endash \tx360\tab {\b Match tracks by name}: automatically maps staves to existing tracks based on track names (e.g., "Guitar", "Bass", etc.).\sa180\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Stores string tuning as track ExtState for compatibility with ReaTab Hero (ensures correct display of tablature).\sa180\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Installation\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel3 \b \fs24 Via ReaPack (recommended)\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab In REAPER, open {\b Extensions \u8594 ? ReaPack \u8594 ? Import Repositories}\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Paste this link - https://raw.githubusercontent.com/kkonstantin2000/konst_reascripts/master/index.xml\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 3.\tx360\tab Click {\b OK}, then {\b Synchronize}\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab Find the script in the Action List: {\f1 Script: konst_Import MusicXML.lua}\sa180\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel3 \b \fs24 Manual\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Download {\f1 konst_Import MusicXML.lua} from the {\f1 ImportMusicXML} folder and place it in your REAPER Scripts directory.\sa180\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Usage\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab Run the script from the Action List.\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Press button "Select File" and select uncompressed {\f1 .xml} file (MusicXML) in File Explorer.\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 3.\tx360\tab Choose whether to import tempo/time signature markers.\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab New tracks will be created with MIDI items containing notes and text events.\sa180\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 For best results with ReaTab Hero, make sure the target track has the proper string tuning set (the script can now store tuning as track ExtState \u8211- see below).\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Feedback & Contributions\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 Found a bug? Have a feature request? Please open an issue on GitHub or post in the {\field{\*\fldinst{HYPERLINK "https://forum.cockos.com/showthread.php?t=307042"}}{\fldrslt{\ul
-REAPER forum thread
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55356 ?\u57272 ? MusicXML Tools for REAPER\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 This script imports and exports {\b MusicXML} files directly inside REAPER while preserving guitar-specific information such as {\b string and fret positions}, articulations, and track structure.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 It was originally designed to work seamlessly with {\b ReaTab Hero}, eliminating the need to manually reassign strings and frets after exporting MIDI from notation software like Guitar Pro. The script has since grown into a more complete {\b MusicXML workflow tool for REAPER}, supporting both import and export, articulation editing, and flexible project integration.\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Features\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 MusicXML Import\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Parses {\f1 <string>} and {\f1 <fret>} elements and maps string numbers to MIDI channels (string 1 \u8594 ? channel 7, etc.)\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Preserves guitar articulation information such as slides, hammer-ons, vibrato, harmonics, bends, mutes, and more\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Converts articulations into {\b text events, markers, or cue events} (fully configurable)\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Handles {\b drum parts} with configurable per-family MIDI channel mapping\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Expands repeat sections (forward/backward repeats)\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Supports chord offsets and complex rhythmic structures\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Optional {\b tempo and time signature import}\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 MusicXML Export\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Export selected {\b MIDI items back to MusicXML}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Preserves:\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab measures\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab staff grouping\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab notes\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab articulations\sa180\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Supports {\b key signatures via REAPER KSIG notation events}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Includes a small UI to quickly set key signatures before export\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Preserves {\b MIDI bank/program data} (Bank Select MSB/LSB + Program Change)\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Track & Project Integration\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Creates separate MIDI tracks for each staff\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Three insertion modes:\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab {\b Create new tracks} \u8211- original behavior\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab {\b Insert on existing tracks} \u8211- places MIDI items on selected tracks\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab {\b Match tracks by name} \u8211- automatically maps staves to existing tracks\sa180\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Stores {\b string tuning as track ExtState} for compatibility with ReaTab Hero\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Articulation Workflow\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Fully configurable articulation system\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Each articulation can define:\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab symbol text\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab event type (Text / Marker / Cue)\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab fret replacement behavior\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab enable/disable toggle\sa180\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Click articulation labels in settings to {\b insert articulation text events directly on selected MIDI notes}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab {\b Alt + Click} removes articulation events\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 User Interface & Workflow\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Dedicated GUI with organized settings sections:\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab GENERAL\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab IMPORT\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab EXPORT\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab ARTICULATION\sa180\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Drag & drop MusicXML files directly onto the script window\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Custom dark-themed UI elements:\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab scrollable menus\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab message boxes\par}
+{\pard \ql \f0 \sa180 \li720 \fi-360 \endash \tx360\tab unified scrollbars\sa180\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Dockable window (top / bottom / left / right)\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Optional {\b stay-on-top mode}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Optional {\b auto-focus on mouse hover}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Font selection for the UI\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Window position memory\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Default / last path handling for file browsing\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Open exported file or folder automatically after export\sa180\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Installation\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Via ReaPack (recommended)\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 1.\tx360\tab In REAPER open {\b Extensions \u8594 ? ReaPack \u8594 ? Import Repositories}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 2.\tx360\tab Paste the repository link\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 https://raw.githubusercontent.com/kkonstantin2000/konst_reascripts/master/index.xml\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 3.\tx360\tab Click {\b OK}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 4.\tx360\tab Run {\b Extensions \u8594 ? ReaPack \u8594 ? Synchronize packages}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 5.\tx360\tab Install:\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Script: konst_Import MusicXML.lua\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Manual Installation\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Download:\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 konst_Import MusicXML.lua\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 from the repository and place it in your {\b REAPER Scripts} directory, then load it via the {\b Action List}.\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Usage\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 1.\tx360\tab Run the script from the {\b Action List}\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 2.\tx360\tab Select an uncompressed {\b MusicXML (.xml)} file\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 3.\tx360\tab Choose import settings (tempo markers, articulation behavior, etc.)\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 4.\tx360\tab Import the file\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 The script will create MIDI items containing notes, string channel information, and articulation events.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 For best results with {\b ReaTab Hero}, ensure the target track has the correct tuning. The script can automatically store tuning data as {\b track ExtState}.\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Feedback & Contributions\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 If you encounter a bug or have a feature request:\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Open an issue on GitHub\par}
+{\pard \ql \f0 \sa180 \li360 \fi-360 \bullet \tx360\tab Or post in the REAPER forum thread\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 {\field{\*\fldinst{HYPERLINK "https://forum.cockos.com/showthread.php?t=307042"}}{\fldrslt{\ul
+https://forum.cockos.com/showthread.php?t=307042
 }}}
-.\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Credits\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Thanks to {\b ExtremRaym} for ReaTab Hero and for encouraging this project.\par}
-{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Inspired by the REAPER scripting community.\sa180\par}
+\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 Credits\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Thanks to {\b ExtremRaym} for creating {\b ReaTab Hero} and for helpful feedback during development.\par}
 }
 ]]></description>
   </metadata>
