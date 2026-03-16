@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="f0e026f6d3772c3f5dba59623bb17712154f310e">
+<index version="1" name="konst_reascripts" commit="3d133d574d8f5ad4cd1dcbe14f29a2b40ac0b588">
   <category name="ImportMusicXML">
-    <reapack name="konst_Import MusicXML.lua" type="script" desc="Import uncompressed MusicXML (.xml) files and create tracks/MIDI for each staff with tablature or drum notes. Supports three insertion modes: create new tracks, insert on existing tracks, or match tracks by name. Includes custom drum channel mapping and robust repeats.">
+    <reapack name="konst_Import MusicXML.lua" type="script" desc="Import and export MusicXML (.xml)">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
         <changelog><![CDATA[Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/4514e4a97ffc9b20d57157653c6fd88105f2384e/ImportMusicXML/konst_Import%20MusicXML.lua</source>
@@ -81,6 +81,10 @@ v1.2 - Added track list with checkboxes to select specific tracks for import
 v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
 v1.0 - Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/f0e026f6d3772c3f5dba59623bb17712154f310e/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+      <version name="1.4.1" author="kkonstantin2000" time="2026-03-16T09:11:58Z">
+        <changelog><![CDATA[v1.4.1 - Fixed settings scrollbar: thumb is now draggable with the mouse]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/3d133d574d8f5ad4cd1dcbe14f29a2b40ac0b588/ImportMusicXML/konst_Import%20MusicXML.lua</source>
       </version>
     </reapack>
   </category>
