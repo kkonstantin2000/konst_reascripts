@@ -24,23 +24,7 @@
 --        - Custom Message Box: non-blocking in-GUI message dialogs with dark theme and text wrapping
 --        - Unified Scrollbar: proportional scrollbar with mouse wheel and drag support for settings and track lists
 --        - Added confirmation label for saving settings export
---   v1.3 - Added Settings panel with per-articulation controls:
---        - symbol text, event type (Text/Marker/Cue), Replace Fret checkbox, underscore prefix toggle, enable/disable
---        - Fret Number global setting: event type selector and enable/disable checkbox
---        - Duration Lines toggle: consecutive Marker/Cue span articulations emit "----" / "-|" instead of repeating the label
---        - Highlight Used toggle: optionally scan the MusicXML to highlight which articulations appear in the file
---        - All settings persisted via ExtState (Save/Restore Defaults buttons)
---        - Fixed vibrato, bends, let ring parsing
---        - Bend variants (bend, bend release, pre-bend, 1/2 bend, full bend, etc.) treated as standard articulation rows
---        - Fixed harmonics: natural uses <fret> format, artificial uses "fret <fret+12>" format; vibrato and other suffix articulations now combine with the base symbol (e.g. "1 <13>~")
---   v1.2 - Added track list with checkboxes to select specific tracks for import
---        - Case‑insensitive track name matching
---        - UI: integrated file selection directly into the "No file selected" area (removed separate button)
---        - Persistent storage of last imported file path
---        - Improved text selection: text elements can now be selected with left‑click dragging (standard mouse behavior)
---        - Added undo point after import for safer CTRL+Z
---   v1.1 - Added three track insertion modes: new tracks, existing tracks, and tracks by name matching
---   v1.0 - Initial release
+
 
 --[[
   Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
@@ -4051,6 +4035,9 @@ local track_scroll_offset = 0  -- Scroll offset (in rows) for the track list
 local scrollbar_dragging = false  -- Whether we're dragging the scrollbar
 local settings_mode = false  -- Whether the settings view is active
 local settings_scroll_offset = 0  -- Scroll offset for settings view (pixels)
+local settings_sb_dragging = false  -- Whether we're dragging the settings scrollbar thumb
+local settings_sb_drag_start_y = 0  -- Mouse Y when drag started
+local settings_sb_drag_start_offset = 0  -- settings_scroll_offset when drag started
 auto_focus_enabled = true  -- Whether to auto-focus window on mouse hover
 stay_on_top_enabled = false  -- Whether to keep the window always on top
 font_list = {"Outfit", "Arial", "Segoe UI", "Tahoma", "Verdana", "Consolas", "Courier New", "Times New Roman", "Georgia", "Trebuchet MS", "Calibri", "Helvetica"}
@@ -6095,6 +6082,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     end
     if mouse_released then
         is_dragging = false
+        settings_sb_dragging = false
     end
 
     -- Button area
@@ -6166,6 +6154,36 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     local max_scroll = math.max(0, total_content_h - visible_h)
     if settings_scroll_offset > max_scroll then settings_scroll_offset = max_scroll end
     if settings_scroll_offset < 0 then settings_scroll_offset = 0 end
+
+    -- Scrollbar geometry (needed for both input and drawing)
+    local scrollbar_width = 8
+    local scrollbar_x = gfx.w - scrollbar_width - 4
+    local scrollbar_track_height = visible_h
+    local sb_thumb_height = math.max(20, math.floor(scrollbar_track_height * visible_h / math.max(1, total_content_h)))
+    local sb_current_max = math.max(1, max_scroll)
+    local sb_thumb_y = content_top + math.floor((scrollbar_track_height - sb_thumb_height) * settings_scroll_offset / sb_current_max)
+
+    -- Scrollbar drag: start
+    if mouse_clicked and max_scroll > 0 and not dark_menu.active and not gui_msgbox.active then
+        if mouse_x >= scrollbar_x and mouse_x <= scrollbar_x + scrollbar_width and
+           mouse_y >= sb_thumb_y and mouse_y <= sb_thumb_y + sb_thumb_height then
+            settings_sb_dragging = true
+            settings_sb_drag_start_y = mouse_y
+            settings_sb_drag_start_offset = settings_scroll_offset
+        end
+    end
+
+    -- Scrollbar drag: update
+    if settings_sb_dragging and mouse_down and max_scroll > 0 then
+        local drag_delta = mouse_y - settings_sb_drag_start_y
+        local track_usable = scrollbar_track_height - sb_thumb_height
+        if track_usable > 0 then
+            settings_scroll_offset = settings_sb_drag_start_offset + math.floor(drag_delta * max_scroll / track_usable)
+            if settings_scroll_offset < 0 then settings_scroll_offset = 0 end
+            if settings_scroll_offset > max_scroll then settings_scroll_offset = max_scroll end
+        end
+    end
+
     local scroll_y = settings_scroll_offset
 
     -- Apply scroll offset to all positions
@@ -8597,17 +8615,15 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
 
     -- Draw unified scrollbar if needed
     if max_scroll > 0 then
-        local scrollbar_width = 8
-        local scrollbar_x = gfx.w - scrollbar_width - 4
-        local scrollbar_track_height = visible_h
-        local thumb_height = math.max(20, math.floor(scrollbar_track_height * visible_h / total_content_h))
-        local current_max_scroll = math.max(1, max_scroll)
-        local thumb_y = content_top + math.floor((scrollbar_track_height - thumb_height) * settings_scroll_offset / current_max_scroll)
-
+        -- Highlight thumb when dragging
         gfx.set(0.15, 0.15, 0.15, 1)
         gfx.rect(scrollbar_x, content_top, scrollbar_width, scrollbar_track_height, 1)
-        gfx.set(0.4, 0.4, 0.4, 1)
-        gfx.rect(scrollbar_x, thumb_y, scrollbar_width, thumb_height, 1)
+        if settings_sb_dragging then
+            gfx.set(0.65, 0.65, 0.65, 1)
+        else
+            gfx.set(0.4, 0.4, 0.4, 1)
+        end
+        gfx.rect(scrollbar_x, sb_thumb_y, scrollbar_width, sb_thumb_height, 1)
     end
 
     -- Draw buttons
