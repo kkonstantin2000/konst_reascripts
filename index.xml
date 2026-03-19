@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="3d133d574d8f5ad4cd1dcbe14f29a2b40ac0b588">
+<index version="1" name="konst_reascripts" commit="8d1c912e0ee21e5158fe64d457419f49793e6452">
   <category name="ImportMusicXML">
     <reapack name="konst_Import MusicXML.lua" type="script" desc="Import and export MusicXML (.xml)">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
@@ -85,6 +85,14 @@ v1.0 - Initial release]]></changelog>
       <version name="1.4.1" author="kkonstantin2000" time="2026-03-16T09:11:58Z">
         <changelog><![CDATA[v1.4.1 - Fixed settings scrollbar: thumb is now draggable with the mouse]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/3d133d574d8f5ad4cd1dcbe14f29a2b40ac0b588/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+      <version name="1.4.2" author="kkonstantin2000" time="2026-03-19T05:41:59Z">
+        <changelog><![CDATA[v1.4.2  
+- Added support for grace notes with proper handling of timing and notation in MIDI items.
+- Added docking context menu options for the GUI header.
+- Added a settings option to rename tracks based on MIDI banks and programs.
+- Added a window resizing handler.]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/8d1c912e0ee21e5158fe64d457419f49793e6452/ImportMusicXML/konst_Import%20MusicXML.lua</source>
       </version>
     </reapack>
   </category>
