@@ -1,12 +1,14 @@
 -- @description Import and export MusicXML (.xml) 
 -- @author kkonstantin2000
--- @version 1.4.1
+-- @version 1.4.2
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
---   v1.4.1 - Fixed settings scrollbar: thumb is now draggable with the mouse
-
-
+--   v1.4.2  
+--   - Added support for grace notes with proper handling of timing and notation in MIDI items.
+--   - Added docking context menu options for the GUI header.
+--   - Added a settings option to rename tracks based on MIDI banks and programs.
+--   - Added a window resizing handler.
 --[[
   Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
   Drum parts use a configurable channel mapping so instruments like kick, snare, etc. can be assigned to separate MIDI channels.
@@ -701,6 +703,8 @@ local highlight_scan_enabled = true
 local export_regions_enabled = true
 -- Include MIDI program/bank in import and export
 local midi_program_banks_enabled = true
+-- Use GM preset names for imported track names instead of part-name
+local gm_name_tracks_enabled = false
 -- Open exported file with external program
 local export_open_with_enabled = false
 local export_open_with_path = ""
@@ -864,6 +868,9 @@ local function serialize_articulation_settings()
     -- MIDI program banks toggle
     local mpb_en = midi_program_banks_enabled and "1" or "0"
     table.insert(parts, "__midibank__|" .. mpb_en .. "||||")
+    -- GM track names toggle
+    local gmn_en = gm_name_tracks_enabled and "1" or "0"
+    table.insert(parts, "__gmname__|" .. gmn_en .. "||||")
     for _, name in ipairs(articulation_names_ordered) do
         local en = articulation_enabled[name] and "1" or "0"
         local sym = articulation_symbol_override[name] or ""
@@ -918,6 +925,9 @@ local function deserialize_articulation_settings(str)
         elseif name == "__midibank__" then
             -- MIDI program banks toggle
             if fields[2] then midi_program_banks_enabled = (fields[2] == "1") end
+        elseif name == "__gmname__" then
+            -- GM track names toggle
+            if fields[2] then gm_name_tracks_enabled = (fields[2] == "1") end
         elseif name and articulation_enabled[name] ~= nil then
             if fields[2] then articulation_enabled[name] = (fields[2] == "1") end
             if fields[3] and fields[3] ~= "" then
@@ -956,6 +966,7 @@ local function restore_default_articulation_settings()
     highlight_scan_enabled = true
     export_regions_enabled = true
     midi_program_banks_enabled = true
+    gm_name_tracks_enabled = false
     export_open_with_enabled = false
     export_open_with_path = ""
     export_open_folder_enabled = false
@@ -980,6 +991,7 @@ for _, name in ipairs(articulation_names_ordered) do settings_menu_flags[name] =
 settings_menu_flags.hlscan = false
 settings_menu_flags.expreg = false
 settings_menu_flags.midibank = false
+settings_menu_flags.gmname = false
 settings_menu_flags.openwith = false
 settings_menu_flags.openfolder = false
 settings_menu_flags.keysig = false
@@ -1027,6 +1039,8 @@ local function get_visible_extra_settings()
     if settings_menu_flags.openwith then table.insert(items, {key="openwith", label="Open After Export"}) end
     if settings_menu_flags.openfolder then table.insert(items, {key="openfolder", label="Open Folder"}) end
     if settings_menu_flags.keysig then table.insert(items, {key="keysig", label="Key Signature"}) end
+    -- IMPORT settings
+    if settings_menu_flags.gmname then table.insert(items, {key="gmname", label="GM Track Names"}) end
     -- ARTICULATION settings
     if settings_menu_flags.hlscan then table.insert(items, {key="hlscan", label="Highlight Used"}) end
     if settings_menu_flags.fret then table.insert(items, {key="fret", label="Fret Number"}) end
@@ -1044,6 +1058,7 @@ local function get_extra_setting_checked(key)
     elseif key == "hlscan" then return highlight_scan_enabled
     elseif key == "expreg" then return export_regions_enabled
     elseif key == "midibank" then return midi_program_banks_enabled
+    elseif key == "gmname" then return gm_name_tracks_enabled
     elseif key == "openwith" then return export_open_with_enabled
     elseif key == "openfolder" then return export_open_folder_enabled
     elseif key == "keysig" then return export_key_sig_enabled
@@ -1067,6 +1082,9 @@ local function toggle_extra_setting(key)
         if not highlight_scan_enabled then articulations_in_file = {} end
     elseif key == "expreg" then export_regions_enabled = not export_regions_enabled
     elseif key == "midibank" then midi_program_banks_enabled = not midi_program_banks_enabled
+    elseif key == "gmname" then
+        gm_name_tracks_enabled = not gm_name_tracks_enabled
+        resize_window()
     elseif key == "openwith" then export_open_with_enabled = not export_open_with_enabled
     elseif key == "openfolder" then export_open_folder_enabled = not export_open_folder_enabled
     elseif key == "keysig" then export_key_sig_enabled = not export_key_sig_enabled
@@ -3050,7 +3068,7 @@ function ImportMusicXMLWithOptions(filepath, options)
 
   -- 6b. Extract MIDI bank/program per part (first midi-instrument with bank/program)
   local part_midi_program = {}  -- part_id -> { channel, bank, program }
-  if options.import_midi_banks and part_list then
+  if (options.import_midi_banks or gm_name_tracks_enabled) and part_list then
     for _, score_part in ipairs(findChildren(part_list, "score-part")) do
       local id = getAttribute(score_part, "id")
       for _, mi in ipairs(findChildren(score_part, "midi-instrument")) do
@@ -3106,6 +3124,24 @@ function ImportMusicXMLWithOptions(filepath, options)
     -- Per‑staff span state for duration line feature
     -- [staff_num][art_name] = { last_idx, last_pos, count }
     local staff_span_state = {}
+
+    -- Per‑staff grace note chord tracking (separate from regular chord
+    -- tracking so that grace notes never interfere with surrounding chords).
+    local staff_grace_start = {}       -- last start position for grace chord
+    local staff_grace_chord_count = {} -- chord member counter for grace chords
+    local staff_grace_running_offset = {} -- cumulative on-beat grace time per staff (applied to note positions, never touches cur_pos_ticks)
+
+    -- Note type name → duration in ticks (relative to ppq)
+    local note_type_ticks = {
+      whole   = 4 * ppq,
+      half    = 2 * ppq,
+      quarter = ppq,
+      eighth  = ppq / 2,
+      ["16th"]  = ppq / 4,
+      ["32nd"]  = ppq / 8,
+      ["64th"]  = ppq / 16,
+      ["128th"] = ppq / 32,
+    }
 
     -- Time tracking for this part
     local cur_pos_ticks = 0
@@ -3179,8 +3215,229 @@ function ImportMusicXMLWithOptions(filepath, options)
       for _, elem in ipairs(measure_children) do
         if elem.name == "note" then
           local rest = findChild(elem, "rest")
+          local grace_node = findChild(elem, "grace")
           local dur_node = findChild(elem, "duration")
-          if dur_node and divisions then
+
+          -- ==================== GRACE NOTE ====================
+          if grace_node and not rest and divisions then
+            local chord = findChild(elem, "chord")
+            local staff_elem = findChild(elem, "staff")
+            local staff_num = 1
+            if staff_elem then
+              staff_num = tonumber(getNodeText(staff_elem)) or 1
+            end
+
+            -- Compute grace note duration from <type>
+            local type_node = findChild(elem, "type")
+            local type_text = type_node and getNodeText(type_node) or "32nd"
+            local grace_ticks = note_type_ticks[type_text] or (ppq / 8)
+            -- Account for dots
+            local dot_count = #findChildren(elem, "dot")
+            if dot_count > 0 then
+              local add = grace_ticks
+              for _ = 1, dot_count do
+                add = add / 2
+                grace_ticks = grace_ticks + add
+              end
+            end
+
+            local slash = getAttribute(grace_node, "slash")
+            local on_beat = (slash ~= "yes")  -- default / slash="no" → on beat
+
+            -- Process pitch
+            local pitch_node = findChild(elem, "pitch")
+            if pitch_node then
+              local step = getChildText(pitch_node, "step")
+              local alter = getChildValue(pitch_node, "alter") or 0
+              local octave = getChildValue(pitch_node, "octave") or 4
+              local offset = ({ C = 0, D = 2, E = 4, F = 5, G = 7, A = 9, B = 11 })[step]
+              if offset then
+                local pitch = (octave + 1) * 12 + offset + alter
+
+                -- Extract string and fret (direct children, then GP PI fallback)
+                local string_num, fret_num
+                local notations = findChild(elem, "notations")
+                if notations then
+                  local technical = findChild(notations, "technical")
+                  if technical then
+                    local str_node = findChild(technical, "string")
+                    local fret_node = findChild(technical, "fret")
+                    if str_node and fret_node then
+                      string_num = tonumber(getNodeText(str_node))
+                      fret_num = tonumber(getNodeText(fret_node))
+                    end
+                    -- Fallback: extract from GP processing instruction (<_gp_><root>)
+                    if not (string_num and fret_num) then
+                      for _, gp_child in ipairs(technical.children or {}) do
+                        if gp_child.name == "_gp_" then
+                          local gp_root = findChild(gp_child, "root")
+                          if gp_root then
+                            local gp_str = findChild(gp_root, "string")
+                            local gp_fret = findChild(gp_root, "fret")
+                            if gp_str and gp_fret then
+                              string_num = tonumber(getNodeText(gp_str))
+                              fret_num = tonumber(getNodeText(gp_fret))
+                            end
+                          end
+                          break
+                        end
+                      end
+                    end
+                  end
+                end
+
+                if string_num and fret_num then
+                  local channel = 7 - string_num
+                  if channel < 1 or channel > 16 then channel = 1 end
+                  local note_channel = channel - 1
+                  if is_bass then note_channel = note_channel - 1 end
+                  local velocity = 100
+
+                  -- Grace note positioning uses its OWN chord tracking
+                  -- (staff_grace_start / staff_grace_chord_count) so regular
+                  -- chord tracking (staff_last_start / staff_chord_count) is
+                  -- never touched.
+                  local grace_off = staff_grace_running_offset[staff_num] or 0
+                  local start_ticks
+                  if on_beat then
+                    -- On-beat: starts at the current beat position (with running offset)
+                    if chord then
+                      local base = staff_grace_start[staff_num] or (cur_pos_ticks + grace_off)
+                      local cnt = (staff_grace_chord_count[staff_num] or 1)
+                      start_ticks = base + (cnt - 1) * chord_offset_ticks
+                      staff_grace_chord_count[staff_num] = cnt + 1
+                    else
+                      start_ticks = cur_pos_ticks + grace_off
+                      staff_grace_start[staff_num] = start_ticks
+                      staff_grace_chord_count[staff_num] = 1
+                      -- Accumulate running offset so all subsequent notes shift by this grace's duration
+                      staff_grace_running_offset[staff_num] = grace_off + grace_ticks
+                    end
+                  else
+                    -- Before-beat: placed just before current position (with running offset)
+                    if chord then
+                      local base = staff_grace_start[staff_num] or (cur_pos_ticks + grace_off - grace_ticks)
+                      local cnt = (staff_grace_chord_count[staff_num] or 1)
+                      start_ticks = base + (cnt - 1) * chord_offset_ticks
+                      staff_grace_chord_count[staff_num] = cnt + 1
+                    else
+                      start_ticks = cur_pos_ticks + grace_off - grace_ticks
+                      if start_ticks < 0 then start_ticks = 0 end
+                      staff_grace_start[staff_num] = start_ticks
+                      staff_grace_chord_count[staff_num] = 1
+                    end
+                  end
+
+                  -- Insert MIDI note for the grace note
+                  if not staff_notes[staff_num] then staff_notes[staff_num] = {} end
+
+                  -- Trim any previous note on same channel+pitch that
+                  -- overlaps (e.g. chord-offset causes 1-tick overlap).
+                  for ni = #staff_notes[staff_num], 1, -1 do
+                    local prev = staff_notes[staff_num][ni]
+                    if prev.pitch == pitch and prev.channel == note_channel
+                        and prev.endpos > start_ticks and prev.pos < start_ticks then
+                      prev.endpos = start_ticks
+                      break
+                    end
+                  end
+
+                  table.insert(staff_notes[staff_num], {
+                    pos     = start_ticks,
+                    endpos  = start_ticks + grace_ticks,
+                    channel = note_channel,
+                    pitch   = pitch,
+                    vel     = velocity
+                  })
+
+                  -- Articulation events (text events for the grace note)
+                  local articulation_events = getArticulationEvents(elem, fret_num)
+
+                  -- Write "gr" text event if grace-note articulation is enabled
+                  local grace_entry = articulation_map["grace-note"]
+                  if grace_entry and articulation_enabled["grace-note"] ~= false then
+                    if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                    table.insert(staff_texts[staff_num], {
+                      pos  = start_ticks,
+                      text = "_" .. (grace_entry.symbol or "gr"),
+                      type = grace_entry.type or 1
+                    })
+                  end
+
+                  -- Fret-replacing text
+                  local main_ev = nil
+                  local suffix_chars = ""
+                  for _, ev in ipairs(articulation_events) do
+                    if ev.replaces_fret then
+                      if ev.is_suffix then
+                        suffix_chars = suffix_chars .. (ev.symbol or "")
+                      elseif not main_ev then
+                        main_ev = ev
+                      end
+                    end
+                  end
+                  local fret_replaced = false
+                  if main_ev ~= nil or suffix_chars ~= "" then
+                    fret_replaced = true
+                    if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                    local base_sym, ev_type, no_pfx
+                    if main_ev then
+                      base_sym = main_ev.symbol; ev_type = main_ev.type; no_pfx = main_ev.no_prefix
+                    else
+                      base_sym = tostring(fret_num); ev_type = 1; no_pfx = false
+                    end
+                    local text = base_sym .. suffix_chars
+                    if not no_pfx then text = "_" .. text end
+                    table.insert(staff_texts[staff_num], { pos = start_ticks, text = text, type = ev_type })
+                  end
+                  if not fret_replaced and fret_number_enabled then
+                    if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                    table.insert(staff_texts[staff_num], { pos = start_ticks, text = "_" .. fret_num, type = fret_number_type })
+                  end
+
+                  -- Non-replacing articulations
+                  for _, ev in ipairs(articulation_events) do
+                    if not ev.replaces_fret then
+                      if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                      local text = ev.symbol
+                      if not ev.no_prefix then text = "_" .. text end
+                      table.insert(staff_texts[staff_num], { pos = start_ticks, text = text, type = ev.type })
+                    end
+                  end
+
+                  -- Slide handling for grace notes
+                  if notations then
+                    for _, child in ipairs(notations.children or {}) do
+                      if slide_names[child.name] then
+                        local info = getSlideInfo(child, fret_num)
+                        if info then
+                          local slide_type = child.attrs and child.attrs.type
+                          if slide_type == "start" then
+                            if not staff_pending_slides[staff_num] then staff_pending_slides[staff_num] = {} end
+                            staff_pending_slides[staff_num][string_num] = {
+                              start_pos = start_ticks, symbol = info.symbol,
+                              no_prefix = info.no_prefix, type = info.type
+                            }
+                          elseif slide_type == "stop" then
+                            if staff_pending_slides[staff_num] and staff_pending_slides[staff_num][string_num] then
+                              local pending = staff_pending_slides[staff_num][string_num]
+                              if not staff_texts[staff_num] then staff_texts[staff_num] = {} end
+                              local text = info.symbol
+                              if not info.no_prefix then text = "_" .. text end
+                              table.insert(staff_texts[staff_num], { pos = start_ticks, text = text, type = pending.type })
+                              staff_pending_slides[staff_num][string_num] = nil
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                end  -- string_num and fret_num
+              end  -- offset
+            end  -- pitch_node
+            -- Grace notes have no <duration>, so do NOT advance time
+
+          elseif dur_node and divisions then
             local duration = tonumber(getNodeText(dur_node))
             if duration then
               local tick_duration = (duration / divisions) * ppq
@@ -3215,11 +3472,13 @@ function ImportMusicXMLWithOptions(filepath, options)
                   local drum_text = "_" .. drumNameToText(drum_name)
 
                   -- Determine start position with possible chord offset
+                  -- Apply per-staff grace running offset for correct beat alignment
+                  local drum_grace_off = staff_grace_running_offset[staff_num] or 0
                   local start_ticks
                   if chord then
                     local base_start = staff_last_start[staff_num]
                     if not base_start then
-                      base_start = cur_pos_ticks
+                      base_start = cur_pos_ticks + drum_grace_off
                       staff_last_start[staff_num] = base_start
                       staff_chord_count[staff_num] = 1
                     end
@@ -3228,9 +3487,9 @@ function ImportMusicXMLWithOptions(filepath, options)
                     staff_chord_count[staff_num] = count
                     start_ticks = base_start + (count - 1) * chord_offset_ticks
                   else
-                    staff_last_start[staff_num] = cur_pos_ticks
+                    staff_last_start[staff_num] = cur_pos_ticks + drum_grace_off
                     staff_chord_count[staff_num] = 1
-                    start_ticks = cur_pos_ticks
+                    start_ticks = cur_pos_ticks + drum_grace_off
                   end
 
                   -- Store note (merge with previous if tie stop)
@@ -3347,6 +3606,23 @@ function ImportMusicXMLWithOptions(filepath, options)
                             string_num = tonumber(getNodeText(str_node))
                             fret_num = tonumber(getNodeText(fret_node))
                           end
+                          -- Fallback: extract from GP processing instruction (<_gp_><root>)
+                          if not (string_num and fret_num) then
+                            for _, gp_child in ipairs(technical.children or {}) do
+                              if gp_child.name == "_gp_" then
+                                local gp_root = findChild(gp_child, "root")
+                                if gp_root then
+                                  local gp_str = findChild(gp_root, "string")
+                                  local gp_fret = findChild(gp_root, "fret")
+                                  if gp_str and gp_fret then
+                                    string_num = tonumber(getNodeText(gp_str))
+                                    fret_num = tonumber(getNodeText(gp_fret))
+                                  end
+                                end
+                                break
+                              end
+                            end
+                          end
                         end
                       end
 
@@ -3378,11 +3654,13 @@ function ImportMusicXMLWithOptions(filepath, options)
                       local needs_chord_offset = fret_number_enabled or #articulation_events > 0 or has_slides
 
                       -- Determine start position with possible chord offset
+                      -- Apply per-staff grace running offset for correct beat alignment
+                      local pitched_grace_off = staff_grace_running_offset[staff_num] or 0
                       local start_ticks
                       if chord then
                         local base_start = staff_last_start[staff_num]
                         if not base_start then
-                          base_start = cur_pos_ticks
+                          base_start = cur_pos_ticks + pitched_grace_off
                           staff_last_start[staff_num] = base_start
                           staff_chord_count[staff_num] = 1
                         end
@@ -3391,9 +3669,9 @@ function ImportMusicXMLWithOptions(filepath, options)
                         staff_chord_count[staff_num] = count
                         start_ticks = base_start + (count - 1) * (needs_chord_offset and chord_offset_ticks or 0)
                       else
-                        staff_last_start[staff_num] = cur_pos_ticks
+                        start_ticks = cur_pos_ticks + pitched_grace_off
+                        staff_last_start[staff_num] = start_ticks
                         staff_chord_count[staff_num] = 1
-                        start_ticks = cur_pos_ticks
                       end
 
                       -- Store note (merge with previous if tie stop)
@@ -3403,6 +3681,20 @@ function ImportMusicXMLWithOptions(filepath, options)
                       if is_bass then
                         note_channel = note_channel - 1
                       end
+
+                      -- Trim any previous note on the same channel+pitch that
+                      -- would overlap this note (e.g. chord-offset causes a
+                      -- 1-tick overlap when the same open string repeats).
+                      -- Without this, REAPER silently drops the new note.
+                      for ni = #staff_notes[staff_num], 1, -1 do
+                        local prev = staff_notes[staff_num][ni]
+                        if prev.pitch == pitch and prev.channel == note_channel
+                            and prev.endpos > start_ticks and prev.pos < start_ticks then
+                          prev.endpos = start_ticks
+                          break
+                        end
+                      end
+
                       local is_tie_stop = false
                       local tie_nodes = findChildren(elem, "tie")
                       for _, tie_node in ipairs(tie_nodes) do
@@ -3775,6 +4067,12 @@ function ImportMusicXMLWithOptions(filepath, options)
     local data = all_parts_data[part_id]
     if data then
     local base_track_name = part_names[part_id] or ("Part " .. part_id)
+    if gm_name_tracks_enabled then
+      local mp = part_midi_program[part_id]
+      if mp and gm_program_to_name[mp.program] then
+        base_track_name = gm_program_to_name[mp.program]
+      end
+    end
 
     -- Skip this part if it wasn't selected in the GUI track list
     if selected_tracks_set and not selected_tracks_set[base_track_name] then
@@ -3790,9 +4088,23 @@ function ImportMusicXMLWithOptions(filepath, options)
       if staff > max_staff then max_staff = staff end
     end
 
+    -- When a TAB staff (with tuning info) has notes, skip non-TAB staves
+    -- to avoid duplicating the same guitar notes as two tracks.
+    local has_tab_staff = false
+    for s = 1, max_staff do
+      if staff_tunings[s] and staff_notes[s] and #staff_notes[s] > 0 then
+        has_tab_staff = true
+        break
+      end
+    end
+
     local part_bank_inserted = false
     local part_ksig_inserted = false
     for staff = 1, max_staff do
+      -- Skip non-TAB staves when a TAB staff with notes exists
+      if has_tab_staff and not staff_tunings[staff] then
+        goto continue_staff
+      end
       local notes = staff_notes[staff]
       if notes and #notes > 0 then
         local track = nil
@@ -3954,6 +4266,7 @@ function ImportMusicXMLWithOptions(filepath, options)
 
         reaper.MIDI_Sort(take)
       end
+      ::continue_staff::
     end
     ::continue_part::
     end
@@ -4464,6 +4777,9 @@ local drag_offset_x = 0
 local drag_offset_y = 0
 local window_script = nil
 
+-- Resize handle state (bundled to reduce top-level local count)
+local RS = { active = false, sx = 0, sy = 0, sw = 0, sh = 0, HANDLE = 14, MIN_W = 300, MIN_H = 200 }
+
 -- Initialize window
 local mouse_x, mouse_y = reaper.GetMousePosition()
 local init_x, init_y
@@ -4509,14 +4825,26 @@ path_mode = load_path_mode()
 -- Helper function to extract track names and count from XML content
 function get_tracks_from_xml(xml_content)
     local tracks = {}
-    -- Extract part-name from each score-part block
+    -- Extract part-name and optional GM program name from each score-part block
     for score_part_block in xml_content:gmatch("<score%-part[^>]*>(.-)</score%-part>") do
         local part_name = score_part_block:match("<part%-name>([^<]*)</part%-name>")
         if part_name and part_name ~= "" then
-            table.insert(tracks, part_name)
+            local gm_name = nil
+            local midi_program = score_part_block:match("<midi%-program>(%d+)</midi%-program>")
+            if midi_program then
+                local prog = tonumber(midi_program) - 1  -- MusicXML is 1-based, GM table is 0-based
+                gm_name = gm_program_to_name[prog]
+            end
+            table.insert(tracks, {name = part_name, gm_name = gm_name})
         end
     end
     return tracks 
+end
+
+-- Get the display name for a track checkbox entry
+function get_track_display_name(tcb)
+    if gm_name_tracks_enabled and tcb.gm_name then return tcb.gm_name end
+    return tcb.name
 end
 
 -- Scan a MusicXML file for articulations present in checked tracks
@@ -4533,16 +4861,17 @@ function scan_articulations_in_xml()
     local root = parseXML(xml_content)
     if not root then return end
 
-    -- Build set of checked track names
+    -- Build set of checked track names (using display names)
     local checked_names = {}
     for _, tcb in ipairs(track_checkboxes) do
         if tcb.checked then
-            checked_names[tcb.name] = true
+            checked_names[get_track_display_name(tcb)] = true
         end
     end
 
     -- Map part IDs to names from <part-list>
     local part_names = {}
+    local part_midi_prog = {}  -- part_id -> 0-based program number
     local part_list = findChild(root, "part-list")
     if part_list then
         for _, score_part in ipairs(findChildren(part_list, "score-part")) do
@@ -4550,6 +4879,15 @@ function scan_articulations_in_xml()
             local name = getChildText(score_part, "part-name")
             if id and name then
                 part_names[id] = name
+            end
+            if id and gm_name_tracks_enabled then
+                for _, mi in ipairs(findChildren(score_part, "midi-instrument")) do
+                    local mp = tonumber(getChildText(mi, "midi-program"))
+                    if mp then
+                        part_midi_prog[id] = mp - 1
+                        break
+                    end
+                end
             end
         end
     end
@@ -4569,6 +4907,9 @@ function scan_articulations_in_xml()
     for _, part_node in ipairs(parts) do
         local part_id = getAttribute(part_node, "id")
         local base_track_name = part_names[part_id] or ("Part " .. (part_id or "?"))
+        if gm_name_tracks_enabled and part_midi_prog[part_id] and gm_program_to_name[part_midi_prog[part_id]] then
+            base_track_name = gm_program_to_name[part_midi_prog[part_id]]
+        end
 
         -- Skip parts not checked for import
         if not checked_names[base_track_name] then goto continue_scan_part end
@@ -4933,7 +5274,7 @@ function resize_window()
     local import_all_w = gfx.measurestr("Import All")
     if import_all_w > max_label_width then max_label_width = import_all_w end
     for _, tcb in ipairs(track_checkboxes) do
-        local w = gfx.measurestr(tcb.name)
+        local w = gfx.measurestr(get_track_display_name(tcb))
         if w > max_label_width then max_label_width = w end
     end
     -- Account for file info text width
@@ -5127,6 +5468,49 @@ function draw_button(x, y, width, height, label, is_hovered, bg_color_key, borde
     gfx.x = x + (width - text_width) / 2
     gfx.y = y + (height - gfx.texth) / 2
     gfx.drawstr(label)
+end
+
+-- Draw resize handle (bottom-right corner grip) and handle drag logic
+function draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released, mouse_down, screen_x, screen_y)
+    local w, h = gfx.w, gfx.h
+    local sz = RS.HANDLE
+    local rx, ry = w - sz, h - sz
+    local hovered = mouse_x >= rx and mouse_y >= ry
+
+    -- Start resize
+    if mouse_clicked and hovered and not is_dragging then
+        RS.active = true
+        RS.sx = screen_x
+        RS.sy = screen_y
+        RS.sw = w
+        RS.sh = h
+    end
+
+    -- During resize
+    if RS.active and mouse_down then
+        local new_w = math.max(RS.MIN_W, RS.sw + (screen_x - RS.sx))
+        local new_h = math.max(RS.MIN_H, RS.sh + (screen_y - RS.sy))
+        gui.width = new_w
+        gui.height = new_h
+        if window_script then
+            reaper.JS_Window_Resize(window_script, new_w, new_h)
+        end
+    end
+
+    -- End resize
+    if mouse_released and RS.active then
+        RS.active = false
+    end
+
+    -- Draw the grip lines (three diagonal lines)
+    local alpha = (hovered or RS.active) and 0.6 or 0.3
+    gfx.set(0.7, 0.7, 0.7, alpha)
+    for i = 0, 2 do
+        local offset = 4 + i * 4
+        gfx.line(w - offset, h - 1, w - 1, h - offset)
+    end
+
+    return hovered or RS.active
 end
 
 -- Forward declarations for main view editing state (used in draw_checkboxes_list, defined later)
@@ -5757,6 +6141,42 @@ local function close_dark_menu()
     dark_menu_close_submenu()
 end
 
+-- Open a right-click dock/undock context menu on the header
+local function open_header_dock_menu(mx, my)
+    local cur_dock = gfx.dock(-1)
+    local is_docked = (cur_dock & 1) ~= 0
+    local menu_str
+    if is_docked then
+        menu_str = "Undock"
+    else
+        menu_str = "Dock to Bottom|Dock to Left|Dock to Top|Dock to Right"
+    end
+    open_dark_menu(menu_str, mx, my, function(idx)
+        if is_docked then
+            -- Undock
+            gfx.dock(0)
+            docker_enabled = false
+            if gui.settings.Borderless_Window and window_script then
+                reaper.JS_Window_SetStyle(window_script, "POPUP")
+                reaper.JS_Window_AttachResizeGrip(window_script)
+                local cur_exstyle = reaper.JS_Window_GetLong(window_script, "EXSTYLE")
+                if cur_exstyle then
+                    reaper.JS_Window_SetLong(window_script, "EXSTYLE", cur_exstyle | 0x10)
+                end
+            end
+        else
+            -- Dock: idx 1=Bottom,2=Left,3=Top,4=Right
+            local dock_vals = {769, 257, 513, 1}
+            local val = dock_vals[idx]
+            if val then
+                docker_enabled = true
+                docker_position = idx
+                gfx.dock(val)
+            end
+        end
+    end)
+end
+
 -- Helper: draw a single menu panel (background, border, items, scroll arrows)
 local function dark_menu_draw_panel(px, py, pw, p_items, p_visible, p_scroll, p_hovered, is_parent)
     local item_h = DARK_MENU_ITEM_HEIGHT
@@ -6051,7 +6471,11 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
 
     -- Header drag handling
     local header_hovered = (mouse_y > 0 and mouse_y < header_height)
-    if mouse_clicked and header_hovered then
+    local rmb_clicked = (gfx.mouse_cap & 2 ~= 0) and (last_mouse_cap & 2 == 0)
+    if rmb_clicked and header_hovered then
+        open_header_dock_menu(mouse_x, mouse_y)
+    end
+    if mouse_clicked and header_hovered and not RS.active then
         is_dragging = true
         drag_offset_x = mouse_x
         drag_offset_y = mouse_y
@@ -6116,6 +6540,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         import_row_y[i] = vy
         vy = vy + checkbox_row_height
     end
+    local gmname_row_y = vy; vy = vy + checkbox_row_height
 
     -- ARTICULATION section
     local art_hdr_y = vy; vy = vy + section_hdr_h
@@ -6187,6 +6612,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     for i = 1, #checkboxes_list do
         import_row_y[i] = import_row_y[i] - scroll_y
     end
+    gmname_row_y = gmname_row_y - scroll_y
     art_hdr_y = art_hdr_y - scroll_y
     hlscan_row_y = hlscan_row_y - scroll_y
     fret_row_y = fret_row_y - scroll_y
@@ -6357,7 +6783,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                 local selected_tracks = {}
                 for _, tcb in ipairs(track_checkboxes) do
                     if tcb.checked then
-                        table.insert(selected_tracks, tcb.name)
+                        table.insert(selected_tracks, get_track_display_name(tcb))
                     end
                 end
                 local options = {
@@ -6769,6 +7195,16 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                     end
                     break
                 end
+            end
+        end
+
+        -- Check click on GM Track Names row
+        if mouse_y > gmname_row_y and mouse_y < gmname_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.gmname = not settings_menu_flags.gmname
+            elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                gm_name_tracks_enabled = not gm_name_tracks_enabled
+                resize_window()
             end
         end
 
@@ -7753,6 +8189,13 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
         end
     end
+    -- GM Track Names row hover
+    if mouse_y >= gmname_row_y and mouse_y < gmname_row_y + checkbox_row_height then
+        if mouse_x >= horizontal_margin and mouse_x < sym_box_x or
+           mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+            settings_tooltip_text = "GM Track Names: use the General MIDI\npreset name (e.g. 'Electric Guitar (clean)')\nas the track name instead of the\noriginal part name from the file."
+        end
+    end
     -- Fret number row hover
     if mouse_y >= fret_row_y and mouse_y < span_row_y then
         if mouse_x >= type_btn_x and mouse_x < type_btn_x + TYPE_BTN_WIDTH then
@@ -8393,6 +8836,15 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         draw_menu_flag_cb(menu_cb_x, ry, cb.show_in_menu)
     end
 
+    -- Draw GM Track Names row
+    local gmname_text_y = gmname_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = gmname_text_y
+    gfx.drawstr("GM Track Names")
+    draw_checkbox(cb_x, gmname_row_y, checkbox_size, cb_x, "", gm_name_tracks_enabled, gui.colors, 0, nil)
+    draw_menu_flag_cb(menu_cb_x, gmname_row_y, settings_menu_flags.gmname)
+
     -- Separator line
     gfx.set(0.3, 0.3, 0.3, 1)
     gfx.line(horizontal_margin, separator_y, gfx.w - horizontal_margin, separator_y)
@@ -8707,6 +9159,8 @@ function main_loop()
         local char = gfx.getchar()
         local char_input = (char > 0) and char or nil
         draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, screen_x, screen_y, mouse_down, char_input)
+        -- Resize handle (drawn on top)
+        draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released, mouse_down, screen_x, screen_y)
         gfx.update()
         last_mouse_cap = gfx.mouse_cap
         if char >= 0 then
@@ -8736,8 +9190,8 @@ function main_loop()
                 local track_names = get_tracks_from_xml(content)
                 selected_file_track_count = #track_names
                 track_checkboxes = {}
-                for _, name in ipairs(track_names) do
-                    table.insert(track_checkboxes, {name = name, checked = true})
+                for _, t in ipairs(track_names) do
+                    table.insert(track_checkboxes, {name = t.name, gm_name = t.gm_name, checked = true})
                 end
                 import_all_checked = true
             else
@@ -8781,9 +9235,13 @@ function main_loop()
     
     -- Check if mouse is over header area
     local header_hovered = (mouse_y > 0 and mouse_y < header_height)
+    local rmb_clicked = (gfx.mouse_cap & 2 ~= 0) and (last_mouse_cap & 2 == 0)
+    if rmb_clicked and header_hovered then
+        open_header_dock_menu(mouse_x, mouse_y)
+    end
     
     -- Handle drag start
-    if mouse_clicked and header_hovered then
+    if mouse_clicked and header_hovered and not RS.active then
         is_dragging = true
         drag_offset_x = mouse_x
         drag_offset_y = mouse_y
@@ -8840,8 +9298,8 @@ function main_loop()
                         local track_names = get_tracks_from_xml(content)
                         selected_file_track_count = #track_names
                         track_checkboxes = {}
-                        for _, name in ipairs(track_names) do
-                            table.insert(track_checkboxes, {name = name, checked = true})
+                        for _, t in ipairs(track_names) do
+                            table.insert(track_checkboxes, {name = t.name, gm_name = t.gm_name, checked = true})
                         end
                         import_all_checked = true
                     else
@@ -8928,7 +9386,7 @@ function main_loop()
                 local selected_tracks = {}
                 for _, tcb in ipairs(track_checkboxes) do
                     if tcb.checked then
-                        table.insert(selected_tracks, tcb.name)
+                        table.insert(selected_tracks, get_track_display_name(tcb))
                     end
                 end
                 -- Collect checkbox states into options table
@@ -9660,7 +10118,7 @@ function main_loop()
             if scrolled_i >= 1 and scrolled_i <= max_visible_tracks then
                 local tcb_y = tracks_area_top + (scrolled_i - 1) * checkbox_row_height
                 draw_checkbox(cb_x, tcb_y, checkbox_size, horizontal_margin,
-                              tcb.name, tcb.checked, gui.colors, trunc_w, "track_" .. i)
+                              get_track_display_name(tcb), tcb.checked, gui.colors, trunc_w, "track_" .. i)
             end
         end
         
@@ -9835,6 +10293,9 @@ function main_loop()
 
     -- Draw GUI message box overlay (on top of everything)
     draw_and_handle_gui_msgbox(mouse_x, mouse_y, mouse_clicked, char_input)
+
+    -- Resize handle (drawn on top)
+    draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released, mouse_down, screen_x, screen_y)
 
     gfx.update()
     last_mouse_cap = gfx.mouse_cap
