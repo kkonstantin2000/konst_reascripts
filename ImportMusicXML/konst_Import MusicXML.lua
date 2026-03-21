@@ -1,14 +1,13 @@
 -- @description Import and export MusicXML (.xml) 
 -- @author kkonstantin2000
--- @version 1.4.2
+-- @version 1.4.3
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
---   v1.4.2  
---   - Added support for grace notes with proper handling of timing and notation in MIDI items.
---   - Added docking context menu options for the GUI header.
---   - Added a settings option to rename tracks based on MIDI banks and programs.
---   - Added a window resizing handler.
+--   v1.4.3  
+--   - Improved resizing behavior and layout of the GUI.
+--   - Added setting to save window dimensions
+
 --[[
   Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
   Drum parts use a configurable channel mapping so instruments like kick, snare, etc. can be assigned to separate MIDI channels.
@@ -770,6 +769,7 @@ local articulations_in_file
 local window_position_mode
 local save_window_position_mode
 local stay_on_top_enabled
+local remember_window_size
 
 -- Reverse mapping: settings name -> XML element name (for names that differ)
 local settings_to_xml_name = {}
@@ -810,8 +810,8 @@ for _, name in ipairs(articulation_names_ordered) do
     end
 end
 
-local EXTSTATE_SECTION = "konst_ImportMusicXML"
-local EXTSTATE_ART_KEY = "articulation_settings"
+EXTSTATE_SECTION = "konst_ImportMusicXML"
+EXTSTATE_ART_KEY = "articulation_settings"
 
 -- Get the effective symbol for an articulation (override or default)
 local function get_art_symbol(name)
@@ -998,12 +998,13 @@ settings_menu_flags.keysig = false
 settings_menu_flags.docker = false
 settings_menu_flags.winpos_last = false
 settings_menu_flags.winpos_mouse = false
+settings_menu_flags.winsize = false
 settings_menu_flags.defpath = false
 settings_menu_flags.lastpath = false
 settings_menu_flags.fret = false
 settings_menu_flags.span = false
 
-local EXTSTATE_MENU_FLAGS_KEY = "settings_menu_flags"
+EXTSTATE_MENU_FLAGS_KEY = "settings_menu_flags"
 local function save_settings_menu_flags()
     local parts = {}
     for k, v in pairs(settings_menu_flags) do
@@ -1031,6 +1032,7 @@ local function get_visible_extra_settings()
     if settings_menu_flags.docker then table.insert(items, {key="docker", label="Docker"}) end
     if settings_menu_flags.winpos_last then table.insert(items, {key="winpos_last", label="Last Position"}) end
     if settings_menu_flags.winpos_mouse then table.insert(items, {key="winpos_mouse", label="At Mouse"}) end
+    if settings_menu_flags.winsize then table.insert(items, {key="winsize", label="Remember Size"}) end
     if settings_menu_flags.defpath then table.insert(items, {key="defpath", label="Default Path"}) end
     if settings_menu_flags.lastpath then table.insert(items, {key="lastpath", label="Last Opened"}) end
     -- EXPORT settings
@@ -1065,6 +1067,7 @@ local function get_extra_setting_checked(key)
     elseif key == "docker" then return docker_enabled
     elseif key == "winpos_last" then return window_position_mode == "last"
     elseif key == "winpos_mouse" then return window_position_mode == "mouse"
+    elseif key == "winsize" then return remember_window_size
     elseif key == "defpath" then return path_mode == "default"
     elseif key == "lastpath" then return path_mode == "last"
     elseif key == "fret" then return fret_number_enabled
@@ -1097,6 +1100,7 @@ local function toggle_extra_setting(key)
         end
     elseif key == "winpos_last" then window_position_mode = "last"; save_window_position_mode("last")
     elseif key == "winpos_mouse" then window_position_mode = "mouse"; save_window_position_mode("mouse")
+    elseif key == "winsize" then remember_window_size = not remember_window_size; save_remember_window_size_setting()
     elseif key == "defpath" then path_mode = "default"; save_path_mode("default")
     elseif key == "lastpath" then path_mode = "last"; save_path_mode("last")
     elseif key == "fret" then fret_number_enabled = not fret_number_enabled
@@ -4326,6 +4330,7 @@ path_mode = "last"  -- "default" = use default_import_dir, "last" = use last_imp
 local track_checkboxes = {}  -- Dynamic list: { {name="...", checked=true, part_id="..."}, ... }
 local import_all_checked = true  -- "Import All" master checkbox state
 local track_scroll_offset = 0  -- Scroll offset (in rows) for the track list
+local main_scroll_offset = 0     -- Scroll offset (in rows) for main settings area
 local scrollbar_dragging = false  -- Whether we're dragging the scrollbar
 local settings_mode = false  -- Whether the settings view is active
 local settings_scroll_offset = 0  -- Scroll offset for settings view (pixels)
@@ -4338,6 +4343,7 @@ font_list = {"Outfit", "Arial", "Segoe UI", "Tahoma", "Verdana", "Consolas", "Co
 current_font_index = 1  -- Index into font_list (default: Outfit)
 docker_enabled = false  -- Whether to dock on startup
 docker_position = 1  -- 1=Bottom, 2=Left, 3=Top, 4=Right
+remember_window_size = false  -- Whether to save/restore window size across launches
 docker_positions = {"Bottom", "Left", "Top", "Right"}
 docker_dock_values = {769, 257, 513, 1}  -- gfx.dock values for each position
 local settings_btn_hovered = false  -- Hover state for settings button in main view
@@ -4364,6 +4370,7 @@ local file_info_click_y = 0  -- mouse y when file info was clicked
 local text_sel_mouse_start_x = 0  -- mouse x at selection start
 local text_sel_mouse_start_y = 0  -- mouse y at selection start
 local DRAG_THRESHOLD = 3  -- minimum pixels to distinguish drag from click
+pending_tooltip = nil  -- tooltip text to draw at end of frame (set during draw functions)
 
 -- ============================================================================
 -- PATH PERSISTENCE FUNCTIONS
@@ -4431,7 +4438,7 @@ local checkboxes_list = {
 }
 
 -- Save/Load import checkbox settings (checked state + show_in_menu flags)
-local EXTSTATE_IMPORT_KEY = "import_settings"
+EXTSTATE_IMPORT_KEY = "import_settings"
 local function save_import_settings()
     local parts = {}
     for _, cb in ipairs(checkboxes_list) do
@@ -4462,8 +4469,8 @@ end
 load_import_settings()
 
 -- Save/Load window position
-local EXTSTATE_WINPOS_KEY = "window_position"
-local EXTSTATE_WINPOS_MODE_KEY = "window_position_mode"
+EXTSTATE_WINPOS_KEY = "window_position"
+EXTSTATE_WINPOS_MODE_KEY = "window_position_mode"
 window_position_mode = "mouse"  -- "last" or "mouse"
 local function save_window_position()
     local dock, wx, wy = gfx.dock(-1, 0, 0, 0, 0)
@@ -4488,8 +4495,38 @@ local function load_window_position_mode()
 end
 window_position_mode = load_window_position_mode()
 
+-- Save/Load remember window size setting
+EXTSTATE_WINSIZE_KEY = "remember_window_size"
+EXTSTATE_WINSIZE_MAIN_KEY = "window_size_main"
+EXTSTATE_WINSIZE_SETTINGS_KEY = "window_size_settings"
+function save_remember_window_size_setting()
+    reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_WINSIZE_KEY, remember_window_size and "1" or "0", true)
+end
+local function load_remember_window_size_setting()
+    local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_WINSIZE_KEY)
+    if val == "1" then remember_window_size = true end
+end
+local function save_window_size(tab)
+    if remember_window_size then
+        local dock = gfx.dock(-1, 0, 0, 0, 0)
+        if dock == 0 then
+            local key = (tab == "settings") and EXTSTATE_WINSIZE_SETTINGS_KEY or EXTSTATE_WINSIZE_MAIN_KEY
+            reaper.SetExtState(EXTSTATE_SECTION, key, tostring(math.floor(gfx.w)) .. "," .. tostring(math.floor(gfx.h)), true)
+        end
+    end
+end
+local function load_window_size(tab)
+    local key = (tab == "settings") and EXTSTATE_WINSIZE_SETTINGS_KEY or EXTSTATE_WINSIZE_MAIN_KEY
+    local saved = reaper.GetExtState(EXTSTATE_SECTION, key)
+    if not saved or saved == "" then return nil, nil end
+    local sw, sh = saved:match("(%d+),(%d+)")
+    if sw and sh then return tonumber(sw), tonumber(sh) end
+    return nil, nil
+end
+load_remember_window_size_setting()
+
 -- Save/Load auto-focus setting
-local EXTSTATE_AUTOFOCUS_KEY = "auto_focus"
+EXTSTATE_AUTOFOCUS_KEY = "auto_focus"
 local function save_auto_focus_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_AUTOFOCUS_KEY, auto_focus_enabled and "1" or "0", true)
 end
@@ -4500,7 +4537,7 @@ end
 load_auto_focus_setting()
 
 -- Save/Load/Apply stay-on-top setting
-local EXTSTATE_STAYONTOP_KEY = "stay_on_top"
+EXTSTATE_STAYONTOP_KEY = "stay_on_top"
 local function apply_stay_on_top()
     if window_script then
         if stay_on_top_enabled then
@@ -4520,8 +4557,8 @@ end
 load_stay_on_top_setting()
 
 -- Save/Load export open-with setting
-local EXTSTATE_OPENWITH_KEY = "export_open_with"
-local EXTSTATE_OPENWITH_PATH_KEY = "export_open_with_path"
+EXTSTATE_OPENWITH_KEY = "export_open_with"
+EXTSTATE_OPENWITH_PATH_KEY = "export_open_with_path"
 local function save_open_with_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_OPENWITH_KEY, export_open_with_enabled and "1" or "0", true)
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_OPENWITH_PATH_KEY, export_open_with_path, true)
@@ -4535,7 +4572,7 @@ end
 load_open_with_setting()
 
 -- Save/Load export open-folder setting
-local EXTSTATE_OPENFOLDER_KEY = "export_open_folder"
+EXTSTATE_OPENFOLDER_KEY = "export_open_folder"
 local function save_open_folder_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_OPENFOLDER_KEY, export_open_folder_enabled and "1" or "0", true)
 end
@@ -4546,7 +4583,7 @@ end
 load_open_folder_setting()
 
 -- Save/Load export key signature setting
-local EXTSTATE_KEYSIG_KEY = "export_key_sig"
+EXTSTATE_KEYSIG_KEY = "export_key_sig"
 function save_key_sig_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEYSIG_KEY, export_key_sig_enabled and "1" or "0", true)
 end
@@ -4695,7 +4732,7 @@ function draw_and_handle_gui_msgbox(mouse_x, mouse_y, mouse_clicked, char_input)
 end
 
 -- Save/Load font setting
-local EXTSTATE_FONT_KEY = "font_name"
+EXTSTATE_FONT_KEY = "font_name"
 local function save_font_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_FONT_KEY, font_list[current_font_index], true)
 end
@@ -4710,7 +4747,7 @@ end
 load_font_setting()
 
 -- Save/Load docker settings
-local EXTSTATE_DOCKER_KEY = "docker_settings"
+EXTSTATE_DOCKER_KEY = "docker_settings"
 local function save_docker_settings()
     local val = (docker_enabled and "1" or "0") .. "," .. tostring(docker_position)
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_DOCKER_KEY, val, true)
@@ -4783,14 +4820,41 @@ local RS = { active = false, sx = 0, sy = 0, sw = 0, sh = 0, HANDLE = 14, MIN_W 
 -- Initialize window
 local mouse_x, mouse_y = reaper.GetMousePosition()
 local init_x, init_y
-if window_position_mode == "last" then
-    local saved_wx, saved_wy = load_window_position()
-    init_x = saved_wx or (mouse_x - gui.width/2)
-    init_y = saved_wy or (mouse_y - gui.height/2)
-else
-    init_x = mouse_x - gui.width/2
-    init_y = mouse_y - gui.height/2
+local launch_from_fretboard = false
+
+-- Check if Fretboard sent a launch hint (format: "right_x,top_y,fb_width,fb_height")
+local hint = reaper.GetExtState("konst_window_manager", "launch_hint")
+if hint and hint ~= "" then
+    local hx, hy, hw, hh = hint:match("(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+)")
+    if hx then
+        init_x = tonumber(hx)
+        init_y = tonumber(hy)
+        gui.height = math.max(tonumber(hh), RS.MIN_H)
+        launch_from_fretboard = true
+        -- Consume the hint so it doesn't affect future standalone launches
+        reaper.DeleteExtState("konst_window_manager", "launch_hint", false)
+    end
 end
+
+if not launch_from_fretboard then
+    -- Restore saved window size if enabled
+    if remember_window_size then
+        local saved_w, saved_h = load_window_size("main")
+        if saved_w and saved_h then
+            gui.width = math.max(RS.MIN_W, math.min(saved_w, MAX_WINDOW_WIDTH))
+            gui.height = math.max(RS.MIN_H, math.min(saved_h, MAX_WINDOW_HEIGHT))
+        end
+    end
+    if window_position_mode == "last" then
+        local saved_wx, saved_wy = load_window_position()
+        init_x = saved_wx or (mouse_x - gui.width/2)
+        init_y = saved_wy or (mouse_y - gui.height/2)
+    else
+        init_x = mouse_x - gui.width/2
+        init_y = mouse_y - gui.height/2
+    end
+end
+
 local startup_dock = gui.settings.docker_id
 if docker_enabled then startup_dock = docker_dock_values[docker_position] or 1 end
 gfx.init(SCRIPT_TITLE, gui.width, gui.height, startup_dock, init_x, init_y)
@@ -5370,8 +5434,10 @@ end
 function draw_checkbox(checkbox_x, checkbox_y, size, label_x, label_text, is_checked, colors, max_text_w, text_id)
     -- Draw text label first (possibly truncated)
     local display_text = label_text
+    local was_truncated = false
     if max_text_w then
         display_text = truncate_text(label_text, max_text_w)
+        was_truncated = (display_text ~= label_text)
     end
     local text_y = checkbox_y + (size - gfx.texth) / 2
     if text_id then
@@ -5381,6 +5447,15 @@ function draw_checkbox(checkbox_x, checkbox_y, size, label_x, label_text, is_che
         gfx.x = label_x
         gfx.y = text_y
         gfx.drawstr(display_text)
+    end
+
+    -- Tooltip for truncated labels
+    if was_truncated and label_text ~= "" then
+        local mx, my = gfx.mouse_x, gfx.mouse_y
+        local text_w = gfx.measurestr(display_text)
+        if mx >= label_x and mx < label_x + text_w and my >= checkbox_y and my < checkbox_y + size then
+            pending_tooltip = label_text
+        end
     end
 
     -- Checkbox background - highlight only when checked
@@ -5462,12 +5537,25 @@ function draw_button(x, y, width, height, label, is_hovered, bg_color_key, borde
     gfx.set(table.unpack(border_color))
     gfx.rect(x, y, width, height, 0)
     
+    -- Truncate label if it doesn't fit
+    local full_label = label
+    local display_label = label
+    local text_width = gfx.measurestr(label)
+    if text_width > width - 8 then
+        display_label = truncate_text(label, width - 8)
+        text_width = gfx.measurestr(display_label)
+    end
+    
     -- Text
     gfx.set(table.unpack(text_color))
-    local text_width = gfx.measurestr(label)
     gfx.x = x + (width - text_width) / 2
     gfx.y = y + (height - gfx.texth) / 2
-    gfx.drawstr(label)
+    gfx.drawstr(display_label)
+    
+    -- Tooltip for truncated label
+    if display_label ~= full_label and is_hovered then
+        pending_tooltip = full_label
+    end
 end
 
 -- Draw resize handle (bottom-right corner grip) and handle drag logic
@@ -5524,23 +5612,29 @@ local main_defpath_edit_cursor
 local main_defpath_edit_sel
 
 -- Draw all checkboxes from list (filtered by show_in_menu) plus extra settings
-function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox_h, cb_size, max_width, colors)
+function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox_h, cb_size, max_width, colors, scroll_offset, max_vis_rows)
+    scroll_offset = scroll_offset or 0
     local visible_idx = 0
     for i, cb in ipairs(checkboxes) do
         if cb.show_in_menu ~= false then
-            local label_x = h_margin
-            local cb_y = header_h + v_margin + visible_idx * checkbox_h
-            local cb_x = gfx.w - h_margin - cb_size
-            
-            draw_checkbox(cb_x, cb_y, cb_size, label_x, cb.name, cb.checked, colors, nil, "option_" .. i)
+            local scrolled = visible_idx - scroll_offset
+            if not max_vis_rows or (scrolled >= 0 and scrolled < max_vis_rows) then
+                local label_x = h_margin
+                local cb_y = header_h + v_margin + scrolled * checkbox_h
+                local cb_x = gfx.w - h_margin - cb_size
+                
+                draw_checkbox(cb_x, cb_y, cb_size, label_x, cb.name, cb.checked, colors, nil, "option_" .. i)
+            end
             visible_idx = visible_idx + 1
         end
     end
     -- Draw extra settings (from M flags)
     local extras = get_visible_extra_settings()
     for j, item in ipairs(extras) do
-        local cb_y = header_h + v_margin + visible_idx * checkbox_h
-        if item.is_art then
+        local scrolled = visible_idx - scroll_offset
+        local main_row_visible = not max_vis_rows or (scrolled >= 0 and scrolled < max_vis_rows)
+        local cb_y = header_h + v_margin + scrolled * checkbox_h
+        if main_row_visible and item.is_art then
             -- Full-featured articulation row
             local art_name = item.key
             local art_i = item.art_index
@@ -5702,7 +5796,7 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
 
             -- 6) Enabled checkbox
             draw_checkbox(m_cb_x, cb_y, cb_size, m_cb_x, "", articulation_enabled[art_name], colors, 0, nil)
-        else
+        elseif main_row_visible then
             -- Non-articulation extra settings with enhanced controls
             local label_x = h_margin
             local cb_x_pos = gfx.w - h_margin - cb_size
@@ -6491,12 +6585,12 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     end
 
     -- Button area
-    local btn_width = 130
     local btn_height = 30
     local btn_spacing = 10
+    local btn_width = math.min(130, math.max(40, math.floor((gfx.w - horizontal_margin * 2 - btn_spacing * 3) / 4)))
     local total_btn_width = btn_width * 4 + btn_spacing * 3
     local btn_y = gfx.h - btn_height - 10
-    local btn_start_x = (gfx.w - total_btn_width) / 2
+    local btn_start_x = math.floor((gfx.w - total_btn_width) / 2)
 
     local import_btn_x = btn_start_x
     local save_btn_x = import_btn_x + btn_width + btn_spacing
@@ -6522,6 +6616,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     local docker_row_y = vy; vy = vy + checkbox_row_height
     local winpos_last_row_y = vy; vy = vy + checkbox_row_height
     local winpos_mouse_row_y = vy; vy = vy + checkbox_row_height
+    local winsize_row_y = vy; vy = vy + checkbox_row_height
     local defpath_row_y = vy; vy = vy + checkbox_row_height
     local lastpath_row_y = vy; vy = vy + checkbox_row_height
 
@@ -6600,6 +6695,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     docker_row_y = docker_row_y - scroll_y
     winpos_last_row_y = winpos_last_row_y - scroll_y
     winpos_mouse_row_y = winpos_mouse_row_y - scroll_y
+    winsize_row_y = winsize_row_y - scroll_y
     defpath_row_y = defpath_row_y - scroll_y
     lastpath_row_y = lastpath_row_y - scroll_y
     export_hdr_y = export_hdr_y - scroll_y
@@ -6634,6 +6730,15 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     local type_btn_x = repl_col_x - COL_SPACING - TYPE_BTN_WIDTH
     local sym_box_x = type_btn_x - COL_SPACING - SYM_BOX_WIDTH
     local name_max_w = sym_box_x - horizontal_margin - COL_SPACING
+
+    -- Button left edge for non-articulation rows (font/docker/midibank)
+    -- Uses art column alignment when wide enough, falls back to label-based position
+    local _sett_label_floor = horizontal_margin + math.max(
+        gfx.measurestr("MIDI Program Banks  "),
+        gfx.measurestr("Key Signature  "),
+        gfx.measurestr("Font  "),
+        gfx.measurestr("Docker  ")) + 4
+    local sett_simple_btn_x = math.max(sym_box_x, _sett_label_floor)
 
     -- Handle clicks (skip when dark menu or gui msgbox is active)
     if mouse_clicked and not dark_menu.active and not gui_msgbox.active then
@@ -6709,6 +6814,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             apply_stay_on_top()
             docker_enabled = false
             docker_position = 1
+            remember_window_size = false
+            save_remember_window_size_setting()
             current_font_index = 1
             gfx.setfont(1, font_list[1], gui.settings.font_size)
             settings_save_confirmed_until = 0  -- clear any "Saved!" label
@@ -6742,9 +6849,21 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
             settings_mode = false
             close_dark_menu()
-            -- Recalculate main view size (M flags may have changed)
-            gui.width = pre_settings_width or gui.width
-            gui.height = pre_settings_height or gui.height
+            -- Save settings tab size and restore main tab size
+            save_window_size("settings")
+            if remember_window_size then
+                local sw, sh = load_window_size("main")
+                if sw and sh then
+                    gui.width = math.max(RS.MIN_W, math.min(sw, MAX_WINDOW_WIDTH))
+                    gui.height = math.max(RS.MIN_H, math.min(sh, MAX_WINDOW_HEIGHT))
+                else
+                    gui.width = pre_settings_width or gui.width
+                    gui.height = pre_settings_height or gui.height
+                end
+            else
+                gui.width = pre_settings_width or gui.width
+                gui.height = pre_settings_height or gui.height
+            end
             resize_window()
             pre_settings_width = nil
             pre_settings_height = nil
@@ -6798,6 +6917,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                 }
                 ImportMusicXMLWithOptions(selected_file_path, options)
                 save_window_position()
+                save_window_size("settings")
                 gfx.quit()
             else
                 safe_msgbox("Please select a MusicXML file first.", "No File Selected", 0)
@@ -6887,8 +7007,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
                 settings_menu_flags.font = not settings_menu_flags.font
             else
-                local font_btn_x_c = sym_box_x
-                local font_btn_w_c = cb_x - COL_SPACING - sym_box_x
+                local font_btn_x_c = sett_simple_btn_x
+                local font_btn_w_c = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
                 if mouse_x >= font_btn_x_c and mouse_x < font_btn_x_c + font_btn_w_c then
                     local menu_str = ""
                     for j, v in ipairs(font_list) do
@@ -6932,8 +7052,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                     if stay_on_top_enabled then apply_stay_on_top() end
                 end
             else
-                local docker_btn_x = sym_box_x
-                local docker_btn_w = cb_x - COL_SPACING - sym_box_x
+                local docker_btn_x = sett_simple_btn_x
+                local docker_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
                 if mouse_x >= docker_btn_x and mouse_x < docker_btn_x + docker_btn_w then
                     local menu_str = ""
                     for j, v in ipairs(docker_positions) do
@@ -6971,6 +7091,16 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
         end
 
+        -- Check click on remember window size row
+        if mouse_in_content and mouse_y > winsize_row_y and mouse_y < winsize_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.winsize = not settings_menu_flags.winsize
+            elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                remember_window_size = not remember_window_size
+                save_remember_window_size_setting()
+            end
+        end
+
         -- Check click on MIDI program banks row
         if mouse_in_content and mouse_y > midibank_row_y and mouse_y < midibank_row_y + checkbox_size then
             if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
@@ -6978,8 +7108,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
                 midi_program_banks_enabled = not midi_program_banks_enabled
             else
-                local midibank_btn_x = sym_box_x
-                local midibank_btn_w = cb_x - COL_SPACING - sym_box_x
+                local midibank_btn_x = sett_simple_btn_x
+                local midibank_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
                 if mouse_x >= midibank_btn_x and mouse_x < midibank_btn_x + midibank_btn_w then
                     -- Build GM presets menu string
                     local menu_str = ""
@@ -7784,8 +7914,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         end
         -- Check if mouse is over font scrollable button
         if not wheel_handled then
-            local font_btn_x_w = sym_box_x
-            local font_btn_w_w = cb_x - COL_SPACING - sym_box_x
+            local font_btn_x_w = sett_simple_btn_x
+            local font_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
             if mouse_x > font_btn_x_w and mouse_x < font_btn_x_w + font_btn_w_w and
                mouse_y > font_row_y and mouse_y < font_row_y + checkbox_size then
                 local delta = gfx.mouse_wheel > 0 and -1 or 1
@@ -7798,8 +7928,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         end
         -- Check if mouse is over docker position button
         if not wheel_handled then
-            local docker_btn_x_w = sym_box_x
-            local docker_btn_w_w = cb_x - COL_SPACING - sym_box_x
+            local docker_btn_x_w = sett_simple_btn_x
+            local docker_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
             if mouse_x > docker_btn_x_w and mouse_x < docker_btn_x_w + docker_btn_w_w and
                mouse_y > docker_row_y and mouse_y < docker_row_y + checkbox_size then
                 local delta = gfx.mouse_wheel > 0 and -1 or 1
@@ -7813,8 +7943,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
         end
         -- Check if mouse is over MIDI bank scrollable button
-        local midibank_btn_x_w = sym_box_x
-        local midibank_btn_w_w = cb_x - COL_SPACING - sym_box_x
+        local midibank_btn_x_w = sett_simple_btn_x
+        local midibank_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
         if not wheel_handled and mouse_x > midibank_btn_x_w and mouse_x < midibank_btn_x_w + midibank_btn_w_w and
            mouse_y > midibank_row_y and mouse_y < midibank_row_y + checkbox_size then
             -- Build flat list of valid GM programs (skip submenu headers)
@@ -8076,8 +8206,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
            mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
             settings_tooltip_text = "MIDI Program Banks: import/export\nMIDI bank and program change info\nfrom/to MusicXML files."
         else
-            local midibank_btn_x_t = sym_box_x
-            local midibank_btn_w_t = cb_x - COL_SPACING - sym_box_x
+            local midibank_btn_x_t = sett_simple_btn_x
+            local midibank_btn_w_t = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
             if mouse_x >= midibank_btn_x_t and mouse_x < midibank_btn_x_t + midibank_btn_w_t then
                 settings_tooltip_text = "Current MIDI bank of selected item.\nClick to assign GM program.\nMousewheel to cycle."
             end
@@ -8135,8 +8265,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         if mouse_x >= horizontal_margin and mouse_x < sym_box_x then
             settings_tooltip_text = "Font: select the display font\nfor the script window."
         else
-            local font_btn_x_t = sym_box_x
-            local font_btn_w_t = cb_x - COL_SPACING - sym_box_x
+            local font_btn_x_t = sett_simple_btn_x
+            local font_btn_w_t = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
             if mouse_x >= font_btn_x_t and mouse_x < font_btn_x_t + font_btn_w_t then
                 settings_tooltip_text = "Font: click or mousewheel to change."
             end
@@ -8148,8 +8278,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
            mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
             settings_tooltip_text = "Docker: dock the script window\non startup at the selected position."
         else
-            local docker_btn_x_t = sym_box_x
-            local docker_btn_w_t = cb_x - COL_SPACING - sym_box_x
+            local docker_btn_x_t = sett_simple_btn_x
+            local docker_btn_w_t = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
             if mouse_x >= docker_btn_x_t and mouse_x < docker_btn_x_t + docker_btn_w_t then
                 settings_tooltip_text = "Dock position: click or mousewheel to change.\nBottom, Left, Top, Right."
             end
@@ -8159,8 +8289,12 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     if mouse_y >= winpos_last_row_y and mouse_y < winpos_mouse_row_y then
         settings_tooltip_text = "Open window at the last saved\nscreen position on next launch."
     end
-    if mouse_y >= winpos_mouse_row_y and mouse_y < defpath_row_y then
+    if mouse_y >= winpos_mouse_row_y and mouse_y < winsize_row_y then
         settings_tooltip_text = "Open window centered under\nthe mouse cursor on next launch."
+    end
+    -- Remember size row hover
+    if mouse_y >= winsize_row_y and mouse_y < defpath_row_y then
+        settings_tooltip_text = "Remember Size: save window dimensions\nseparately for main and settings tabs."
     end
     -- Default path row hover
     if mouse_y >= defpath_row_y and mouse_y < lastpath_row_y then
@@ -8365,8 +8499,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
         end
     end
-    local midibank_btn_x = sym_box_x
-    local midibank_btn_w = cb_x - COL_SPACING - sym_box_x
+    local midibank_btn_x = sett_simple_btn_x
+    local midibank_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
     local midibank_btn_hovered = (mouse_x >= midibank_btn_x and mouse_x < midibank_btn_x + midibank_btn_w and
                                   mouse_y >= midibank_row_y and mouse_y < midibank_row_y + checkbox_size)
     if midibank_btn_hovered then
@@ -8610,8 +8744,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.y = font_text_y
     gfx.drawstr("Font")
     -- Font scrollable button
-    local font_btn_x = sym_box_x
-    local font_btn_w = cb_x - COL_SPACING - sym_box_x
+    local font_btn_x = sett_simple_btn_x
+    local font_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
     local font_label = font_list[current_font_index] or "Outfit"
     local font_btn_hovered = (mouse_x >= font_btn_x and mouse_x < font_btn_x + font_btn_w and
                               mouse_y >= font_row_y and mouse_y < font_row_y + checkbox_size)
@@ -8646,8 +8780,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.y = docker_text_y
     gfx.drawstr("Docker")
     -- Docker position scrollable button
-    local docker_btn_x = sym_box_x
-    local docker_btn_w = cb_x - COL_SPACING - sym_box_x
+    local docker_btn_x = sett_simple_btn_x
+    local docker_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
     local docker_pos_label = docker_positions[docker_position] or "Bottom"
     local docker_btn_hovered = (mouse_x >= docker_btn_x and mouse_x < docker_btn_x + docker_btn_w and
                                 mouse_y >= docker_row_y and mouse_y < docker_row_y + checkbox_size)
@@ -8660,10 +8794,19 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
     gfx.rect(docker_btn_x, docker_row_y, docker_btn_w, checkbox_size, 0)
     gfx.set(table.unpack(gui.colors.TEXT))
-    local docker_lbl_w = gfx.measurestr(docker_pos_label)
+    -- Truncate label to fit
+    local docker_lbl_full = docker_pos_label
+    local docker_lbl_w = gfx.measurestr(docker_lbl_full)
+    if docker_lbl_w > docker_btn_w - 4 then
+        while #docker_lbl_full > 1 and gfx.measurestr(docker_lbl_full .. "..") > docker_btn_w - 4 do
+            docker_lbl_full = docker_lbl_full:sub(1, -2)
+        end
+        docker_lbl_full = docker_lbl_full .. ".."
+        docker_lbl_w = gfx.measurestr(docker_lbl_full)
+    end
     gfx.x = docker_btn_x + (docker_btn_w - docker_lbl_w) / 2
     gfx.y = docker_text_y
-    gfx.drawstr(docker_pos_label)
+    gfx.drawstr(docker_lbl_full)
     -- Docker enabled checkbox
     draw_checkbox(cb_x, docker_row_y, checkbox_size, cb_x, "", docker_enabled, gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, docker_row_y, settings_menu_flags.docker)
@@ -8693,6 +8836,21 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.drawstr("At Mouse")
     draw_checkbox(cb_x, winpos_mouse_row_y, checkbox_size, cb_x, "", window_position_mode == "mouse", gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, winpos_mouse_row_y, settings_menu_flags.winpos_mouse)
+
+    -- "Remember Size" row
+    local winsize_text_y = winsize_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = winsize_text_y
+    gfx.drawstr("Remember Size")
+    -- Show live window size
+    local wrs_label_w = gfx.measurestr("Remember Size  ")
+    gfx.set(0.5, 0.5, 0.5, 1)
+    gfx.x = horizontal_margin + wrs_label_w
+    gfx.y = winsize_text_y
+    gfx.drawstr(tostring(math.floor(gfx.w)) .. " x " .. tostring(math.floor(gfx.h)))
+    draw_checkbox(cb_x, winsize_row_y, checkbox_size, cb_x, "", remember_window_size, gui.colors, 0, nil)
+    draw_menu_flag_cb(menu_cb_x, winsize_row_y, settings_menu_flags.winsize)
 
     -- Draw default path row
     local defpath_text_y = defpath_row_y + (checkbox_size - gfx.texth) / 2
@@ -9167,6 +9325,7 @@ function main_loop()
             reaper.defer(main_loop)
         else
             save_window_position()
+            save_window_size("settings")
             gfx.quit()
         end
         return
@@ -9319,12 +9478,12 @@ function main_loop()
     end
 
     -- Button area - bottom with four buttons side by side
-    local btn_width = 110
     local btn_height = 30
     local btn_spacing = 10
+    local btn_width = math.min(110, math.max(40, math.floor((gfx.w - horizontal_margin * 2 - btn_spacing * 3) / 4)))
     local total_btn_width = btn_width * 4 + btn_spacing * 3
     local btn_y = gfx.h - btn_height - 10
-    local btn_start_x = (gfx.w - total_btn_width) / 2
+    local btn_start_x = math.floor((gfx.w - total_btn_width) / 2)
     
     -- Import button
     local import_btn_x = btn_start_x
@@ -9348,7 +9507,27 @@ function main_loop()
         if cb.show_in_menu ~= false then visible_checkboxes = visible_checkboxes + 1 end
     end
     visible_checkboxes = visible_checkboxes + #get_visible_extra_settings()
-    local file_info_y = header_height + vertical_margin + (visible_checkboxes * checkbox_row_height) + vertical_margin
+    
+    -- Compute main settings scroll state
+    local settings_area_top = header_height + vertical_margin
+    local fixed_bottom_h = vertical_margin + file_info_height + vertical_margin + button_height_area
+    local settings_avail_h = gfx.h - settings_area_top - fixed_bottom_h
+    local max_vis_settings = math.max(1, math.floor(settings_avail_h / checkbox_row_height))
+    local main_needs_scroll = visible_checkboxes > max_vis_settings
+    local main_display_rows = main_needs_scroll and max_vis_settings or visible_checkboxes
+    local max_main_scroll = math.max(0, visible_checkboxes - max_vis_settings)
+    if main_scroll_offset > max_main_scroll then main_scroll_offset = max_main_scroll end
+    if main_scroll_offset < 0 then main_scroll_offset = 0 end
+    
+    local file_info_y_top = settings_area_top + main_display_rows * checkbox_row_height + vertical_margin
+    local file_info_y
+    if main_needs_scroll and #track_checkboxes == 0 then
+        -- Anchor from bottom to eliminate visual gap from floor() remainder
+        local file_info_y_bottom = btn_y - vertical_margin - file_info_height
+        file_info_y = math.max(file_info_y_top, file_info_y_bottom)
+    else
+        file_info_y = file_info_y_top
+    end
     local file_info_hovered = (mouse_x > 0 and mouse_x < gfx.w and
                                mouse_y > file_info_y and mouse_y < file_info_y + file_info_height)
 
@@ -9368,6 +9547,7 @@ function main_loop()
         -- Cancel button
         if cancel_btn_hovered then
             save_window_position()
+            save_window_size(settings_mode and "settings" or "main")
             gfx.quit()
             return
         end
@@ -9403,6 +9583,7 @@ function main_loop()
                 -- Execute import with selected options
                 ImportMusicXMLWithOptions(selected_file_path, options)
                 save_window_position()
+                save_window_size("main")
                 gfx.quit()
             else
                 safe_msgbox("Please select a MusicXML file first.", "No File Selected", 0)
@@ -9470,8 +9651,26 @@ function main_loop()
                 main_defpath_edit_active = false
             end
             -- Save current size and resize for settings view
+            save_window_size("main")
             pre_settings_width = gui.width
             pre_settings_height = gui.height
+            -- Try to restore saved settings tab size
+            local restored_settings = false
+            if remember_window_size then
+                local sw, sh = load_window_size("settings")
+                if sw and sh then
+                    gui.width = math.max(RS.MIN_W, math.min(sw, MAX_WINDOW_WIDTH))
+                    gui.height = math.max(RS.MIN_H, math.min(sh, MAX_WINDOW_HEIGHT))
+                    if window_script then
+                        reaper.JS_Window_Resize(window_script, gui.width, gui.height)
+                    else
+                        local _, wx, wy = gfx.dock(-1, 0, 0, 0, 0)
+                        gfx.init(SCRIPT_TITLE, gui.width, gui.height, gui.settings.docker_id, wx, wy)
+                    end
+                    restored_settings = true
+                end
+            end
+            if not restored_settings then
             local min_settings_w = horizontal_margin + 150 + COL_SPACING + SYM_BOX_WIDTH + COL_SPACING + TYPE_BTN_WIDTH + COL_SPACING + REPL_COL_WIDTH + COL_SPACING + checkbox_size + COL_SPACING + checkbox_size + COL_SPACING + checkbox_size + horizontal_margin
             local settings_w = math.max(min_settings_w, 660)
             local settings_h = math.min(MAX_WINDOW_HEIGHT, 900)
@@ -9486,15 +9685,18 @@ function main_loop()
                     gfx.init(SCRIPT_TITLE, gui.width, gui.height, gui.settings.docker_id, wx, wy)
                 end
             end
+            end
         end
 
         -- Checkboxes (vertical layout - aligned, filtered by show_in_menu)
         local vis_idx = 0
         for i, cb in ipairs(checkboxes_list) do
             if cb.show_in_menu ~= false then
+                local scrolled_i = vis_idx - main_scroll_offset
                 local cb_x = gfx.w - horizontal_margin - checkbox_size
-                local cb_y = header_height + vertical_margin + vis_idx * checkbox_row_height
-                if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
+                local cb_y = header_height + vertical_margin + scrolled_i * checkbox_row_height
+                if scrolled_i >= 0 and (not main_needs_scroll or scrolled_i < main_display_rows) and
+                   mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
                    mouse_y > cb_y and mouse_y < cb_y + checkbox_size then
                     -- Handle mutually exclusive checkboxes for insertion modes (indices 5, 6, 7)
                     if i >= 5 and i <= 7 then
@@ -9519,8 +9721,10 @@ function main_loop()
         local main_clicked_sym_box = false
         local main_clicked_defpath_box = false
         for j, item in ipairs(extras) do
-            local cb_y = header_height + vertical_margin + vis_idx * checkbox_row_height
-            if item.is_art then
+            local scrolled_j = vis_idx - main_scroll_offset
+            local cb_y = header_height + vertical_margin + scrolled_j * checkbox_row_height
+            local row_vis = scrolled_j >= 0 and (not main_needs_scroll or scrolled_j < main_display_rows)
+            if row_vis and item.is_art then
                 local art_name = item.key
                 local art_i = item.art_index
                 -- Column positions matching draw code
@@ -9748,7 +9952,7 @@ function main_loop()
                         break
                     end
                 end
-            else
+            elseif row_vis then
                 -- Non-articulation extras with enhanced controls
                 local mk = item.key
                 local cb_x = gfx.w - horizontal_margin - checkbox_size
@@ -9965,6 +10169,55 @@ function main_loop()
         end
     end
 
+    -- Handle mousewheel for settings area scroll + type buttons on art rows
+    if gfx.mouse_wheel ~= 0 and not dark_menu.active and not gui_msgbox.active then
+        -- Main settings area scroll
+        local settings_area_bottom = settings_area_top + main_display_rows * checkbox_row_height
+        if main_needs_scroll and mouse_y >= settings_area_top and mouse_y < settings_area_bottom then
+            local mw_handled_scroll = false
+            -- Check art row type buttons first (they consume mousewheel too)
+            local mw_extras = get_visible_extra_settings()
+            local mw_vis_idx = 0
+            for _, cb in ipairs(checkboxes_list) do
+                if cb.show_in_menu ~= false then mw_vis_idx = mw_vis_idx + 1 end
+            end
+            for _, mw_item in ipairs(mw_extras) do
+                local mw_scrolled = mw_vis_idx - main_scroll_offset
+                local mw_cb_y = header_height + vertical_margin + mw_scrolled * checkbox_row_height
+                if mw_scrolled >= 0 and mw_scrolled < main_display_rows and mw_item.is_art then
+                    local m_cb_x = gfx.w - horizontal_margin - checkbox_size
+                    local m_prefix_cb_x = m_cb_x - COL_SPACING - checkbox_size
+                    local m_repl_col_x = m_prefix_cb_x - COL_SPACING - REPL_COL_WIDTH
+                    local m_type_btn_x = m_repl_col_x - COL_SPACING - TYPE_BTN_WIDTH
+                    if mouse_x > m_type_btn_x and mouse_x < m_type_btn_x + TYPE_BTN_WIDTH and
+                       mouse_y > mw_cb_y and mouse_y < mw_cb_y + checkbox_size then
+                        mw_handled_scroll = true
+                    end
+                end
+                if mw_scrolled >= 0 and mw_scrolled < main_display_rows and
+                   (mw_item.key == "docker" or mw_item.key == "font") then
+                    local lbl_w = gfx.measurestr(mw_item.label .. "  ")
+                    local btn_x = horizontal_margin + lbl_w
+                    local m_cb_x = gfx.w - horizontal_margin - checkbox_size
+                    local btn_w = (mw_item.key == "font") and (gfx.w - horizontal_margin - btn_x) or (m_cb_x - COL_SPACING - btn_x)
+                    if btn_w < 20 then btn_w = 20 end
+                    if mouse_x >= btn_x and mouse_x < btn_x + btn_w and
+                       mouse_y >= mw_cb_y and mouse_y < mw_cb_y + checkbox_size then
+                        mw_handled_scroll = true
+                    end
+                end
+                mw_vis_idx = mw_vis_idx + 1
+            end
+            if not mw_handled_scroll then
+                local scroll_delta = -math.floor(gfx.mouse_wheel / 120)
+                main_scroll_offset = main_scroll_offset + scroll_delta
+                if main_scroll_offset < 0 then main_scroll_offset = 0 end
+                if main_scroll_offset > max_main_scroll then main_scroll_offset = max_main_scroll end
+                gfx.mouse_wheel = 0
+            end
+        end
+    end
+
     -- Handle mousewheel for type buttons on art rows in main view
     if gfx.mouse_wheel ~= 0 and not dark_menu.active and not gui_msgbox.active then
         local mw_extras = get_visible_extra_settings()
@@ -9974,8 +10227,9 @@ function main_loop()
         end
         local mw_handled = false
         for _, mw_item in ipairs(mw_extras) do
-            local mw_cb_y = header_height + vertical_margin + mw_vis_idx * checkbox_row_height
-            if mw_item.is_art then
+            local mw_scrolled = mw_vis_idx - main_scroll_offset
+            local mw_cb_y = header_height + vertical_margin + mw_scrolled * checkbox_row_height
+            if mw_scrolled >= 0 and (not main_needs_scroll or mw_scrolled < main_display_rows) and mw_item.is_art then
                 local m_cb_x = gfx.w - horizontal_margin - checkbox_size
                 local m_prefix_cb_x = m_cb_x - COL_SPACING - checkbox_size
                 local m_repl_col_x = m_prefix_cb_x - COL_SPACING - REPL_COL_WIDTH
@@ -10000,7 +10254,8 @@ function main_loop()
                     mw_handled = true
                     break
                 end
-            elseif mw_item.key == "docker" or mw_item.key == "font" then
+            elseif mw_scrolled >= 0 and (not main_needs_scroll or mw_scrolled < main_display_rows) and
+                   (mw_item.key == "docker" or mw_item.key == "font") then
                 local lbl_w = gfx.measurestr(mw_item.label .. "  ")
                 local btn_x = horizontal_margin + lbl_w
                 local m_cb_x = gfx.w - horizontal_margin - checkbox_size
@@ -10080,9 +10335,41 @@ function main_loop()
     end
 
     -- Draw all UI elements using modular functions
+    pending_tooltip = nil  -- clear tooltip each frame
     draw_header("IMPORT MUSICXML", header_height, gui.colors)
     draw_checkboxes_list(checkboxes_list, header_height, horizontal_margin, vertical_margin, 
-                        checkbox_row_height, checkbox_size, max_label_width, gui.colors)
+                        checkbox_row_height, checkbox_size, max_label_width, gui.colors,
+                        main_scroll_offset, main_needs_scroll and main_display_rows or nil)
+    
+    -- Draw main settings scrollbar if needed
+    if main_needs_scroll then
+        local sb_width = 8
+        local sb_x = gfx.w - sb_width - 4
+        local sb_top = settings_area_top
+        local sb_track_h = main_display_rows * checkbox_row_height
+        local thumb_h = math.max(20, math.floor(sb_track_h * main_display_rows / visible_checkboxes))
+        local thumb_y = sb_top + math.floor((sb_track_h - thumb_h) * main_scroll_offset / max_main_scroll)
+        -- Track
+        gfx.set(0.15, 0.15, 0.15, 1)
+        gfx.rect(sb_x, sb_top, sb_width, sb_track_h, 1)
+        -- Thumb
+        gfx.set(0.4, 0.4, 0.4, 1)
+        gfx.rect(sb_x, thumb_y, sb_width, thumb_h, 1)
+    end
+    
+    -- Cover area below settings rows (above file info) to hide partially-drawn scrolled content
+    if main_needs_scroll then
+        local clear_r = (gfx.clear & 0xFF) / 255
+        local clear_g = ((gfx.clear >> 8) & 0xFF) / 255
+        local clear_b = ((gfx.clear >> 16) & 0xFF) / 255
+        gfx.set(clear_r, clear_g, clear_b, 1)
+        local cover_y = settings_area_top + main_display_rows * checkbox_row_height
+        local cover_h = file_info_y - cover_y
+        if cover_h > 0 then
+            gfx.rect(0, cover_y, gfx.w, cover_h, 1)
+        end
+    end
+    
     draw_file_info(file_info_y, file_info_height, selected_file_name, selected_file_track_count, gui.colors, file_info_hovered, is_drag_over_file_info)
     
     -- Draw track checkboxes section (after file info)
@@ -10297,6 +10584,11 @@ function main_loop()
     -- Resize handle (drawn on top)
     draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released, mouse_down, screen_x, screen_y)
 
+    -- Draw tooltip (on top of everything, before update)
+    if pending_tooltip and not dark_menu.active and not gui_msgbox.active then
+        draw_tooltip(pending_tooltip, mouse_x, mouse_y)
+    end
+
     gfx.update()
     last_mouse_cap = gfx.mouse_cap
 
@@ -10309,6 +10601,7 @@ function main_loop()
         reaper.defer(main_loop)
     else
         save_window_position()
+        save_window_size("main")
         gfx.quit()
     end
 end
