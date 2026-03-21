@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="8d1c912e0ee21e5158fe64d457419f49793e6452">
+<index version="1" name="konst_reascripts" commit="90ecf42f586997c45396094dc269c7b0ffeafb26">
   <category name="ImportMusicXML">
     <reapack name="konst_Import MusicXML.lua" type="script" desc="Import and export MusicXML (.xml)">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
@@ -93,6 +93,12 @@ v1.0 - Initial release]]></changelog>
 - Added a settings option to rename tracks based on MIDI banks and programs.
 - Added a window resizing handler.]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/8d1c912e0ee21e5158fe64d457419f49793e6452/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+      <version name="1.4.3" author="kkonstantin2000" time="2026-03-21T08:46:13Z">
+        <changelog><![CDATA[v1.4.3  
+- Improved resizing behavior and layout of the GUI.
+- Added setting to save window dimensions]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/90ecf42f586997c45396094dc269c7b0ffeafb26/ImportMusicXML/konst_Import%20MusicXML.lua</source>
       </version>
     </reapack>
   </category>
