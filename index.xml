@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="7cfe6e802699e02d7402791bda33f98d035fb0e1">
+<index version="1" name="konst_reascripts" commit="c4261d2f990e7f3b53a0bd3c144c6b1bcfb557e8">
   <category name="ImportMusicXML">
+    <reapack name="konst_align_score_to_audio.py" type="script" desc="Score-to-audio alignment helper for konst_Import MusicXML">
+      <version name="1.5.0" author="kkonstantin2000" time="2026-04-21T13:59:24Z">
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/c4261d2f990e7f3b53a0bd3c144c6b1bcfb557e8/ImportMusicXML/konst_align_score_to_audio.py</source>
+      </version>
+    </reapack>
     <reapack name="konst_Import MusicXML.lua" type="script" desc="Import and export MusicXML (.xml)">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
         <changelog><![CDATA[Initial release]]></changelog>
@@ -170,6 +175,11 @@ Bug fixes:
       <version name="1.0.0" author="kkonstantin2000" time="2026-04-21T13:08:06Z">
         <changelog><![CDATA[v1.0.0 - Initial release]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/7cfe6e802699e02d7402791bda33f98d035fb0e1/ImportMusicXML/konst_Insert%20at%20mouse.lua</source>
+      </version>
+    </reapack>
+    <reapack name="konst_transient_detect.py" type="script" desc="Transient detection helper for konst_Import MusicXML">
+      <version name="1.5.0" author="kkonstantin2000" time="2026-04-21T13:59:24Z">
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/c4261d2f990e7f3b53a0bd3c144c6b1bcfb557e8/ImportMusicXML/konst_transient_detect.py</source>
       </version>
     </reapack>
   </category>
