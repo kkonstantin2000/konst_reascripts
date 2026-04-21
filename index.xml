@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="konst_reascripts" commit="90ecf42f586997c45396094dc269c7b0ffeafb26">
+<index version="1" name="konst_reascripts" commit="7cfe6e802699e02d7402791bda33f98d035fb0e1">
   <category name="ImportMusicXML">
     <reapack name="konst_Import MusicXML.lua" type="script" desc="Import and export MusicXML (.xml)">
       <version name="1.0" author="kkonstantin2000" time="2026-02-23T11:30:07Z">
@@ -99,6 +99,77 @@ v1.0 - Initial release]]></changelog>
 - Improved resizing behavior and layout of the GUI.
 - Added setting to save window dimensions]]></changelog>
         <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/90ecf42f586997c45396094dc269c7b0ffeafb26/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+      <version name="1.5.0" author="kkonstantin2000" time="2026-04-21T13:08:06Z">
+        <changelog><![CDATA[v1.5.0
+Settings UI:
+- Reorganized all settings into 9 foldable sections: GENERAL, EXPORT, IMPORT, TRANSIENTS, TEMPO MAP, MIDI TOOLS, INSERT AT MOUSE, ARTICULATION, ARTICULATION GRID.
+- Added comprehensive hover tooltips for all UI elements in both main and settings views.
+- Fixed hover tips toggle: disabling "Hover Tips" now correctly hides tooltips in both views.
+
+Import workflow:
+- Added drag-and-drop track import: drag a track label from the GUI list directly into REAPER's arrange view to import and position it.
+- Added double-click on track label to import that single track at the edit cursor.
+- Added import position options "Region Onset" and "START Marker" (total now 6, was 4).
+- Added import timebase options "Align to project tempo map" and "Align to detected tempo map" (total now 6, was 4).
+- Added import progress bar overlay with animated progress, status text, and per-step completion log.
+- Added import undo history: saves pre-import state and allows undoing the last import.
+
+Auto-load:
+- Added auto-loading MusicXML by region name: automatically selects the file matching the active region as the edit cursor moves.
+- Fixed: manual Import button now always respects import_position_index, even when the cursor is inside an auto-loaded region.
+
+Audio alignment (Settings > Transients / Tempo Map):
+- Added "Align to audio stem" import timebase: aligns the imported score to a drum/percussion audio stem via an external Python script.
+- Added "Align notes to transients" option: creates a nudged MIDI take with each note snapped to its nearest audio transient.
+- Added native audio transient detection with dual envelope follower and peak refinement.
+- Added tempo smoothing and iterative BPM correction passes for stable tempo maps.
+- Added "Tempo map every beat" option: generates per-beat tempo markers snapped to audio transients.
+- Added stretch markers on drum audio items during stem alignment.
+- Added START marker detection to anchor alignment to a specific project position.
+- Added measure boundary collection during XML parsing for alignment use.
+- Added "Detect Tempo" button (Settings > Transients): generates tempo markers from the transients of a selected audio item.
+- Added standalone "Remap" button (Settings > Tempo Map): re-positions MIDI notes to match the current project tempo map without re-importing.
+- Added standalone "Nudge" button (Settings > Tempo Map): snaps notes of a selected MIDI item to the nearest stretch markers of a selected audio item (new take).
+- Added "Delete Tempo Markers" button (Settings > Tempo Map): deletes all tempo markers within the active range (razor edit → time selection → selected items bounding box).
+- Added "Remove Stretch Markers" button (Settings > Tempo Map): removes stretch markers from selected audio items within the active range.
+
+MIDI Tools (Settings > MIDI Tools):
+- Added MIDI Stretch Markers mode: take markers on MIDI items act as pseudo-stretch markers — drag to warp surrounding notes in real time.
+- Added "Shift TM" slider: shifts the MIDI take tempo map offset (±2 beats).
+- Added "Warp TM" slider: stretches the MIDI take tempo map rate (±2 beats range), with rate display.
+- Added TM Grid Snap toggle: snaps both sliders to the project grid.
+- Added "Snap TM to Note" button: snaps the take marker to the nearest MIDI note.
+- Added Auto-snap TM checkbox: automatically snaps the take marker on every frame.
+- Added "Reset TM" button: resets Shift TM and Warp TM to defaults.
+
+Insert at Mouse (Settings > Insert at Mouse + companion script):
+- Added companion script konst_Insert at mouse.lua: context-sensitive insertion on ruler (tempo marker), MIDI item (take marker), or audio item (stretch marker).
+- Added Insert at Mouse settings section to control which insertion types are enabled.
+
+Bug fixes:
+- Fixed ticks_to_project_time: now uses TimeMap_timeToQN / TimeMap_QNToTime for correct accumulated beat calculation (was using TimeMap2_timeToBeats which returns beat-within-measure).
+- Fixed stale autoload_region_start_pos causing manual Import to override the chosen import position when the cursor was inside a matching region.]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/7cfe6e802699e02d7402791bda33f98d035fb0e1/ImportMusicXML/konst_Import%20MusicXML.lua</source>
+      </version>
+    </reapack>
+    <reapack name="konst_Insert at mouse.lua" type="script" desc="Insert or remove stretch marker / take marker / tempo marker at mouse cursor">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-aware insert/remove toggle at the mouse cursor.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Audio item: insert or remove a stretch marker\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab MIDI item: insert or remove a rated take marker (1.00x)\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab Ruler / empty area: insert or remove a tempo+time-signature marker\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Settings are read from REAPER ExtState section "konst_InsertAtMouse". You can configure them in konst_Import MusicXML (Settings > Insert at Mouse).\par}
+}
+]]></description>
+      </metadata>
+      <version name="1.0.0" author="kkonstantin2000" time="2026-04-21T13:08:06Z">
+        <changelog><![CDATA[v1.0.0 - Initial release]]></changelog>
+        <source main="main">https://github.com/kkonstantin2000/konst_reascripts/raw/7cfe6e802699e02d7402791bda33f98d035fb0e1/ImportMusicXML/konst_Insert%20at%20mouse.lua</source>
       </version>
     </reapack>
   </category>
