@@ -1,12 +1,58 @@
 -- @description Import and export MusicXML (.xml) 
 -- @author kkonstantin2000
--- @version 1.4.3
+-- @version 1.5.0
 -- @provides
 --   konst_Import MusicXML.lua
 -- @changelog
---   v1.4.3  
---   - Improved resizing behavior and layout of the GUI.
---   - Added setting to save window dimensions
+--   v1.5.0
+--   Settings UI:
+--   - Reorganized all settings into 9 foldable sections: GENERAL, EXPORT, IMPORT, TRANSIENTS, TEMPO MAP, MIDI TOOLS, INSERT AT MOUSE, ARTICULATION, ARTICULATION GRID.
+--   - Added comprehensive hover tooltips for all UI elements in both main and settings views.
+--   - Fixed hover tips toggle: disabling "Hover Tips" now correctly hides tooltips in both views.
+--
+--   Import workflow:
+--   - Added drag-and-drop track import: drag a track label from the GUI list directly into REAPER's arrange view to import and position it.
+--   - Added double-click on track label to import that single track at the edit cursor.
+--   - Added import position options "Region Onset" and "START Marker" (total now 6, was 4).
+--   - Added import timebase options "Align to project tempo map" and "Align to detected tempo map" (total now 6, was 4).
+--   - Added import progress bar overlay with animated progress, status text, and per-step completion log.
+--   - Added import undo history: saves pre-import state and allows undoing the last import.
+--
+--   Auto-load:
+--   - Added auto-loading MusicXML by region name: automatically selects the file matching the active region as the edit cursor moves.
+--   - Fixed: manual Import button now always respects import_position_index, even when the cursor is inside an auto-loaded region.
+--
+--   Audio alignment (Settings > Transients / Tempo Map):
+--   - Added "Align to audio stem" import timebase: aligns the imported score to a drum/percussion audio stem via an external Python script.
+--   - Added "Align notes to transients" option: creates a nudged MIDI take with each note snapped to its nearest audio transient.
+--   - Added native audio transient detection with dual envelope follower and peak refinement.
+--   - Added tempo smoothing and iterative BPM correction passes for stable tempo maps.
+--   - Added "Tempo map every beat" option: generates per-beat tempo markers snapped to audio transients.
+--   - Added stretch markers on drum audio items during stem alignment.
+--   - Added START marker detection to anchor alignment to a specific project position.
+--   - Added measure boundary collection during XML parsing for alignment use.
+--   - Added "Detect Tempo" button (Settings > Transients): generates tempo markers from the transients of a selected audio item.
+--   - Added standalone "Remap" button (Settings > Tempo Map): re-positions MIDI notes to match the current project tempo map without re-importing.
+--   - Added standalone "Nudge" button (Settings > Tempo Map): snaps notes of a selected MIDI item to the nearest stretch markers of a selected audio item (new take).
+--   - Added "Delete Tempo Markers" button (Settings > Tempo Map): deletes all tempo markers within the active range (razor edit → time selection → selected items bounding box).
+--   - Added "Remove Stretch Markers" button (Settings > Tempo Map): removes stretch markers from selected audio items within the active range.
+--
+--   MIDI Tools (Settings > MIDI Tools):
+--   - Added MIDI Stretch Markers mode: take markers on MIDI items act as pseudo-stretch markers — drag to warp surrounding notes in real time.
+--   - Added "Shift TM" slider: shifts the MIDI take tempo map offset (±2 beats).
+--   - Added "Warp TM" slider: stretches the MIDI take tempo map rate (±2 beats range), with rate display.
+--   - Added TM Grid Snap toggle: snaps both sliders to the project grid.
+--   - Added "Snap TM to Note" button: snaps the take marker to the nearest MIDI note.
+--   - Added Auto-snap TM checkbox: automatically snaps the take marker on every frame.
+--   - Added "Reset TM" button: resets Shift TM and Warp TM to defaults.
+--
+--   Insert at Mouse (Settings > Insert at Mouse + companion script):
+--   - Added companion script konst_Insert at mouse.lua: context-sensitive insertion on ruler (tempo marker), MIDI item (take marker), or audio item (stretch marker).
+--   - Added Insert at Mouse settings section to control which insertion types are enabled.
+--
+--   Bug fixes:
+--   - Fixed ticks_to_project_time: now uses TimeMap_timeToQN / TimeMap_QNToTime for correct accumulated beat calculation (was using TimeMap2_timeToBeats which returns beat-within-measure).
+--   - Fixed stale autoload_region_start_pos causing manual Import to override the chosen import position when the cursor was inside a matching region.
 
 --[[
   Select an uncompressed MusicXML (.xml) file. This script creates new tracks and MIDI items for each staff that contains tablature or drum notes.
@@ -32,6 +78,9 @@
 -- The first note keeps its original position, the second is moved forward by
 -- this amount, the third by 2×, etc. Set to 0 to disable.
 chord_offset_ticks = 1
+
+-- Script directory (for finding companion Python scripts)
+script_dir = ({reaper.get_action_context()})[2]:match("(.+[\\/])") or ""
 
 -- Case-insensitive track name matching for "Insert items on tracks by name" mode
 -- Set to true to match track names regardless of case (e.g., "guitar" matches "Guitar" or "GUITAR")
@@ -551,7 +600,7 @@ local c = {
     grey = reaper.ColorToNative(89,89,98)|0x1000000
 }
 
-local region_color_map = {
+region_color_map = {
     ["intro"] = c.grey,
     ["verse"] = c.gold,
     ["pre-chorus"] = c.orange,
@@ -664,53 +713,190 @@ xml_to_settings_name = {
 }
 
 -- Build a set of articulation_names_ordered for quick lookup
-local settings_name_set = {}
+settings_name_set = {}
 for _, name in ipairs(articulation_names_ordered) do
     settings_name_set[name] = true
 end
 
 -- Table: articulation_name -> true/false (enabled)
-local articulation_enabled = {}
+articulation_enabled = {}
 -- Table: articulation_name -> custom symbol string (nil = use default)
-local articulation_symbol_override = {}
+articulation_symbol_override = {}
 -- Table: articulation_name -> custom type number (nil = use default)
-local articulation_type_override = {}
+articulation_type_override = {}
 -- Table: articulation_name -> custom replaces_fret override (nil = use default)
-local articulation_replaces_fret_override = {}
+articulation_replaces_fret_override = {}
 -- Table: articulation_name -> custom no_prefix override (nil = use default)
-local articulation_no_prefix_override = {}
+articulation_no_prefix_override = {}
 -- Table: articulation_name -> default symbol string (from articulation_map)
-local articulation_default_symbol = {}
+articulation_default_symbol = {}
 -- Table: articulation_name -> default type number (from articulation_map)
-local articulation_default_type = {}
+articulation_default_type = {}
 -- Table: articulation_name -> default replaces_fret (from articulation_map)
-local articulation_default_replaces_fret = {}
+articulation_default_replaces_fret = {}
 -- Table: articulation_name -> default no_prefix (from articulation_map)
-local articulation_default_no_prefix = {}
+articulation_default_no_prefix = {}
 -- Valid type values and their labels
-local art_type_values = {1, 6, 7}
-local art_type_labels = {[1] = "Text", [6] = "Marker", [7] = "Cue"}
+art_type_values = {1, 6, 7}
+art_type_labels = {[1] = "Text", [6] = "Marker", [7] = "Cue"}
 -- Fret number global settings
-local fret_number_enabled = false
-local fret_number_type = 1
-local FRET_NUMBER_TYPE_DEFAULT = 1
+fret_number_enabled = false
+fret_number_type = 1
+FRET_NUMBER_TYPE_DEFAULT = 1
 -- Duration line (span) feature: draw "----" / "-|" for consecutive span arts
-local span_line_enabled = false
+span_line_enabled = false
 -- Highlight articulations used in file (requires XML scan on track selection change)
-local highlight_scan_enabled = true
+highlight_scan_enabled = true
 -- Export project regions as rehearsal marks (segments) in MusicXML
-local export_regions_enabled = true
+export_regions_enabled = true
 -- Include MIDI program/bank in import and export
-local midi_program_banks_enabled = true
+midi_program_banks_enabled = true
 -- Use GM preset names for imported track names instead of part-name
-local gm_name_tracks_enabled = false
+gm_name_tracks_enabled = false
+-- Import position: 1=Start of Project, 2=Edit Cursor, 3=Closest Region Start, 4=Closest Marker, 5=Region Onset, 6=START Marker
+import_position_index = 1
+import_position_options = {"Start of Project", "Edit Cursor", "Closest Region Start", "Closest Marker", "Region Onset", "START Marker"}
+-- Align stem selector: index into the audio items list within the current region (0 = Auto)
+align_stem_index = 0
+align_stem_items = {}  -- populated dynamically: {{item, take, name}, ...}
+-- Onset item selector: index into audio items list for onset detection (0 = Auto)
+onset_item_index = 0
+onset_item_items = {}  -- populated dynamically like align_stem_items
+-- Auto-load MusicXML file by matching region name at edit cursor
+autoload_by_region_enabled = false
+-- MIDI item timebase: 1=Default, 2=Time, 3=Beats (pos+len+rate), 4=Beats (pos only), 5=Adapt to project tempo map
+import_timebase_index = 1
+import_timebase_options = {"Project default", "Time", "Beats (position, length, rate)", "Beats (position only)", "Align to project tempo map", "Align to detected tempo map"}
+import_timebase_values = {-1, 0, 1, 2, 0}  -- C_BEATATTACHMODE values; index 5 (Align to tempo map) uses Time (0) (-1=project default, 0=time, 1=beats pos+len+rate, 2=beats pos only; Adapt uses project default)
+-- Tempo map frequency: how often to write tempo markers (fraction of a bar, or N bars)
+tempo_map_freq_index = 1
+tempo_map_freq_options = {"Off", "1/16", "1/8", "1/6", "1/4", "1/3", "1/2", "1", "2", "3", "4", "5", "6", "7", "8"}
+-- Time signature for tempo detection (default 4/4)
+tempo_timesig_index = 8  -- index into tempo_timesig_options for 4/4
+tempo_timesig_options = {
+    "1/2", "2/2", "3/2", "4/2",
+    "1/4", "2/4", "3/4", "4/4", "5/4", "6/4", "7/4", "8/4",
+    "1/8", "2/8", "3/8", "4/8", "5/8", "6/8", "7/8", "8/8", "9/8", "12/8",
+}
+tempo_timesig_num   = {1, 2, 3, 4,  1, 2, 3, 4, 5, 6, 7, 8,  1, 2, 3, 4, 5, 6, 7, 8, 9, 12}
+tempo_timesig_denom = {2, 2, 2, 2,  4, 4, 4, 4, 4, 4, 4, 4,  8, 8, 8, 8, 8, 8, 8, 8, 8, 8}
+-- Compute effective time sig and quarter-note beats per marker interval.
+-- For freq >= 1 bar: uses user time sig, marker every N bars.
+-- For freq < 1 bar: shrinks time sig so one marker = one bar.
+-- Returns: ts_num, ts_denom, beats_per_bar (quarter-note beats), or nil,nil,nil if Off.
+function get_detect_tempo_timesig()
+    local freq_opt = tempo_map_freq_options[tempo_map_freq_index]
+    if freq_opt == "Off" then return nil, nil, nil end
+    local user_num = tempo_timesig_num[tempo_timesig_index]
+    local user_denom = tempo_timesig_denom[tempo_timesig_index]
+    local user_beats_qn = user_num * 4 / user_denom
+    local fn, fd = freq_opt:match("^(%d+)/(%d+)$")
+    if fn then
+        fn = tonumber(fn)
+        fd = tonumber(fd)
+    else
+        fn = tonumber(freq_opt)
+        fd = 1
+    end
+    if fn >= fd then
+        -- freq >= 1 bar: user time sig, marker every N bars
+        return user_num, user_denom, user_beats_qn * fn / fd
+    else
+        -- freq < 1 bar: effective time sig = fraction of user bar
+        local eff_num = user_num * fn
+        local eff_denom = user_denom * fd
+        local function gcd(a, b) while b ~= 0 do a, b = b, a % b end return a end
+        local g = gcd(eff_num, eff_denom)
+        eff_num = eff_num / g
+        eff_denom = eff_denom / g
+        return eff_num, eff_denom, eff_num * 4 / eff_denom
+    end
+end
+-- Tempo detection method: 1=Lua, 2=Python
+tempo_detect_method_index = 1
+tempo_detect_method_options = {"Lua", "Python"}
+-- Stretch markers on transients after tempo detection
+detect_stretch_markers_enabled = false
+-- First stretch marker = start of bar 1 (skip transients before it)
+first_marker_is_bar1 = true
+-- Detect tempo from existing stretch markers (skip transient detection)
+detect_tempo_use_existing_markers = false
+-- Stretch marker sliders: threshold, sensitivity, retrig, offset
+sm_threshold_dB = 60     -- amplitude threshold (0–60 dB, higher = detect more). Default 60
+sm_sensitivity_dB = 7    -- envelope ratio (1–20 dB, lower = more transients). Default 7
+sm_retrig_ms = 60        -- min gap between transients (10–500 ms). Default 60
+sm_offset_ms = 0         -- bidirectional shift of markers (-100 to +100 ms). Default 0
+sm_slider_dragging = nil -- nil or "threshold"/"sensitivity"/"retrig"/"offset"
+-- Cache of detected transients (per item, detected at min settings for instant post-filtering)
+cached_transients_raw = nil     -- table of {src=..., proj=..., strength=env1, env2=env2}
+cached_transient_item = nil     -- item pointer the cache was built for
+cached_transient_params = nil   -- (unused, kept for compat)
+-- Tempo detection item source: 0=Selected Item, 1+=index into detect_tempo_item_items
+detect_tempo_item_index = 0
+detect_tempo_item_items = {}  -- populated dynamically like align_stem_items
+-- Tooltips (hover tips) enabled
+tips_enabled = true
+-- Import undo history (persisted to ExtState)
+import_history = {}  -- array of {label, timestamp, track_guids={}, item_guids={}, region_indices={}, tempo_marker_indices={}}
+EXTSTATE_IMPORT_HISTORY_KEY = "import_history"
+
+function save_import_history()
+    local entries = {}
+    for _, entry in ipairs(import_history) do
+        local tg = table.concat(entry.track_guids or {}, ",")
+        local ig = table.concat(entry.item_guids or {}, ",")
+        local ri = {}
+        for _, v in ipairs(entry.region_indices or {}) do ri[#ri+1] = tostring(v) end
+        local ti = {}
+        for _, v in ipairs(entry.tempo_marker_indices or {}) do ti[#ti+1] = tostring(v) end
+        entries[#entries+1] = (entry.label or "Import") .. "\t" ..
+            tostring(entry.timestamp or 0) .. "\t" ..
+            tg .. "\t" .. ig .. "\t" ..
+            table.concat(ri, ",") .. "\t" .. table.concat(ti, ",")
+    end
+    reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_IMPORT_HISTORY_KEY, table.concat(entries, "\n"), true)
+end
+
+function load_import_history()
+    local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_IMPORT_HISTORY_KEY)
+    if not saved or saved == "" then return end
+    import_history = {}
+    for line in saved:gmatch("[^\n]+") do
+        local parts = {}
+        for part in (line .. "\t"):gmatch("(.-)\t") do parts[#parts+1] = part end
+        if #parts >= 6 then
+            local entry = {
+                label = parts[1],
+                timestamp = tonumber(parts[2]) or 0,
+                track_guids = {},
+                item_guids = {},
+                region_indices = {},
+                tempo_marker_indices = {},
+            }
+            if parts[3] ~= "" then
+                for g in parts[3]:gmatch("[^,]+") do entry.track_guids[#entry.track_guids+1] = g end
+            end
+            if parts[4] ~= "" then
+                for g in parts[4]:gmatch("[^,]+") do entry.item_guids[#entry.item_guids+1] = g end
+            end
+            if parts[5] ~= "" then
+                for v in parts[5]:gmatch("[^,]+") do entry.region_indices[#entry.region_indices+1] = tonumber(v) end
+            end
+            if parts[6] ~= "" then
+                for v in parts[6]:gmatch("[^,]+") do entry.tempo_marker_indices[#entry.tempo_marker_indices+1] = tonumber(v) end
+            end
+            import_history[#import_history+1] = entry
+        end
+    end
+end
+-- load_import_history() is called after EXTSTATE_SECTION is defined below
 -- Open exported file with external program
-local export_open_with_enabled = false
-local export_open_with_path = ""
+export_open_with_enabled = false
+export_open_with_path = ""
 -- Open containing folder after export
-local export_open_folder_enabled = false
+export_open_folder_enabled = false
 -- Key signature for export
-local export_key_sig_enabled = true
+export_key_sig_enabled = true
 
 -- Key signature lookup tables
 keysig_root_names = {"C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"}
@@ -756,23 +942,11 @@ function keysig_write_event(take, root, notes_hex)
     reaper.MIDI_Sort(take)
 end
 
--- Forward declarations for variables/functions defined later, needed by early functions
-local path_mode
-local auto_focus_enabled
-local font_list
-local current_font_index
-local docker_enabled
-local docker_position
-local docker_positions
-local docker_dock_values
-local articulations_in_file
-local window_position_mode
-local save_window_position_mode
-local stay_on_top_enabled
-local remember_window_size
+-- Forward declarations (globals) for variables defined later, needed by early functions
+-- (Assigned in the GUI initialization section below)
 
 -- Reverse mapping: settings name -> XML element name (for names that differ)
-local settings_to_xml_name = {}
+settings_to_xml_name = {}
 for xml_name, settings_name in pairs(xml_to_settings_name) do
     settings_to_xml_name[settings_name] = xml_name
 end
@@ -812,19 +986,20 @@ end
 
 EXTSTATE_SECTION = "konst_ImportMusicXML"
 EXTSTATE_ART_KEY = "articulation_settings"
+load_import_history()
 
 -- Get the effective symbol for an articulation (override or default)
-local function get_art_symbol(name)
+function get_art_symbol(name)
     return articulation_symbol_override[name] or articulation_default_symbol[name]
 end
 
 -- Get the effective type for an articulation (override or default)
-local function get_art_type(name)
+function get_art_type(name)
     return articulation_type_override[name] or articulation_default_type[name]
 end
 
 -- Get the effective replaces_fret for an articulation (override or default)
-local function get_art_replaces_fret(name)
+function get_art_replaces_fret(name)
     if articulation_replaces_fret_override[name] ~= nil then
         return articulation_replaces_fret_override[name]
     end
@@ -832,7 +1007,7 @@ local function get_art_replaces_fret(name)
 end
 
 -- Get the effective no_prefix for an articulation (override or default)
-local function get_art_no_prefix(name)
+function get_art_no_prefix(name)
     if articulation_no_prefix_override[name] ~= nil then
         return articulation_no_prefix_override[name]
     end
@@ -842,15 +1017,15 @@ end
 -- Serialize all articulation settings to a string
 -- Format: "name|enabled|symbol|type;name2|enabled|symbol|type;..."
 -- Symbol uses base64-like URL encoding to avoid delimiter collisions
-local function encode_sym(s)
+function encode_sym(s)
     -- Percent-encode | ; and % characters
     return s:gsub("%%", "%%%%25"):gsub("|", "%%7C"):gsub(";", "%%3B")
 end
-local function decode_sym(s)
+function decode_sym(s)
     return s:gsub("%%3B", ";"):gsub("%%7C", "|"):gsub("%%25", "%%")
 end
 
-local function serialize_articulation_settings()
+function serialize_articulation_settings()
     local parts = {}
     -- Fret number global settings as special entry
     local fret_en = fret_number_enabled and "1" or "0"
@@ -871,6 +1046,36 @@ local function serialize_articulation_settings()
     -- GM track names toggle
     local gmn_en = gm_name_tracks_enabled and "1" or "0"
     table.insert(parts, "__gmname__|" .. gmn_en .. "||||")
+    -- Import position
+    table.insert(parts, "__importpos__|" .. tostring(import_position_index) .. "||||")
+    -- Align stem index
+    table.insert(parts, "__alignstem__|" .. tostring(align_stem_index) .. "||||")
+    -- Onset item index
+    table.insert(parts, "__onsetitem__|" .. tostring(onset_item_index) .. "||||")
+    -- Auto-load by region
+    local alr_en = autoload_by_region_enabled and "1" or "0"
+    table.insert(parts, "__autoloadrgn__|" .. alr_en .. "||||")
+    -- Import timebase
+    table.insert(parts, "__timebase__|" .. tostring(import_timebase_index) .. "||||")
+    -- Tempo map frequency
+    table.insert(parts, "__tempofreq__|" .. tostring(tempo_map_freq_index) .. "||||")
+    -- Tempo time signature
+    table.insert(parts, "__tempotimesig__|" .. tostring(tempo_timesig_index) .. "||||")
+    -- Tempo detect method
+    table.insert(parts, "__detectmethod__|" .. tostring(tempo_detect_method_index) .. "||||")
+    -- Stretch markers on transients
+    table.insert(parts, "__stretchmarkers__|" .. (detect_stretch_markers_enabled and "1" or "0") .. "||||")
+    -- Use existing stretch markers for tempo detection
+    table.insert(parts, "__useexistingmarkers__|" .. (detect_tempo_use_existing_markers and "1" or "0") .. "||||")
+    -- Stretch marker slider parameters
+    table.insert(parts, "__smthreshold__|" .. tostring(sm_threshold_dB) .. "||||")
+    table.insert(parts, "__smsensitivity__|" .. tostring(sm_sensitivity_dB) .. "||||")
+    table.insert(parts, "__smretrig__|" .. tostring(sm_retrig_ms) .. "||||")
+    table.insert(parts, "__smoffset__|" .. tostring(sm_offset_ms) .. "||||")
+    -- Detect tempo item index
+    table.insert(parts, "__detectitem__|" .. tostring(detect_tempo_item_index) .. "||||")
+    -- Tips enabled
+    table.insert(parts, "__tips__|" .. (tips_enabled and "1" or "0") .. "||||")
     for _, name in ipairs(articulation_names_ordered) do
         local en = articulation_enabled[name] and "1" or "0"
         local sym = articulation_symbol_override[name] or ""
@@ -885,7 +1090,7 @@ local function serialize_articulation_settings()
 end
 
 -- Deserialize string back to articulation settings tables
-local function deserialize_articulation_settings(str)
+function deserialize_articulation_settings(str)
     if not str or str == "" then return end
     -- Support old format "name=0,name2=1,..." for backward compatibility
     if str:find("=") and not str:find("|") then
@@ -928,6 +1133,93 @@ local function deserialize_articulation_settings(str)
         elseif name == "__gmname__" then
             -- GM track names toggle
             if fields[2] then gm_name_tracks_enabled = (fields[2] == "1") end
+        elseif name == "__importpos__" then
+            -- Import position
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx and idx >= 1 and idx <= #import_position_options then import_position_index = idx end
+            end
+        elseif name == "__alignstem__" then
+            -- Align stem index
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx then align_stem_index = idx end
+            end
+        elseif name == "__onsetitem__" then
+            -- Onset item index
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx then onset_item_index = idx end
+            end
+        elseif name == "__autoloadrgn__" then
+            -- Auto-load by region
+            if fields[2] then autoload_by_region_enabled = (fields[2] == "1") end
+        elseif name == "__timebase__" then
+            -- Import timebase
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx and idx >= 1 and idx <= #import_timebase_options then import_timebase_index = idx end
+            end
+        elseif name == "__tempofreq__" then
+            -- Tempo map frequency
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx and idx >= 1 and idx <= #tempo_map_freq_options then tempo_map_freq_index = idx end
+            end
+        elseif name == "__tempotimesig__" then
+            -- Tempo time signature
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx and idx >= 1 and idx <= #tempo_timesig_options then tempo_timesig_index = idx end
+            end
+        elseif name == "__detectmethod__" then
+            -- Tempo detect method
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx and idx >= 1 and idx <= #tempo_detect_method_options then tempo_detect_method_index = idx end
+            end
+        elseif name == "__stretchmarkers__" then
+            -- Stretch markers on transients
+            if fields[2] then
+                detect_stretch_markers_enabled = (fields[2] == "1")
+            end
+        elseif name == "__detectitem__" then
+            if fields[2] then
+                local idx = tonumber(fields[2])
+                if idx then detect_tempo_item_index = idx end
+            end
+        elseif name == "__transientsens__" then
+            -- legacy: ignore (replaced by __smthreshold__ / __smsensitivity__)
+        elseif name == "__transientretrig__" then
+            -- legacy: ignore (replaced by __smretrig__)
+        elseif name == "__useexistingmarkers__" then
+            if fields[2] then
+                detect_tempo_use_existing_markers = (fields[2] ~= "0")
+            end
+        elseif name == "__smthreshold__" then
+            if fields[2] then
+                local v = tonumber(fields[2])
+                if v then sm_threshold_dB = math.max(0, math.min(60, v)) end
+            end
+        elseif name == "__smsensitivity__" then
+            if fields[2] then
+                local v = tonumber(fields[2])
+                if v then sm_sensitivity_dB = math.max(1, math.min(20, v)) end
+            end
+        elseif name == "__smretrig__" then
+            if fields[2] then
+                local v = tonumber(fields[2])
+                if v then sm_retrig_ms = math.max(10, math.min(500, v)) end
+            end
+        elseif name == "__smoffset__" then
+            if fields[2] then
+                local v = tonumber(fields[2])
+                if v then sm_offset_ms = math.max(-100, math.min(100, v)) end
+            end
+        elseif name == "__tips__" then
+            if fields[2] then
+                tips_enabled = (fields[2] ~= "0")
+            end
         elseif name and articulation_enabled[name] ~= nil then
             if fields[2] then articulation_enabled[name] = (fields[2] == "1") end
             if fields[3] and fields[3] ~= "" then
@@ -948,18 +1240,18 @@ local function deserialize_articulation_settings(str)
 end
 
 -- Load from EXTSTATE (call at startup)
-local function load_articulation_settings()
+function load_articulation_settings()
     local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_ART_KEY)
     deserialize_articulation_settings(saved)
 end
 
 -- Save to EXTSTATE (persist = true)
-local function save_articulation_settings()
+function save_articulation_settings()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_ART_KEY, serialize_articulation_settings(), true)
 end
 
 -- Restore defaults: re-enable everything, clear overrides
-local function restore_default_articulation_settings()
+function restore_default_articulation_settings()
     fret_number_enabled = false
     fret_number_type = FRET_NUMBER_TYPE_DEFAULT
     span_line_enabled = false
@@ -967,10 +1259,19 @@ local function restore_default_articulation_settings()
     export_regions_enabled = true
     midi_program_banks_enabled = true
     gm_name_tracks_enabled = false
+    import_position_index = 1
+    align_stem_index = 0
+    onset_item_index = 0
+    autoload_by_region_enabled = false
+    import_timebase_index = 1
     export_open_with_enabled = false
     export_open_with_path = ""
     export_open_folder_enabled = false
     export_key_sig_enabled = true
+    detect_stretch_markers_enabled = false
+    first_marker_is_bar1 = true
+    detect_tempo_item_index = 0
+    tips_enabled = true
     for _, name in ipairs(articulation_names_ordered) do
         articulation_enabled[name] = true
         articulation_symbol_override[name] = nil
@@ -983,15 +1284,34 @@ end
 -- Load settings on script start
 load_articulation_settings()
 
+-- Load Insert at Mouse companion script settings
+do
+    local v = reaper.GetExtState("konst_InsertAtMouse", "enable_stretch")
+    iam_enable_stretch = (v == "" or v == "1")
+    v = reaper.GetExtState("konst_InsertAtMouse", "enable_take_tm")
+    iam_enable_take_tm = (v == "" or v == "1")
+    v = reaper.GetExtState("konst_InsertAtMouse", "enable_tempo")
+    iam_enable_tempo   = (v == "" or v == "1")
+end
+
 -- Show-in-menu flags for all non-import settings rows
 -- Keys: "hlscan","expreg","midibank","docker","winpos_last","winpos_mouse","defpath","lastpath","fret","span", and each articulation name
-local settings_menu_flags = {}
+settings_menu_flags = {}
 -- Initialize defaults (all hidden in main menu)
 for _, name in ipairs(articulation_names_ordered) do settings_menu_flags[name] = false end
 settings_menu_flags.hlscan = false
 settings_menu_flags.expreg = false
 settings_menu_flags.midibank = false
 settings_menu_flags.gmname = false
+settings_menu_flags.importpos = false
+settings_menu_flags.alignstem = false
+settings_menu_flags.onsetitem = false
+settings_menu_flags.autoloadrgn = false
+settings_menu_flags.timebase = false
+settings_menu_flags.tempofreq = false
+settings_menu_flags.tempotimesig = false
+settings_menu_flags.detectmethod = false
+settings_menu_flags.detectitem = false
 settings_menu_flags.openwith = false
 settings_menu_flags.openfolder = false
 settings_menu_flags.keysig = false
@@ -1003,16 +1323,19 @@ settings_menu_flags.defpath = false
 settings_menu_flags.lastpath = false
 settings_menu_flags.fret = false
 settings_menu_flags.span = false
+settings_menu_flags.smsnap = false
+settings_menu_flags.temposnap = false
+settings_menu_flags.midism = false
 
 EXTSTATE_MENU_FLAGS_KEY = "settings_menu_flags"
-local function save_settings_menu_flags()
+function save_settings_menu_flags()
     local parts = {}
     for k, v in pairs(settings_menu_flags) do
         if v then table.insert(parts, k .. "=1") end
     end
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_MENU_FLAGS_KEY, table.concat(parts, ";"), true)
 end
-local function load_settings_menu_flags()
+function load_settings_menu_flags()
     local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_MENU_FLAGS_KEY)
     if not saved or saved == "" then return end
     for entry in saved:gmatch("[^;]+") do
@@ -1022,8 +1345,38 @@ local function load_settings_menu_flags()
 end
 load_settings_menu_flags()
 
+-- Foldable section state for settings view + main view
+settings_fold = {general=false, export=false, import=false, transients=false, tempomap=false, miditools=false, insertmouse=false, articulation=false, artgrid=false}
+main_settings_folded = false
+
+EXTSTATE_FOLD_KEY = "settings_fold"
+EXTSTATE_MAIN_FOLD_KEY = "main_settings_folded"
+function save_fold_state()
+    local parts = {}
+    for k, v in pairs(settings_fold) do
+        if v then table.insert(parts, k .. "=1") end
+    end
+    if main_settings_folded then table.insert(parts, "main=1") end
+    reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_FOLD_KEY, table.concat(parts, ";"), true)
+end
+function load_fold_state()
+    local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_FOLD_KEY)
+    if not saved or saved == "" then return end
+    for entry in saved:gmatch("[^;]+") do
+        local k, v = entry:match("^(.+)=(%d)$")
+        if k and v and v == "1" then
+            if k == "main" then
+                main_settings_folded = true
+            elseif settings_fold[k] ~= nil then
+                settings_fold[k] = true
+            end
+        end
+    end
+end
+load_fold_state()
+
 -- Build list of extra settings visible in main menu (controlled by M checkboxes)
-local function get_visible_extra_settings()
+function get_visible_extra_settings()
     local items = {}
     -- GENERAL settings
     if settings_menu_flags.autofocus then table.insert(items, {key="autofocus", label="Auto-Focus"}) end
@@ -1043,6 +1396,19 @@ local function get_visible_extra_settings()
     if settings_menu_flags.keysig then table.insert(items, {key="keysig", label="Key Signature"}) end
     -- IMPORT settings
     if settings_menu_flags.gmname then table.insert(items, {key="gmname", label="GM Track Names"}) end
+    if settings_menu_flags.importpos then table.insert(items, {key="importpos", label="Import Position"}) end
+    if settings_menu_flags.autoloadrgn then table.insert(items, {key="autoloadrgn", label="Auto-load by Region"}) end
+    if settings_menu_flags.timebase then table.insert(items, {key="timebase", label="MIDI Timebase"}) end
+    -- TEMPO MAP settings
+    if settings_menu_flags.tempofreq then table.insert(items, {key="tempofreq", label="Tempo Map Freq"}) end
+    if settings_menu_flags.tempotimesig then table.insert(items, {key="tempotimesig", label="Time Signature"}) end
+    if settings_menu_flags.detectmethod then table.insert(items, {key="detectmethod", label="Detect Method"}) end
+    if settings_menu_flags.detectitem then table.insert(items, {key="detectitem", label="Detect Item"}) end
+    if settings_menu_flags.alignstem then table.insert(items, {key="alignstem", label="Align Stem"}) end
+    if settings_menu_flags.onsetitem then table.insert(items, {key="onsetitem", label="Onset Item"}) end
+    if settings_menu_flags.smsnap then table.insert(items, {key="smsnap", label="Snap SM to Grid"}) end
+    if settings_menu_flags.temposnap then table.insert(items, {key="temposnap", label="Snap Tempo to SM"}) end
+    if settings_menu_flags.midism then table.insert(items, {key="midism", label="MIDI SM Mode"}) end
     -- ARTICULATION settings
     if settings_menu_flags.hlscan then table.insert(items, {key="hlscan", label="Highlight Used"}) end
     if settings_menu_flags.fret then table.insert(items, {key="fret", label="Fret Number"}) end
@@ -1053,7 +1419,7 @@ local function get_visible_extra_settings()
     return items
 end
 
-local function get_extra_setting_checked(key)
+function get_extra_setting_checked(key)
     if key == "autofocus" then return auto_focus_enabled
     elseif key == "stayontop" then return stay_on_top_enabled
     elseif key == "font" then return true
@@ -1061,6 +1427,7 @@ local function get_extra_setting_checked(key)
     elseif key == "expreg" then return export_regions_enabled
     elseif key == "midibank" then return midi_program_banks_enabled
     elseif key == "gmname" then return gm_name_tracks_enabled
+    elseif key == "autoloadrgn" then return autoload_by_region_enabled
     elseif key == "openwith" then return export_open_with_enabled
     elseif key == "openfolder" then return export_open_folder_enabled
     elseif key == "keysig" then return export_key_sig_enabled
@@ -1072,11 +1439,18 @@ local function get_extra_setting_checked(key)
     elseif key == "lastpath" then return path_mode == "last"
     elseif key == "fret" then return fret_number_enabled
     elseif key == "span" then return span_line_enabled
+    elseif key == "smsnap" then return sm_snap_to_grid_enabled
+    elseif key == "temposnap" then return tempo_snap_to_sm_enabled
+    elseif key == "midism" then return midi_sm_enabled
+    elseif key == "tempofreq" then return true
+    elseif key == "tempotimesig" then return true
+    elseif key == "detectmethod" then return true
+    elseif key == "detectitem" then return true
     else return articulation_enabled[key] or false
     end
 end
 
-local function toggle_extra_setting(key)
+function toggle_extra_setting(key)
     if key == "autofocus" then auto_focus_enabled = not auto_focus_enabled
     elseif key == "stayontop" then stay_on_top_enabled = not stay_on_top_enabled; apply_stay_on_top(); save_stay_on_top_setting()
     elseif key == "font" then -- no toggle; font is always active
@@ -1088,6 +1462,8 @@ local function toggle_extra_setting(key)
     elseif key == "gmname" then
         gm_name_tracks_enabled = not gm_name_tracks_enabled
         resize_window()
+    elseif key == "autoloadrgn" then
+        autoload_by_region_enabled = not autoload_by_region_enabled
     elseif key == "openwith" then export_open_with_enabled = not export_open_with_enabled
     elseif key == "openfolder" then export_open_folder_enabled = not export_open_folder_enabled
     elseif key == "keysig" then export_key_sig_enabled = not export_key_sig_enabled
@@ -1105,6 +1481,9 @@ local function toggle_extra_setting(key)
     elseif key == "lastpath" then path_mode = "last"; save_path_mode("last")
     elseif key == "fret" then fret_number_enabled = not fret_number_enabled
     elseif key == "span" then span_line_enabled = not span_line_enabled
+    elseif key == "smsnap" then sm_snap_to_grid_enabled = not sm_snap_to_grid_enabled
+    elseif key == "temposnap" then tempo_snap_to_sm_enabled = not tempo_snap_to_sm_enabled
+    elseif key == "midism" then midi_sm_enabled = not midi_sm_enabled; if not midi_sm_enabled then midi_sm_state = {} end
     elseif articulation_enabled[key] ~= nil then articulation_enabled[key] = not articulation_enabled[key]
     end
 end
@@ -1112,7 +1491,7 @@ end
 -- ============================================================================
 -- Helper: convert drum instrument name to short text
 -- ============================================================================
-local function drumNameToText(name)
+function drumNameToText(name)
     if drum_text_map[name] then
         return drum_text_map[name]
     end
@@ -1124,7 +1503,7 @@ end
 -- ============================================================================
 -- Helper: get MIDI channel for a drum instrument name
 -- ============================================================================
-local function getDrumChannel(instrument_name, default_channel)
+function getDrumChannel(instrument_name, default_channel)
     local chan = drum_channel_map[instrument_name]
     if chan then
         -- Convert 1‑based user channel to 0‑based for REAPER
@@ -1136,7 +1515,7 @@ end
 -- ============================================================================
 -- Helper: get MIDI pitch for a drum instrument name
 -- ============================================================================
-local function getDrumPitch(instrument_name, default_pitch)
+function getDrumPitch(instrument_name, default_pitch)
     local pitch = drum_pitch_map[instrument_name]
     if pitch then
         return pitch
@@ -1147,7 +1526,7 @@ end
 -- ============================================================================
 -- Helper: generate drum exstate string with 9 channels (one per string)
 -- ============================================================================
-local function getDrumReaTabHeroState()
+function getDrumReaTabHeroState()
     -- Map channel (1-based) to default MIDI pitch for that channel
     -- This creates a 9-string setup for drums
     local channel_pitches = {
@@ -1169,7 +1548,7 @@ end
 -- ============================================================================
 -- NOTE TO MIDI SEMITONE MAPPING
 -- ============================================================================
-local note_to_semitone = {
+note_to_semitone = {
     ["C"] = 0,
     ["D"] = 2,
     ["E"] = 4,
@@ -1182,7 +1561,7 @@ local note_to_semitone = {
 -- ============================================================================
 -- Helper: parse guitar tuning from staff-tuning elements
 -- ============================================================================
-local function parseTuning(attrs, is_drum)
+function parseTuning(attrs, is_drum)
     if is_drum then
         return nil  -- Drums don't have tuning
     end
@@ -1221,7 +1600,7 @@ end
 -- ============================================================================
 -- Helper: convert tuning array to ReaTabHero format string
 -- ============================================================================
-local function tuningToReaTabHeroString(tuning)
+function tuningToReaTabHeroString(tuning)
     if not tuning or #tuning == 0 then return nil end
     
     local notes_str = table.concat(tuning, ",")
@@ -1240,7 +1619,7 @@ end
 -- ============================================================================
 -- Helper: get default tuning for bass
 -- ============================================================================
-local function getDefaultBassTuning()
+function getDefaultBassTuning()
     -- Standard 4-string bass tuning: E A D G
     return {28, 33, 38, 43}
 end
@@ -1248,7 +1627,7 @@ end
 -- ============================================================================
 -- Helper: get default tuning for 5-string bass
 -- ============================================================================
-local function getDefault5StringBassTuning()
+function getDefault5StringBassTuning()
     -- Standard 5-string bass tuning: B E A D G
     return {23, 28, 33, 38, 43}
 end
@@ -1259,7 +1638,7 @@ end
 -- ============================================================================
 -- Compact tuning data mirroring konst_Fretboard INSTRUMENTS table (midi arrays,
 -- ordered high-to-low as stored in Fretboard).
-local fretboard_tunings = {
+fretboard_tunings = {
     -- Guitar 6-String
     {{ 64,59,55,50,45,40 }, { 64,59,55,50,45,38 }, { 63,58,54,49,44,37 },
      { 62,57,53,48,43,36 }, { 61,56,52,47,42,35 }, { 59,54,50,45,40,33 },
@@ -1322,7 +1701,7 @@ local fretboard_tunings = {
     {{ 43,50,55 }},
 }
 
-local function getTuningFromFretboard()
+function getTuningFromFretboard()
     local inst_idx = tonumber(reaper.GetExtState("konst_Fretboard", "instrument"))
     local tun_idx  = tonumber(reaper.GetExtState("konst_Fretboard", "tuning"))
     if not inst_idx or not tun_idx then return nil end
@@ -1339,14 +1718,14 @@ local function getTuningFromFretboard()
 end
 
 -- Get active tuning: Fretboard ExtState -> default guitar
-local function getActiveTuning()
+function getActiveTuning()
     return getTuningFromFretboard() or getDefaultGuitarTuning()
 end
 
 -- ============================================================================
 -- Helper: detect if a track name indicates it's a bass
 -- ============================================================================
-local function isBassTrack(track_name)
+function isBassTrack(track_name)
     if not track_name then return false end
     local name_lower = track_name:lower()
     return name_lower:find("bass") ~= nil
@@ -1355,7 +1734,7 @@ end
 -- ============================================================================
 -- Helper: detect if a track name indicates it's a 5-string bass
 -- ============================================================================
-local function is5StringBassTrack(track_name)
+function is5StringBassTrack(track_name)
     if not track_name then return false end
     local name_lower = track_name:lower()
     return (name_lower:find("5") ~= nil or name_lower:find("five") ~= nil) and name_lower:find("bass") ~= nil
@@ -1364,10 +1743,143 @@ end
 -- ============================================================================
 -- Helper: detect if a track name indicates it's a drum track
 -- ============================================================================
-local function isDrumTrack(track_name)
+function isDrumTrack(track_name)
     if not track_name then return false end
     local name_lower = track_name:lower()
     return name_lower:find("drum") ~= nil or name_lower:find("percussion") ~= nil or name_lower:find("kit") ~= nil
+end
+
+-- ============================================================================
+-- Detect transients on an audio item using dual envelope follower.
+-- Returns sorted list of {proj = project_time, src = source_time, strength = env1}
+-- Each position is refined to the actual sample peak within a short window.
+-- ============================================================================
+function detect_audio_transients(audio_item, audio_take, opts)
+  if not audio_item or not audio_take then return {} end
+  local PCM_src = reaper.GetMediaItemTake_Source(audio_take)
+  local srate = reaper.GetMediaSourceSampleRate(PCM_src)
+  if not srate or srate <= 0 then return {} end
+
+  local sens_dB = (opts and opts.sensitivity_dB) or 7
+  local retrig_ms = (opts and opts.retrig_ms) or 60
+  local threshold_dB = (opts and opts.threshold_dB) or 60
+
+  local da_pos  = reaper.GetMediaItemInfo_Value(audio_item, "D_POSITION")
+  local da_len  = reaper.GetMediaItemInfo_Value(audio_item, "D_LENGTH")
+  local da_offs = reaper.GetMediaItemTakeInfo_Value(audio_take, "D_STARTOFFS")
+  local da_rate = reaper.GetMediaItemTakeInfo_Value(audio_take, "D_PLAYRATE")
+  if da_rate == 0 then da_rate = 1 end
+
+  local orig_rate = da_rate
+  if da_rate ~= 1 then
+    reaper.SetMediaItemTakeInfo_Value(audio_take, "D_PLAYRATE", 1)
+    reaper.SetMediaItemInfo_Value(audio_item, "D_LENGTH", da_len * da_rate)
+  end
+
+  local range_start = da_offs
+  local range_len = da_len * orig_rate
+  local range_len_smpls = math.floor(range_len * srate)
+
+  -- Detection parameters (use passed-in sensitivity, retrigger, and threshold)
+  local Threshold   = 10 ^ (-threshold_dB / 20)
+  local Sensitivity = 10 ^ (sens_dB / 20)
+  local Retrig      = math.floor((retrig_ms / 1000) * srate)
+  local PEAK_WINDOW = math.floor(0.005 * srate)  -- 5ms forward window for peak refinement
+
+  local ga1 = math.exp(-1 / (srate * 0.001))
+  local gr1 = math.exp(-1 / (srate * 0.010))
+  local ga2 = math.exp(-1 / (srate * 0.007))
+  local gr2 = math.exp(-1 / (srate * 0.015))
+
+  local env1 = 0
+  local env2 = 0
+  local retrig_cnt = Retrig + 1
+
+  local block_size = 65536
+  local n_blocks = math.floor(range_len_smpls / block_size)
+  local starttime = range_start
+  local trigger_positions = {}  -- raw trigger source-time positions + sample index info
+
+  -- Pass 1: detect trigger points
+  local AA = reaper.CreateTakeAudioAccessor(audio_take)
+  for cur_block = 0, n_blocks do
+    local sz = cur_block == n_blocks
+      and (range_len_smpls - block_size * n_blocks) or block_size
+    if sz <= 0 then break end
+    local buf = reaper.new_array(sz)
+    reaper.GetAudioAccessorSamples(AA, srate, 1, starttime, sz, buf)
+    for s = 1, sz do
+      local inp = math.abs(buf[s])
+      env1 = inp > env1 and (inp + ga1 * (env1 - inp)) or (inp + gr1 * (env1 - inp))
+      env2 = inp > env2 and (inp + ga2 * (env2 - inp)) or (inp + gr2 * (env2 - inp))
+      if retrig_cnt > Retrig and env1 > Threshold and env2 > 0 and env1 / env2 > Sensitivity then
+        local trigger_src = starttime + (s - 1) / srate
+        -- Scan forward in current buffer for peak within 5ms window
+        local peak_val = inp
+        local peak_offset = 0
+        local scan_end = math.min(sz, s + PEAK_WINDOW)
+        for ps = s + 1, scan_end do
+          local pv = math.abs(buf[ps])
+          if pv > peak_val then
+            peak_val = pv
+            peak_offset = ps - s
+          end
+        end
+        local peak_src = trigger_src + peak_offset / srate
+        trigger_positions[#trigger_positions + 1] = {
+          src = peak_src,
+          strength = env1,
+          env2 = env2
+        }
+        retrig_cnt = 0
+      else
+        retrig_cnt = retrig_cnt + 1
+      end
+    end
+    starttime = starttime + block_size / srate
+  end
+  reaper.DestroyAudioAccessor(AA)
+
+  -- Restore playrate
+  if orig_rate ~= 1 then
+    reaper.SetMediaItemTakeInfo_Value(audio_take, "D_PLAYRATE", orig_rate)
+    reaper.SetMediaItemInfo_Value(audio_item, "D_LENGTH", da_len)
+  end
+
+  -- Convert to project time and build result
+  local proj_start = opts and opts.proj_start
+  local proj_end   = opts and opts.proj_end
+  local results = {}
+  for _, tp in ipairs(trigger_positions) do
+    local pt = da_pos + (tp.src - da_offs) / orig_rate
+    if (not proj_start or pt >= proj_start) and (not proj_end or pt <= proj_end) then
+      results[#results + 1] = {
+        proj = pt,
+        src = tp.src,
+        strength = tp.strength,
+        env2 = tp.env2
+      }
+    end
+  end
+  table.sort(results, function(a, b) return a.proj < b.proj end)
+  return results, da_pos, da_offs, orig_rate
+end
+
+-- Helper: find drum audio item in the project
+function find_drum_audio_item()
+  local n_items = reaper.CountMediaItems(0)
+  for ii = 0, n_items - 1 do
+    local ai = reaper.GetMediaItem(0, ii)
+    local at = reaper.GetActiveTake(ai)
+    if at and not reaper.TakeIsMIDI(at) then
+      local ai_track = reaper.GetMediaItemTrack(ai)
+      local _, ai_track_name = reaper.GetSetMediaTrackInfo_String(ai_track, "P_NAME", "", false)
+      if isDrumTrack(ai_track_name) then
+        return ai, at
+      end
+    end
+  end
+  return nil, nil
 end
 
 -- ============================================================================
@@ -1375,7 +1887,7 @@ end
 -- Converts them to parseable <_gp_> elements so their content is accessible
 -- in the parsed tree (e.g. <letring/> detection).
 -- ============================================================================
-local function preprocess_gp_pis(xml)
+function preprocess_gp_pis(xml)
   local pieces = {}
   local pos = 1
   local len = #xml
@@ -1618,7 +2130,7 @@ end
 --   1. A fret-replacing shape event (bend / bend release / pre-bend articulation)
 --   2. An amount label event (1/2 bend, full bend, … articulation)
 -- Everything is controlled via the standard articulation settings rows.
-local function make_bend_events(bend_nodes, default_fret)
+function make_bend_events(bend_nodes, default_fret)
   if #bend_nodes == 0 then return {} end
 
   local n1      = bend_nodes[1]
@@ -1684,7 +2196,7 @@ local function make_bend_events(bend_nodes, default_fret)
   return result
 end
 
-local function getArticulationEvents(note_node, default_fret)
+function getArticulationEvents(note_node, default_fret)
   local events = {}
   if not note_node then return events end
 
@@ -1849,7 +2361,7 @@ end
 -- ============================================================================
 -- Helper to resolve slide info from the articulation map
 -- ============================================================================
-local function getSlideInfo(slide_node, default_fret)
+function getSlideInfo(slide_node, default_fret)
   -- Check if this slide articulation is disabled in settings
   if slide_node and articulation_enabled[slide_node.name] == false then return nil end
   local entry = articulation_map[slide_node.name]
@@ -1897,7 +2409,8 @@ end
 -- ============================================================================
 -- Insert tempo/time signature markers into REAPER
 -- ============================================================================
-local function insert_markers(markers)
+function insert_markers(markers, offset)
+  offset = offset or 0
   -- Convert to sorted list
   local times = {}
   for t in pairs(markers) do table.insert(times, t) end
@@ -1908,7 +2421,7 @@ local function insert_markers(markers)
     reaper.SetTempoTimeSigMarker(
       0,           -- project
       -1,          -- index (-1 = add new)
-      t,           -- time in seconds
+      t + offset,  -- time in seconds (offset by import position)
       -1, -1,      -- measure & beat (auto)
       m.tempo or -1,
       m.beats or -1,
@@ -1922,22 +2435,23 @@ end
 -- ============================================================================
 -- Insert sections as regions
 -- ============================================================================
-local function insert_regions(sections, max_seconds)
+function insert_regions(sections, max_seconds, offset)
   if not sections or #sections == 0 then return end
+  offset = offset or 0
   
   -- Sort sections by start time
   table.sort(sections, function(a, b) return a.start_time < b.start_time end)
   
   -- Create regions for each section
   for i, section in ipairs(sections) do
-    local start_time = section.start_time
+    local start_time = section.start_time + offset
     -- End time is either the next section's start time or the end of the project
     local end_time
     if i < #sections then
-      end_time = sections[i + 1].start_time
+      end_time = sections[i + 1].start_time + offset
     else
       -- Last section extends to the end of the project
-      end_time = max_seconds
+      end_time = max_seconds + offset
     end
     
     -- Ensure end_time is at least start_time + small buffer
@@ -1953,8 +2467,8 @@ local function insert_regions(sections, max_seconds)
     reaper.AddProjectMarker2(
       0,                    -- project
       true,                 -- isrgn (true for region)
-      start_time,          -- pos
-      end_time,            -- rgnend
+      start_time,          -- pos (offset by import position)
+      end_time,            -- rgnend (offset by import position)
       section.name,        -- name
       -1,                  -- wantidx (-1 = add new)
       color                -- color
@@ -1967,7 +2481,7 @@ end
 -- ============================================================================
 -- Repeat expansion
 -- ============================================================================
-local function expand_repeats(measures)
+function expand_repeats(measures)
   -- Recursively expand repeats in a list of measure nodes.
   -- Returns a linear list of measure nodes (original nodes may appear multiple times).
   local expanded = {}
@@ -2972,6 +3486,2511 @@ function ExportMusicXML(filepath)
 end
 
 -- ============================================================================
+-- Find an audio stem item in the project by region name + stem keyword
+-- Returns: source_path or nil
+-- ============================================================================
+function find_audio_stem_for_region(region_name)
+  if not region_name or region_name == "" then return nil, 0 end
+  local region_lower = region_name:lower()
+  local stem_keywords = {"drum", "drums", "percussion", "perc"}
+
+  local n_items = reaper.CountMediaItems(0)
+  for i = 0, n_items - 1 do
+    local item = reaper.GetMediaItem(0, i)
+    local take = reaper.GetActiveTake(item)
+    if take and not reaper.TakeIsMIDI(take) then
+      local _, take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+      local name_lower = take_name:lower()
+      -- Check if item name contains the region name AND a drum keyword
+      if name_lower:find(region_lower, 1, true) then
+        for _, kw in ipairs(stem_keywords) do
+          if name_lower:find(kw, 1, true) then
+            local source = reaper.GetMediaItemTake_Source(take)
+            if source then
+              local path = reaper.GetMediaSourceFileName(source)
+              if path and path ~= "" then
+                local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+                local take_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+                return path, item_pos - take_offs
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- Fallback: try any audio item containing the region name
+  for i = 0, n_items - 1 do
+    local item = reaper.GetMediaItem(0, i)
+    local take = reaper.GetActiveTake(item)
+    if take and not reaper.TakeIsMIDI(take) then
+      local _, take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+      if take_name:lower():find(region_lower, 1, true) then
+        local source = reaper.GetMediaItemTake_Source(take)
+        if source then
+          local path = reaper.GetMediaSourceFileName(source)
+          if path and path ~= "" then
+            local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+            local take_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+            return path, item_pos - take_offs
+          end
+        end
+      end
+    end
+  end
+
+  return nil, 0
+end
+
+-- ============================================================================
+-- Get all audio items within a region (by region start/end)
+-- Returns: list of {item, take, name} sorted by track index then position
+-- ============================================================================
+function get_audio_items_in_region(rgn_start, rgn_end)
+  if not rgn_start or not rgn_end then return {} end
+  local results = {}
+  local n_items = reaper.CountMediaItems(0)
+  for i = 0, n_items - 1 do
+    local item = reaper.GetMediaItem(0, i)
+    local take = reaper.GetActiveTake(item)
+    if take and not reaper.TakeIsMIDI(take) then
+      local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+      local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+      -- Item overlaps with region
+      if pos < rgn_end and pos + len > rgn_start then
+        local _, take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+        if take_name == "" then
+          local track = reaper.GetMediaItemTrack(item)
+          if track then
+            _, take_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+          end
+        end
+        local track = reaper.GetMediaItemTrack(item)
+        local track_idx = track and reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") or 0
+        results[#results + 1] = {item = item, take = take, name = take_name or "", pos = pos, track_idx = track_idx}
+      end
+    end
+  end
+  table.sort(results, function(a, b)
+    if a.track_idx ~= b.track_idx then return a.track_idx < b.track_idx end
+    return a.pos < b.pos
+  end)
+  return results
+end
+
+-- ============================================================================
+-- Refresh the align stem items list based on current region context
+-- ============================================================================
+function refresh_align_stem_items()
+  local cursor = reaper.GetCursorPosition()
+  local _, num_m, num_r = reaper.CountProjectMarkers(0)
+  local rgn_start, rgn_end = nil, nil
+  -- Try cursor inside a region first
+  for i = 0, num_m + num_r - 1 do
+    local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+    if is_rgn and cursor >= pos and cursor < rgnend then
+      rgn_start, rgn_end = pos, rgnend
+      break
+    end
+  end
+  -- Fallback: closest region to cursor
+  if not rgn_start then
+    local best_dist = math.huge
+    for i = 0, num_m + num_r - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn then
+        local d = math.abs(pos - cursor)
+        if d < best_dist then best_dist = d; rgn_start = pos; rgn_end = rgnend end
+      end
+    end
+  end
+  if autoload_region_start_pos then
+    rgn_start = autoload_region_start_pos
+    -- Find region end for autoloaded region
+    for i = 0, num_m + num_r - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn and math.abs(pos - rgn_start) < 0.01 then
+        rgn_end = rgnend
+        break
+      end
+    end
+  end
+  align_stem_items = get_audio_items_in_region(rgn_start, rgn_end)
+  -- Clamp index
+  if align_stem_index > #align_stem_items then align_stem_index = 0 end
+end
+
+-- ============================================================================
+-- Get the currently selected align stem item (or nil for Auto)
+-- Returns: item, take, name  or nil,nil,nil
+-- ============================================================================
+function get_selected_align_stem()
+  if align_stem_index <= 0 or align_stem_index > #align_stem_items then
+    return nil, nil, nil
+  end
+  local entry = align_stem_items[align_stem_index]
+  return entry.item, entry.take, entry.name
+end
+
+-- ============================================================================
+-- Refresh the onset item list based on current region context
+-- ============================================================================
+function refresh_onset_item_items()
+  local cursor = reaper.GetCursorPosition()
+  local _, num_m, num_r = reaper.CountProjectMarkers(0)
+  local rgn_start, rgn_end = nil, nil
+  -- Try cursor inside a region first
+  for i = 0, num_m + num_r - 1 do
+    local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+    if is_rgn and cursor >= pos and cursor < rgnend then
+      rgn_start, rgn_end = pos, rgnend
+      break
+    end
+  end
+  -- Fallback: closest region to cursor
+  if not rgn_start then
+    local best_dist = math.huge
+    for i = 0, num_m + num_r - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn then
+        local d = math.abs(pos - cursor)
+        if d < best_dist then best_dist = d; rgn_start = pos; rgn_end = rgnend end
+      end
+    end
+  end
+  if autoload_region_start_pos then
+    rgn_start = autoload_region_start_pos
+    for i = 0, num_m + num_r - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn and math.abs(pos - rgn_start) < 0.01 then
+        rgn_end = rgnend
+        break
+      end
+    end
+  end
+  onset_item_items = get_audio_items_in_region(rgn_start, rgn_end)
+  if onset_item_index > #onset_item_items then onset_item_index = 0 end
+end
+
+-- ============================================================================
+-- Get the currently selected onset item (or nil for Auto)
+-- Returns: item, take, name  or nil,nil,nil
+-- ============================================================================
+function get_selected_onset_item()
+  if onset_item_index <= 0 or onset_item_index > #onset_item_items then
+    return nil, nil, nil
+  end
+  local entry = onset_item_items[onset_item_index]
+  return entry.item, entry.take, entry.name
+end
+
+-- ============================================================================
+-- Get audio items overlapping the edit cursor (fallback when no region exists)
+-- ============================================================================
+function get_audio_items_at_cursor()
+  local cursor = reaper.GetCursorPosition()
+  local results = {}
+  local n_items = reaper.CountMediaItems(0)
+  for i = 0, n_items - 1 do
+    local item = reaper.GetMediaItem(0, i)
+    local take = reaper.GetActiveTake(item)
+    if take and not reaper.TakeIsMIDI(take) then
+      local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+      local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+      if cursor >= pos and cursor < pos + len then
+        local _, take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+        if take_name == "" then
+          local track = reaper.GetMediaItemTrack(item)
+          if track then _, take_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false) end
+        end
+        local track = reaper.GetMediaItemTrack(item)
+        local track_idx = track and reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") or 0
+        results[#results + 1] = {item = item, take = take, name = take_name or "", pos = pos, track_idx = track_idx}
+      end
+    end
+  end
+  table.sort(results, function(a, b)
+    if a.track_idx ~= b.track_idx then return a.track_idx < b.track_idx end
+    return a.pos < b.pos
+  end)
+  return results
+end
+
+-- ============================================================================
+-- Refresh detect tempo item list (region items + fallback to edit cursor)
+-- ============================================================================
+function refresh_detect_tempo_items()
+  local cursor = reaper.GetCursorPosition()
+  local _, num_m, num_r = reaper.CountProjectMarkers(0)
+  local rgn_start, rgn_end = nil, nil
+  for i = 0, num_m + num_r - 1 do
+    local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+    if is_rgn and cursor >= pos and cursor < rgnend then
+      rgn_start, rgn_end = pos, rgnend
+      break
+    end
+  end
+  if not rgn_start then
+    local best_dist = math.huge
+    for i = 0, num_m + num_r - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn then
+        local d = math.abs(pos - cursor)
+        if d < best_dist then best_dist = d; rgn_start = pos; rgn_end = rgnend end
+      end
+    end
+  end
+  if autoload_region_start_pos then
+    rgn_start = autoload_region_start_pos
+    for i = 0, num_m + num_r - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn and math.abs(pos - rgn_start) < 0.01 then
+        rgn_end = rgnend
+        break
+      end
+    end
+  end
+  if rgn_start and rgn_end then
+    detect_tempo_item_items = get_audio_items_in_region(rgn_start, rgn_end)
+  else
+    detect_tempo_item_items = get_audio_items_at_cursor()
+  end
+  if detect_tempo_item_index > #detect_tempo_item_items then detect_tempo_item_index = 0 end
+end
+
+-- ============================================================================
+-- Get the item/take for tempo detection based on detect_tempo_item_index
+-- 0 = Selected Item (current selection in arrange), 1+ = specific from list
+-- ============================================================================
+function get_detect_tempo_item()
+  if detect_tempo_item_index <= 0 then
+    -- "Selected Item" mode
+    local item = reaper.GetSelectedMediaItem(0, 0)
+    if item then
+      local take = reaper.GetActiveTake(item)
+      if take and not reaper.TakeIsMIDI(take) then return item, take end
+    end
+    -- Fallback: try to find audio item under razor edit
+    for ti = 0, reaper.CountTracks(0) - 1 do
+      local track = reaper.GetTrack(0, ti)
+      local _, razor_str = reaper.GetSetMediaTrackInfo_String(track, "P_RAZOREDITS", "", false)
+      if razor_str and razor_str ~= "" then
+        for rstart, rend in razor_str:gmatch("([%d%.]+) ([%d%.]+)") do
+          local rs, re = tonumber(rstart), tonumber(rend)
+          if rs and re and re - rs > 0.001 then
+            for ii = 0, reaper.CountTrackMediaItems(track) - 1 do
+              local ri = reaper.GetTrackMediaItem(track, ii)
+              local ri_pos = reaper.GetMediaItemInfo_Value(ri, "D_POSITION")
+              local ri_len = reaper.GetMediaItemInfo_Value(ri, "D_LENGTH")
+              if ri_pos < re and ri_pos + ri_len > rs then
+                local rt = reaper.GetActiveTake(ri)
+                if rt and not reaper.TakeIsMIDI(rt) then return ri, rt end
+              end
+            end
+          end
+        end
+      end
+    end
+    return nil, nil
+  end
+  if detect_tempo_item_index > #detect_tempo_item_items then
+    refresh_detect_tempo_items()
+  end
+  if detect_tempo_item_index <= 0 or detect_tempo_item_index > #detect_tempo_item_items then
+    return nil, nil
+  end
+  local entry = detect_tempo_item_items[detect_tempo_item_index]
+  return entry.item, entry.take
+end
+
+-- ============================================================================
+-- Get detection bounds from time selection or razor edit for stretch marker slider
+-- ============================================================================
+function get_slider_detect_bounds(item)
+    local detect_start, detect_end
+    local sel_start, sel_end = reaper.GetSet_LoopTimeRange(0, false, 0, 0, false)
+    if sel_end - sel_start > 0.001 then
+        detect_start = sel_start
+        detect_end = sel_end
+    else
+        local item_track = reaper.GetMediaItemTrack(item)
+        if item_track then
+            local _, razor_str = reaper.GetSetMediaTrackInfo_String(item_track, "P_RAZOREDITS", "", false)
+            if razor_str and razor_str ~= "" then
+                for rstart, rend in razor_str:gmatch("([%d%.]+) ([%d%.]+)") do
+                    local rs, re = tonumber(rstart), tonumber(rend)
+                    if rs and re and re - rs > 0.001 then
+                        detect_start = rs
+                        detect_end = re
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return detect_start, detect_end
+end
+
+-- ============================================================================
+-- Get the active edit range as (start, end) in project time.
+-- Priority: razor edit on any track → time selection → selected items bounds.
+-- Returns nil, nil if nothing is available.
+-- ============================================================================
+function get_edit_range()
+    -- 1. Razor edits: find the union of all razor edit areas across all tracks
+    local razor_start, razor_end
+    for ti = 0, reaper.CountTracks(0) - 1 do
+        local track = reaper.GetTrack(0, ti)
+        local _, razor_str = reaper.GetSetMediaTrackInfo_String(track, "P_RAZOREDITS", "", false)
+        if razor_str and razor_str ~= "" then
+            for rstart, rend in razor_str:gmatch("([%d%.%-]+) ([%d%.%-]+)") do
+                local rs, re = tonumber(rstart), tonumber(rend)
+                if rs and re and re - rs > 0.001 then
+                    if not razor_start or rs < razor_start then razor_start = rs end
+                    if not razor_end   or re > razor_end   then razor_end   = re end
+                end
+            end
+        end
+    end
+    if razor_start then return razor_start, razor_end end
+
+    -- 2. Time selection
+    local sel_start, sel_end = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
+    if sel_end - sel_start > 0.001 then
+        return sel_start, sel_end
+    end
+
+    -- 3. Selected items bounding box
+    local n = reaper.CountSelectedMediaItems(0)
+    if n > 0 then
+        local rng_start, rng_end
+        for i = 0, n - 1 do
+            local item = reaper.GetSelectedMediaItem(0, i)
+            local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+            local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+            if not rng_start or pos < rng_start then rng_start = pos end
+            if not rng_end   or pos + len > rng_end then rng_end = pos + len end
+        end
+        return rng_start, rng_end
+    end
+
+    return nil, nil
+end
+
+-- ============================================================================
+-- Delete all tempo/time-sig markers within the given project-time range.
+-- Never removes the very first marker if it is the only one (REAPER requires
+-- at least one tempo marker). Returns the count of deleted markers.
+-- ============================================================================
+function delete_tempo_markers_in_range(range_start, range_end)
+    local n = reaper.CountTempoTimeSigMarkers(0)
+    if n == 0 then return 0 end
+    -- Collect indices to delete (iterate backwards to avoid index shifting)
+    local to_delete = {}
+    for i = 0, n - 1 do
+        local rv, t = reaper.GetTempoTimeSigMarker(0, i)
+        if rv and t >= range_start - 0.0001 and t <= range_end + 0.0001 then
+            table.insert(to_delete, i)
+        end
+    end
+    -- If we would delete ALL markers, keep the first one
+    if #to_delete == n and n > 0 then
+        table.remove(to_delete, 1)
+    end
+    -- Delete in reverse order so indices stay valid
+    for i = #to_delete, 1, -1 do
+        reaper.DeleteTempoTimeSigMarker(0, to_delete[i])
+    end
+    return #to_delete
+end
+
+-- ============================================================================
+-- Remove stretch markers on all selected audio items within the given range.
+-- If range_start/range_end are nil, removes ALL stretch markers from selected items.
+-- Returns total count of removed markers.
+-- ============================================================================
+function remove_stretch_markers_in_range(range_start, range_end, items_list)
+    local total_removed = 0
+    local n_items = items_list and #items_list or reaper.CountSelectedMediaItems(0)
+    reaper.PreventUIRefresh(1)
+    for i = 0, n_items - 1 do
+        local item = items_list and items_list[i + 1] or reaper.GetSelectedMediaItem(0, i)
+        local take = reaper.GetActiveTake(item)
+        if take and not reaper.TakeIsMIDI(take) then
+            local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+            local item_rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+            if item_rate == 0 then item_rate = 1 end
+            local item_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+            local sm_count = reaper.GetTakeNumStretchMarkers(take)
+            -- Collect indices to remove (backwards)
+            local to_remove = {}
+            for si = 0, sm_count - 1 do
+                local _, src_pos = reaper.GetTakeStretchMarker(take, si)
+                -- Convert source position to project time
+                local proj_pos = item_pos + (src_pos - item_offs) / item_rate
+                local in_range = (not range_start) or
+                                 (proj_pos >= range_start - 0.0001 and proj_pos <= range_end + 0.0001)
+                if in_range then
+                    table.insert(to_remove, si)
+                end
+            end
+            for ri = #to_remove, 1, -1 do
+                reaper.DeleteTakeStretchMarkers(take, to_remove[ri])
+                total_removed = total_removed + 1
+            end
+        end
+    end
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateTimeline()
+    return total_removed
+end
+
+-- ============================================================================
+-- Ensure transient cache is valid for the given item + detection parameters.
+-- Cache key is item only — detection runs at minimum settings (threshold=60,
+-- sensitivity=1, retrig=10) to capture ALL possible candidates with their
+-- envelope values. Slider changes post-filter the cached candidates instantly.
+-- ============================================================================
+function ensure_transient_cache(item, take)
+    if cached_transients_raw and cached_transient_item == item then
+        return  -- cache is valid for this item
+    end
+    -- Detect at minimum settings to get the superset of all possible transients
+    local opts = {
+        threshold_dB = 60,    -- lowest amplitude gate → most candidates
+        sensitivity_dB = 1,   -- lowest ratio gate → most candidates
+        retrig_ms = 10,       -- shortest gap → most candidates
+    }
+    local transients = detect_audio_transients(item, take, opts)
+    if not transients then transients = {} end
+    cached_transients_raw = transients
+    cached_transient_item = item
+    cached_transient_params = nil  -- no longer used
+end
+
+-- ============================================================================
+-- Post-filter cached transient candidates for given slider values.
+-- This is O(N) over the candidate list (typically hundreds) → instant.
+-- Applies threshold, sensitivity, and retrig filters in a single pass.
+-- Returns a filtered list of {src, proj, strength, env2}.
+-- ============================================================================
+function filter_transients(candidates, threshold_dB, sensitivity_dB, retrig_ms)
+    if not candidates then return {} end
+    local Threshold   = 10 ^ (-threshold_dB / 20)
+    local Sensitivity = 10 ^ (sensitivity_dB / 20)
+    local retrig_sec  = retrig_ms / 1000.0
+    local result = {}
+    local last_proj = -1e30
+    for _, t in ipairs(candidates) do
+        if t.strength > Threshold
+           and t.env2 and t.env2 > 0
+           and t.strength / t.env2 > Sensitivity
+           and (t.proj - last_proj) > retrig_sec then
+            result[#result + 1] = t
+            last_proj = t.proj
+        end
+    end
+    return result
+end
+
+-- ============================================================================
+-- Apply stretch markers from cached transients onto the item.
+-- Post-filters the cached superset using current slider values (instant).
+-- Then filters by current time selection / razor edit bounds.
+-- Applies offset (sm_offset_ms) to source positions.
+-- Removes all existing stretch markers first, then places filtered ones.
+-- ============================================================================
+function apply_cached_stretch_markers(item, take)
+    -- Ensure cache is populated (runs detection once per item, then instant)
+    ensure_transient_cache(item, take)
+    if not cached_transients_raw then return end
+    -- Post-filter cached candidates using current slider values (microseconds)
+    local filtered = filter_transients(cached_transients_raw, sm_threshold_dB, sm_sensitivity_dB, sm_retrig_ms)
+    local ds, de = get_slider_detect_bounds(item)
+    local da_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local da_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local da_rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if da_rate == 0 then da_rate = 1 end
+    local offset_sec = sm_offset_ms / 1000.0
+    reaper.PreventUIRefresh(1)
+    -- Remove stretch markers in range only (preserve those outside range when range is set)
+    local sm_count = reaper.GetTakeNumStretchMarkers(take)
+    for i = sm_count - 1, 0, -1 do
+        if ds or de then
+            local _, sm_pos = reaper.GetTakeStretchMarker(take, i)
+            local sm_proj = da_pos + sm_pos
+            if (not ds or sm_proj >= ds - 0.001) and (not de or sm_proj <= de + 0.001) then
+                reaper.DeleteTakeStretchMarkers(take, i)
+            end
+        else
+            reaper.DeleteTakeStretchMarkers(take, i)
+        end
+    end
+    -- Filter by bounds and apply offset
+    local to_place = {}
+    for _, tr in ipairs(filtered) do
+        -- Filter by project-time bounds if set
+        if (not ds or tr.proj >= ds) and (not de or tr.proj <= de) then
+            local shifted_src = tr.src + offset_sec * da_rate
+            if shifted_src >= da_offs then
+                to_place[#to_place + 1] = shifted_src
+            end
+        end
+    end
+    table.sort(to_place)
+    -- Insert stretch markers
+    for _, src_pos in ipairs(to_place) do
+        reaper.SetTakeStretchMarker(take, -1, src_pos)
+    end
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateTimeline()
+end
+
+-- ============================================================================
+-- Detect song start in an audio item (first sustained signal above silence)
+-- Returns: project_time of detected onset, or nil
+-- ============================================================================
+function detect_song_start(item)
+  local take = reaper.GetActiveTake(item)
+  if not take or reaper.TakeIsMIDI(take) then return nil end
+
+  local PCM_src = reaper.GetMediaItemTake_Source(take)
+  local srate = reaper.GetMediaSourceSampleRate(PCM_src)
+  if not srate or srate <= 0 then return nil end
+
+  local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+  local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+  local take_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+  local play_rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+  if play_rate == 0 then play_rate = 1 end
+
+  local orig_rate = play_rate
+  if play_rate ~= 1 then
+    reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", 1)
+    reaper.SetMediaItemInfo_Value(item, "D_LENGTH", item_len * play_rate)
+  end
+
+  local SILENCE_THRESHOLD_DB = -40
+  local RMS_BLOCK_MS = 10
+  local LOOKBACK_MS = 5
+  local MIN_CONSECUTIVE_BLOCKS = 2
+  local SILENCE_THRESHOLD = 10 ^ (SILENCE_THRESHOLD_DB / 20)
+
+  local block_samples = math.floor(RMS_BLOCK_MS / 1000 * srate)
+  local source_len = item_len * orig_rate
+  local total_blocks = math.floor(source_len * srate / block_samples)
+
+  local AA = reaper.CreateTakeAudioAccessor(take)
+  local first_loud_block = nil
+  local consecutive = 0
+
+  for bi = 0, total_blocks - 1 do
+    local block_start = take_offs + bi * block_samples / srate
+    local buf = reaper.new_array(block_samples)
+    reaper.GetAudioAccessorSamples(AA, srate, 1, block_start, block_samples, buf)
+
+    local sum_sq = 0
+    for s = 1, block_samples do
+      local v = buf[s]; sum_sq = sum_sq + v * v
+    end
+    local rms = math.sqrt(sum_sq / block_samples)
+
+    if rms > SILENCE_THRESHOLD then
+      if consecutive == 0 then first_loud_block = bi end
+      consecutive = consecutive + 1
+      if consecutive >= MIN_CONSECUTIVE_BLOCKS then
+        local lookback_samples = math.floor(LOOKBACK_MS / 1000 * srate)
+        local onset_sample = first_loud_block * block_samples
+        onset_sample = math.max(0, onset_sample - lookback_samples)
+
+        local scan_start = take_offs + onset_sample / srate
+        local scan_len = math.min(block_samples * 3, lookback_samples + block_samples * 2)
+        local scan_buf = reaper.new_array(scan_len)
+        reaper.GetAudioAccessorSamples(AA, srate, 1, scan_start, scan_len, scan_buf)
+
+        local onset_offset = 0
+        for s = 1, scan_len do
+          if math.abs(scan_buf[s]) > SILENCE_THRESHOLD * 0.5 then
+            onset_offset = s - 1
+            break
+          end
+        end
+
+        reaper.DestroyAudioAccessor(AA)
+        if orig_rate ~= 1 then
+          reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", orig_rate)
+          reaper.SetMediaItemInfo_Value(item, "D_LENGTH", item_len)
+        end
+
+        local source_time = take_offs + onset_sample / srate + onset_offset / srate
+        local project_time = item_pos + (source_time - take_offs) / orig_rate
+        return project_time
+      end
+    else
+      consecutive = 0
+      first_loud_block = nil
+    end
+  end
+
+  reaper.DestroyAudioAccessor(AA)
+  if orig_rate ~= 1 then
+    reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", orig_rate)
+    reaper.SetMediaItemInfo_Value(item, "D_LENGTH", item_len)
+  end
+  return nil
+end
+
+-- ============================================================================
+-- Run audio-to-score alignment via Python
+-- Returns: aligned_boundaries table or nil on failure
+-- ============================================================================
+function run_audio_alignment(audio_path, score_onsets, measure_boundaries_data, start_time)
+  local align_script = script_dir .. "konst_align_score_to_audio.py"
+
+  -- Check Python script exists
+  local pf = io.open(align_script, "r")
+  if not pf then
+    import_log("Alignment script not found: " .. align_script)
+    return nil
+  end
+  pf:close()
+
+  -- Determine Python executable
+  local py_exe = reaper.GetExtState("konst_ImportMusicXML", "python_exe")
+  if py_exe == "" then py_exe = "python" end
+
+  -- Write input JSON
+  local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or reaper.GetResourcePath()
+  local ts = tostring(os.time())
+  local input_path  = temp_dir .. "\\konst_align_input_" .. ts .. ".json"
+  local output_path = temp_dir .. "\\konst_align_output_" .. ts .. ".json"
+
+  -- Build JSON input manually (avoid requiring dkjson at top level)
+  local onset_parts = {}
+  for _, t in ipairs(score_onsets) do
+    onset_parts[#onset_parts + 1] = tostring(t)
+  end
+
+  local mb_parts = {}
+  for _, mb in ipairs(measure_boundaries_data) do
+    mb_parts[#mb_parts + 1] = string.format(
+      '{"measure":%d,"score_time":%s,"beats":%d,"beat_type":%d}',
+      mb.measure, tostring(mb.score_time), mb.beats, mb.beat_type)
+  end
+
+  local start_time_json = ""
+  if start_time then
+    start_time_json = string.format(',"start_time":%s', tostring(start_time))
+  end
+
+  local json_str = string.format(
+    '{"audio_path":"%s","score_onsets":[%s],"measure_boundaries":[%s]%s}',
+    audio_path:gsub("\\", "\\\\"):gsub('"', '\\"'),
+    table.concat(onset_parts, ","),
+    table.concat(mb_parts, ","),
+    start_time_json)
+
+  local f = io.open(input_path, "w")
+  if not f then
+    import_log("Could not write alignment input file")
+    return nil
+  end
+  f:write(json_str)
+  f:close()
+
+  -- Run Python synchronously (ExecProcess with timeout)
+  local cmd = string.format('"%s" "%s" "%s" "%s"',
+    py_exe, align_script, input_path, output_path)
+  import_log("Running audio alignment...")
+
+  local ret = reaper.ExecProcess(cmd, 120000)  -- 120s timeout
+
+  -- Clean up input
+  os.remove(input_path)
+
+  -- Check for error file
+  local errf = io.open(output_path .. ".err", "r")
+  if errf then
+    local err_msg = errf:read("*a")
+    errf:close()
+    os.remove(output_path .. ".err")
+    import_log("Alignment error: " .. err_msg)
+    return nil
+  end
+
+  -- Read output
+  local of = io.open(output_path, "r")
+  if not of then
+    import_log("Alignment produced no output")
+    return nil
+  end
+  local result_str = of:read("*a")
+  of:close()
+  os.remove(output_path)
+
+  -- Parse JSON result (simple parser for our known structure)
+  local aligned_boundaries = {}
+  for entry in result_str:gmatch('{[^{}]+}') do
+    -- Skip the outer wrapper, only parse boundary entries
+    local measure = tonumber(entry:match('"measure"%s*:%s*(%d+)'))
+    local real_time = tonumber(entry:match('"real_time"%s*:%s*([%d%.%-e]+)'))
+    local tempo = tonumber(entry:match('"tempo"%s*:%s*([%d%.%-e]+)'))
+    local beats = tonumber(entry:match('"beats"%s*:%s*(%d+)'))
+    local beat_type = tonumber(entry:match('"beat_type"%s*:%s*(%d+)'))
+    if measure and real_time then
+      table.insert(aligned_boundaries, {
+        measure = measure,
+        real_time = real_time,
+        tempo = tempo or 120,
+        beats = beats or 4,
+        beat_type = beat_type or 4
+      })
+    end
+  end
+
+  -- Parse confidence
+  local confidence = tonumber(result_str:match('"confidence"%s*:%s*([%d%.]+)')) or 0
+
+  -- Parse per-note corrections (st = score_time, tt = target_time from item start)
+  local note_corrections = {}
+  for entry in result_str:gmatch('{[^{}]+}') do
+    local st = tonumber(entry:match('"st"%s*:%s*([%d%.%-e]+)'))
+    local tt = tonumber(entry:match('"tt"%s*:%s*([%d%.%-e]+)'))
+    if st and tt and not entry:match('"measure"') then
+      local key = string.format("%.4f", st)
+      note_corrections[key] = tt
+    end
+  end
+
+  -- Parse onset_times array (flat array of audio-relative onset positions)
+  local onset_times = {}
+  local onset_arr_str = result_str:match('"onset_times"%s*:%s*(%[[^%]]*%])')
+  if onset_arr_str then
+    for val in onset_arr_str:gmatch('([%d%.%-e]+)') do
+      local t = tonumber(val)
+      if t then table.insert(onset_times, t) end
+    end
+    table.sort(onset_times)
+  end
+
+  if #aligned_boundaries > 0 then
+    local n_corr = 0
+    for _ in pairs(note_corrections) do n_corr = n_corr + 1 end
+    import_log(string.format(
+      "Alignment: %d bars, %d note corrections, confidence %.0f%%",
+      #aligned_boundaries, n_corr, confidence * 100))
+    return aligned_boundaries, note_corrections, onset_times
+  end
+
+  import_log("Alignment returned no boundaries")
+  return nil, nil, nil
+end
+
+-- ============================================================================
+-- Convert beat-based ticks to seconds using a tempo map
+-- tempo_map: sorted list of {ticks, tempo} pairs
+-- ============================================================================
+function ticks_to_seconds(pos, map, ppq_val)
+  local sec = 0
+  local prev_ticks = 0
+  local prev_tempo = 120
+  for _, entry in ipairs(map) do
+    if entry.ticks > pos then break end
+    sec = sec + (entry.ticks - prev_ticks) / ppq_val * 60 / prev_tempo
+    prev_ticks = entry.ticks
+    prev_tempo = entry.tempo
+  end
+  sec = sec + (pos - prev_ticks) / ppq_val * 60 / prev_tempo
+  return sec
+end
+
+-- ============================================================================
+-- Convert XML ticks to project time using the project's existing tempo map.
+-- tick_pos: position in XML ticks (ppq_val ticks per quarter note)
+-- ppq_val: ticks per quarter note from the XML
+-- import_start_time: project time where import begins
+-- Returns: absolute project time
+-- The XML tick position is converted to beat offset (quarter notes),
+-- then mapped to the project's tempo map starting from import_start_time.
+-- ============================================================================
+function ticks_to_project_time(tick_pos, ppq_val, import_start_time)
+  local qn_offset = tick_pos / ppq_val  -- quarter notes from start of piece
+  -- Get the ABSOLUTE QN position of the import start (TimeMap2_timeToBeats returns
+  -- beat-within-measure as first value; TimeMap_timeToQN returns accumulated QN from project start)
+  local start_qn = reaper.TimeMap_timeToQN(import_start_time)
+  -- Map to project time at (start_qn + qn_offset) quarter notes from project start
+  return reaper.TimeMap_QNToTime(start_qn + qn_offset)
+end
+
+-- ============================================================================
+-- Remap data: serialize/deserialize tick-based note & text data on MIDI takes
+-- Stored via P_EXT keys so it persists in the RPP project file.
+-- ============================================================================
+
+-- Serialize notes array to a compact string: "pos,endpos,ch,pitch,vel;..."
+function serialize_remap_notes(notes)
+  local parts = {}
+  for _, n in ipairs(notes) do
+    parts[#parts + 1] = string.format("%d,%d,%d,%d,%d", n.pos, n.endpos, n.channel, n.pitch, n.vel)
+  end
+  return table.concat(parts, ";")
+end
+
+-- Deserialize notes string back to array of {pos, endpos, channel, pitch, vel}
+function deserialize_remap_notes(str)
+  if not str or str == "" then return nil end
+  local notes = {}
+  for entry in str:gmatch("[^;]+") do
+    local p, e, ch, pi, v = entry:match("^(%d+),(%d+),(%d+),(%d+),(%d+)$")
+    if p then
+      notes[#notes + 1] = {
+        pos = tonumber(p), endpos = tonumber(e),
+        channel = tonumber(ch), pitch = tonumber(pi), vel = tonumber(v)
+      }
+    end
+  end
+  return #notes > 0 and notes or nil
+end
+
+-- Serialize text events array to a compact string: "pos,type,text;..."
+-- Text is base64-encoded to avoid delimiter collisions.
+function serialize_remap_texts(texts)
+  if not texts or #texts == 0 then return "" end
+  local parts = {}
+  for _, t in ipairs(texts) do
+    -- Simple base64 encode for the text field
+    local b64 = remap_base64_encode(t.text or "")
+    parts[#parts + 1] = string.format("%d,%d,%s", t.pos, t.type or 1, b64)
+  end
+  return table.concat(parts, ";")
+end
+
+-- Deserialize text events string back to array of {pos, type, text}
+function deserialize_remap_texts(str)
+  if not str or str == "" then return nil end
+  local texts = {}
+  for entry in str:gmatch("[^;]+") do
+    local p, tp, b64 = entry:match("^(%d+),(%d+),(.+)$")
+    if p and b64 then
+      texts[#texts + 1] = {
+        pos = tonumber(p), type = tonumber(tp),
+        text = remap_base64_decode(b64)
+      }
+    end
+  end
+  return #texts > 0 and texts or nil
+end
+
+-- Minimal base64 encode/decode for text event storage
+do
+  local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  function remap_base64_encode(data)
+    local out = {}
+    local pad = 0
+    for i = 1, #data, 3 do
+      local a, b, c = data:byte(i, i + 2)
+      b = b or 0; c = c or 0
+      if i + 1 > #data then pad = pad + 1 end
+      if i + 2 > #data then pad = pad + 1 end
+      local n = a * 65536 + b * 256 + c
+      out[#out + 1] = b64chars:sub(math.floor(n / 262144) % 64 + 1, math.floor(n / 262144) % 64 + 1)
+      out[#out + 1] = b64chars:sub(math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1)
+      out[#out + 1] = pad < 2 and b64chars:sub(math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1) or "="
+      out[#out + 1] = pad < 1 and b64chars:sub(n % 64 + 1, n % 64 + 1) or "="
+    end
+    return table.concat(out)
+  end
+  local b64lookup = {}
+  for i = 1, 64 do b64lookup[b64chars:byte(i)] = i - 1 end
+  function remap_base64_decode(data)
+    data = data:gsub("=", "")
+    local out = {}
+    for i = 1, #data, 4 do
+      local a = b64lookup[data:byte(i)] or 0
+      local b = b64lookup[data:byte(i + 1)] or 0
+      local c = b64lookup[data:byte(i + 2)] or 0
+      local d = b64lookup[data:byte(i + 3)] or 0
+      local n = a * 262144 + b * 4096 + c * 64 + d
+      out[#out + 1] = string.char(math.floor(n / 65536) % 256)
+      if i + 2 <= #data then out[#out + 1] = string.char(math.floor(n / 256) % 256) end
+      if i + 3 <= #data then out[#out + 1] = string.char(n % 256) end
+    end
+    return table.concat(out)
+  end
+end
+
+-- Store remap data on a take after note insertion
+function store_remap_data(take, notes, texts, ppq_val)
+  if not take then return end
+  local notes_str = serialize_remap_notes(notes)
+  if notes_str and notes_str ~= "" then
+    reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:XMLREMAP_NOTES", notes_str, true)
+  end
+  local texts_str = serialize_remap_texts(texts)
+  if texts_str and texts_str ~= "" then
+    reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:XMLREMAP_TEXTS", texts_str, true)
+  end
+  reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:XMLREMAP_PPQ", tostring(ppq_val), true)
+end
+
+-- ============================================================================
+-- Remap: re-position MIDI notes on selected items using the current tempo map.
+-- Scans all takes on selected items for stored remap data (P_EXT:XMLREMAP_*).
+-- Clears existing MIDI events and re-inserts them from stored tick data.
+-- Returns: number of takes remapped, or 0 if none found.
+-- ============================================================================
+function remap_midi_to_tempo_map()
+  local num_items = reaper.CountSelectedMediaItems(0)
+  if num_items == 0 then return 0 end
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+
+  local remapped_count = 0
+
+  for i = 0, num_items - 1 do
+    local item = reaper.GetSelectedMediaItem(0, i)
+    if item then
+      local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+      local num_takes = reaper.GetMediaItemNumTakes(item)
+
+      -- Collect max end-time across all takes for item length adjustment
+      local max_end_time = item_pos
+
+      for t = 0, num_takes - 1 do
+        local take = reaper.GetMediaItemTake(item, t)
+        if take and reaper.TakeIsMIDI(take) then
+          -- Read stored remap data
+          local ok_n, notes_str = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:XMLREMAP_NOTES", "", false)
+          local ok_p, ppq_str = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:XMLREMAP_PPQ", "", false)
+
+          if ok_n and notes_str ~= "" and ok_p and ppq_str ~= "" then
+            local notes = deserialize_remap_notes(notes_str)
+            local ppq_val = tonumber(ppq_str)
+
+            if notes and ppq_val and ppq_val > 0 then
+              -- Read text events if stored
+              local ok_t, texts_str = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:XMLREMAP_TEXTS", "", false)
+              local texts = (ok_t and texts_str ~= "") and deserialize_remap_texts(texts_str) or nil
+
+              -- Clear all existing MIDI events
+              reaper.MIDI_DisableSort(take)
+              local _, note_count, cc_count, text_count = reaper.MIDI_CountEvts(take)
+              for ni = note_count - 1, 0, -1 do
+                reaper.MIDI_DeleteNote(take, ni)
+              end
+              for ti = text_count - 1, 0, -1 do
+                reaper.MIDI_DeleteTextSysexEvt(take, ti)
+              end
+
+              -- Re-insert notes using current project tempo map
+              for _, n in ipairs(notes) do
+                local start_proj = ticks_to_project_time(n.pos, ppq_val, item_pos)
+                local end_proj = ticks_to_project_time(n.endpos, ppq_val, item_pos)
+                local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(take, start_proj)
+                local ppq_end = reaper.MIDI_GetPPQPosFromProjTime(take, end_proj)
+                if ppq_end <= ppq_start then ppq_end = ppq_start + 1 end
+                reaper.MIDI_InsertNote(take, false, false, ppq_start, ppq_end, n.channel, n.pitch, n.vel, true)
+                if end_proj > max_end_time then max_end_time = end_proj end
+              end
+
+              -- Re-insert text events
+              if texts then
+                for _, tx in ipairs(texts) do
+                  local t_proj = ticks_to_project_time(tx.pos, ppq_val, item_pos)
+                  local ppq_pos = reaper.MIDI_GetPPQPosFromProjTime(take, t_proj)
+                  reaper.MIDI_InsertTextSysexEvt(take, false, false, ppq_pos, tx.type, tx.text)
+                end
+              end
+
+              reaper.MIDI_Sort(take)
+              remapped_count = remapped_count + 1
+            end
+          end
+        end
+      end
+
+      -- Adjust item length to fit all remapped notes
+      if max_end_time > item_pos then
+        local new_length = max_end_time - item_pos + 0.01  -- small padding
+        reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_length)
+      end
+    end
+  end
+
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock("Remap MIDI to project tempo map", -1)
+  return remapped_count
+end
+
+-- ============================================================================
+-- Nudge notes to transients: create a new take on a MIDI item where each note
+-- is snapped to the nearest stretch marker position from an audio item.
+-- Requires exactly 2 selected items: one MIDI, one audio with stretch markers.
+-- Returns: nudge_count (notes moved), or nil + error string on failure.
+-- ============================================================================
+function nudge_notes_to_transients()
+  local num_items = reaper.CountSelectedMediaItems(0)
+  if num_items < 2 then
+    return nil, "Select exactly 2 items: one MIDI item and one audio item with stretch markers."
+  end
+
+  -- Identify the MIDI item and audio item among selected items
+  local midi_item, midi_take, audio_item, audio_take
+  for i = 0, num_items - 1 do
+    local item = reaper.GetSelectedMediaItem(0, i)
+    if item then
+      local take = reaper.GetActiveTake(item)
+      if take then
+        if reaper.TakeIsMIDI(take) then
+          if not midi_item then
+            midi_item = item
+            midi_take = take
+          end
+        else
+          if not audio_item then
+            audio_item = item
+            audio_take = take
+          end
+        end
+      end
+    end
+  end
+
+  if not midi_item or not midi_take then
+    return nil, "No MIDI item found among selected items."
+  end
+  if not audio_item or not audio_take then
+    return nil, "No audio item with stretch markers found among selected items."
+  end
+
+  -- Read stretch marker positions as project times
+  local sm_count = reaper.GetTakeNumStretchMarkers(audio_take)
+  if sm_count == 0 then
+    return nil, "Audio item has no stretch markers. Add stretch markers first."
+  end
+
+  local audio_pos = reaper.GetMediaItemInfo_Value(audio_item, "D_POSITION")
+  local audio_offset = reaper.GetMediaItemTakeInfo_Value(audio_take, "D_STARTOFFS")
+  local audio_rate = reaper.GetMediaItemTakeInfo_Value(audio_take, "D_PLAYRATE")
+  if audio_rate == 0 then audio_rate = 1 end
+
+  local sm_positions = {}
+  for si = 0, sm_count - 1 do
+    local _, pos_in_source = reaper.GetTakeStretchMarker(audio_take, si)
+    -- Convert source position to project time
+    local proj_time = audio_pos + (pos_in_source - audio_offset) / audio_rate
+    sm_positions[#sm_positions + 1] = proj_time
+  end
+  table.sort(sm_positions)
+
+  -- Read all notes from the MIDI take
+  local _, note_count = reaper.MIDI_CountEvts(midi_take)
+  if note_count == 0 then
+    return nil, "MIDI item has no notes."
+  end
+
+  local src_notes = {}
+  for i = 0, note_count - 1 do
+    local ret, sel, muted, startppq, endppq, chan, pitch, vel = reaper.MIDI_GetNote(midi_take, i)
+    if ret then
+      src_notes[#src_notes + 1] = {
+        proj_time = reaper.MIDI_GetProjTimeFromPPQPos(midi_take, startppq),
+        sp = startppq, ep = endppq,
+        sel = sel, muted = muted,
+        chan = chan, pitch = pitch, vel = vel,
+      }
+    end
+  end
+
+  -- Read text/sysex events from original take to copy them to nudge take
+  local _, _, _, text_count = reaper.MIDI_CountEvts(midi_take)
+  local src_texts = {}
+  for i = 0, text_count - 1 do
+    local ret, sel, muted, ppqpos, evt_type, msg = reaper.MIDI_GetTextSysexEvt(midi_take, i)
+    if ret then
+      src_texts[#src_texts + 1] = {ppqpos = ppqpos, sel = sel, muted = muted, evt_type = evt_type, msg = msg}
+    end
+  end
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+
+  -- Create a new take on the MIDI item (shares the same source)
+  local nudge_take = reaper.AddTakeToMediaItem(midi_item)
+  if not nudge_take then
+    reaper.PreventUIRefresh(-1)
+    reaper.Undo_EndBlock("Nudge notes to transients (failed)", -1)
+    return nil, "Failed to create new take."
+  end
+
+  -- Copy source from original take
+  local old_src = reaper.GetMediaItemTake_Source(nudge_take)
+  local src = reaper.GetMediaItemTake_Source(midi_take)
+  reaper.SetMediaItemTake_Source(nudge_take, src)
+  if old_src then reaper.PCM_Source_Destroy(old_src) end
+
+  -- Name the new take
+  local _, orig_name = reaper.GetSetMediaItemTakeInfo_String(midi_take, "P_NAME", "", false)
+  local nudge_name = (orig_name ~= "" and orig_name or "MIDI") .. " (nudged)"
+  reaper.GetSetMediaItemTakeInfo_String(nudge_take, "P_NAME", nudge_name, true)
+
+  -- Insert nudged notes
+  reaper.MIDI_DisableSort(nudge_take)
+  local nudge_count = 0
+
+  -- Snap each note to nearest stretch marker and preserve original PPQ duration
+  local nudged_notes = {}
+  for _, tn in ipairs(src_notes) do
+    -- Binary search for closest stretch marker
+    local lo, hi = 1, #sm_positions
+    while lo < hi do
+      local mid = math.floor((lo + hi) / 2)
+      if sm_positions[mid] < tn.proj_time then lo = mid + 1 else hi = mid end
+    end
+    local best_d = math.huge
+    local best_proj = tn.proj_time
+    for ci = lo - 1, lo + 1 do
+      if ci >= 1 and ci <= #sm_positions then
+        local d = math.abs(sm_positions[ci] - tn.proj_time)
+        if d < best_d then
+          best_d = d
+          best_proj = sm_positions[ci]
+        end
+      end
+    end
+    if best_proj ~= tn.proj_time then nudge_count = nudge_count + 1 end
+
+    local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, best_proj)
+    local orig_dur = tn.ep - tn.sp
+    local ppq_end = ppq_start + (orig_dur > 0 and orig_dur or 10)
+    nudged_notes[#nudged_notes + 1] = {
+      sel=tn.sel, muted=tn.muted, chan=tn.chan, pitch=tn.pitch, vel=tn.vel,
+      sp=ppq_start, ep=ppq_end
+    }
+  end
+
+  -- Prevent overlap: for same channel+pitch, trim note end to next note's start
+  table.sort(nudged_notes, function(a, b)
+    if a.chan ~= b.chan then return a.chan < b.chan end
+    if a.pitch ~= b.pitch then return a.pitch < b.pitch end
+    return a.sp < b.sp
+  end)
+  for i = 1, #nudged_notes - 1 do
+    local na = nudged_notes[i]
+    local nb = nudged_notes[i + 1]
+    if na.chan == nb.chan and na.pitch == nb.pitch and na.ep > nb.sp then
+      na.ep = nb.sp
+      if na.ep <= na.sp then na.ep = na.sp + 1 end
+    end
+  end
+
+  -- Insert nudged notes
+  for _, nn in ipairs(nudged_notes) do
+    reaper.MIDI_InsertNote(nudge_take, nn.sel, nn.muted,
+      nn.sp, nn.ep, nn.chan, nn.pitch, nn.vel, true)
+  end
+
+  -- Copy text/sysex events to nudge take at original positions
+  for _, tx in ipairs(src_texts) do
+    reaper.MIDI_InsertTextSysexEvt(nudge_take, tx.sel, tx.muted, tx.ppqpos, tx.evt_type, tx.msg)
+  end
+
+  reaper.MIDI_Sort(nudge_take)
+
+  -- Copy remap P_EXT data to the nudge take if present on original
+  local ok_n, notes_str = reaper.GetSetMediaItemTakeInfo_String(midi_take, "P_EXT:XMLREMAP_NOTES", "", false)
+  if ok_n and notes_str ~= "" then
+    reaper.GetSetMediaItemTakeInfo_String(nudge_take, "P_EXT:XMLREMAP_NOTES", notes_str, true)
+  end
+  local ok_t, texts_str = reaper.GetSetMediaItemTakeInfo_String(midi_take, "P_EXT:XMLREMAP_TEXTS", "", false)
+  if ok_t and texts_str ~= "" then
+    reaper.GetSetMediaItemTakeInfo_String(nudge_take, "P_EXT:XMLREMAP_TEXTS", texts_str, true)
+  end
+  local ok_p, ppq_str = reaper.GetSetMediaItemTakeInfo_String(midi_take, "P_EXT:XMLREMAP_PPQ", "", false)
+  if ok_p and ppq_str ~= "" then
+    reaper.GetSetMediaItemTakeInfo_String(nudge_take, "P_EXT:XMLREMAP_PPQ", ppq_str, true)
+  end
+
+  -- Make the nudge take active
+  reaper.SetActiveTake(nudge_take)
+
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock("Nudge notes to transients", -1)
+  return nudge_count
+end
+function capture_pre_import_state()
+    local state = {}
+    state.track_count = reaper.CountTracks(0)
+    state.track_guids = {}
+    for i = 0, state.track_count - 1 do
+        local track = reaper.GetTrack(0, i)
+        state.track_guids[reaper.GetTrackGUID(track)] = true
+    end
+    state.item_count = reaper.CountMediaItems(0)
+    state.item_guids = {}
+    for i = 0, state.item_count - 1 do
+        local item = reaper.GetMediaItem(0, i)
+        state.item_guids[reaper.BR_GetMediaItemGUID(item)] = true
+    end
+    state.region_count = 0
+    state.region_indices = {}
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    for i = 0, num_markers + num_regions - 1 do
+        local _, isrgn, _, _, _, idx = reaper.EnumProjectMarkers(i)
+        if isrgn then
+            state.region_count = state.region_count + 1
+            state.region_indices[idx] = true
+        end
+    end
+    state.tempo_count = reaper.CountTempoTimeSigMarkers(0)
+    return state
+end
+
+function capture_post_import_history(pre_state, filepath)
+    local entry = {
+        label = filepath and filepath:match("[^\\/]+$") or "Import",
+        timestamp = os.time(),
+        track_guids = {},
+        item_guids = {},
+        region_indices = {},
+        tempo_marker_indices = {},
+    }
+    -- Find new tracks
+    local track_count = reaper.CountTracks(0)
+    for i = 0, track_count - 1 do
+        local track = reaper.GetTrack(0, i)
+        local guid = reaper.GetTrackGUID(track)
+        if not pre_state.track_guids[guid] then
+            table.insert(entry.track_guids, guid)
+        end
+    end
+    -- Find new items
+    local item_count = reaper.CountMediaItems(0)
+    for i = 0, item_count - 1 do
+        local item = reaper.GetMediaItem(0, i)
+        local guid = reaper.BR_GetMediaItemGUID(item)
+        if not pre_state.item_guids[guid] then
+            table.insert(entry.item_guids, guid)
+        end
+    end
+    -- Find new regions
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    for i = 0, num_markers + num_regions - 1 do
+        local _, isrgn, _, _, _, idx = reaper.EnumProjectMarkers(i)
+        if isrgn and not pre_state.region_indices[idx] then
+            table.insert(entry.region_indices, idx)
+        end
+    end
+    -- Find new tempo markers
+    local tempo_count = reaper.CountTempoTimeSigMarkers(0)
+    for i = pre_state.tempo_count, tempo_count - 1 do
+        table.insert(entry.tempo_marker_indices, i)
+    end
+    -- Only add if something was created
+    if #entry.track_guids > 0 or #entry.item_guids > 0 or #entry.region_indices > 0 or #entry.tempo_marker_indices > 0 then
+        table.insert(import_history, entry)
+        save_import_history()
+    end
+end
+
+-- ============================================================================
+-- ============================================================================
+-- Find nearest stretch marker to the REAPER edit cursor (across all audio items).
+-- Returns item, take, idx (0-based), src (take-time), proj_pos.
+-- Returns nil,nil,-1,0,0 if none found.
+-- ============================================================================
+function find_sm_near_cursor()
+    local cur = reaper.GetCursorPosition()
+    local best_item, best_take, best_idx, best_src, best_proj, best_srcpos = nil, nil, -1, 0, 0, 0
+    local best_dist = math.huge
+    for i = 0, reaper.CountMediaItems(0) - 1 do
+        local it = reaper.GetMediaItem(0, i)
+        local tk = reaper.GetActiveTake(it)
+        if tk and not reaper.TakeIsMIDI(tk) then
+            local ip = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+            for si = 0, reaper.GetTakeNumStretchMarkers(tk) - 1 do
+                local _, sm_pos, sm_srcpos = reaper.GetTakeStretchMarker(tk, si)
+                local proj = ip + sm_pos
+                local d = math.abs(proj - cur)
+                if d < best_dist then
+                    best_dist = d
+                    best_item = it; best_take = tk; best_idx = si
+                    best_src = sm_pos
+                    best_srcpos = (sm_srcpos and sm_srcpos >= 0) and sm_srcpos or sm_pos
+                    best_proj = proj
+                end
+            end
+        end
+    end
+    return best_item, best_take, best_idx, best_src, best_proj, best_srcpos
+end
+
+-- ============================================================================
+-- Find nearest tempo marker to the REAPER edit cursor.
+-- Returns idx (0-based), proj_time, bpm, tsn, tsd, linear.
+-- Returns -1 if not found.
+-- ============================================================================
+function find_tempo_near_cursor()
+    local cur = reaper.GetCursorPosition()
+    local best_idx, best_t, best_bpm = -1, 0, 120
+    local best_tsn, best_tsd, best_lin = 4, 4, false
+    local best_dist = math.huge
+    for mi = 0, reaper.CountTempoTimeSigMarkers(0) - 1 do
+        local rv, t, _, _, bpm, tsn, tsd, lin = reaper.GetTempoTimeSigMarker(0, mi)
+        if rv then
+            local d = math.abs(t - cur)
+            if d < best_dist then
+                best_dist = d
+                best_idx = mi; best_t = t; best_bpm = bpm
+                best_tsn = tsn; best_tsd = tsd; best_lin = lin
+            end
+        end
+    end
+    return best_idx, best_t, best_bpm, best_tsn, best_tsd, best_lin
+end
+
+-- ============================================================================
+-- Snap nearest stretch marker to edit cursor to the REAPER project grid.
+-- ============================================================================
+function snap_sm_to_grid()
+    local item, take, idx, src = find_sm_near_cursor()
+    if not item or idx < 0 then
+        safe_msgbox("No stretch markers found near the edit cursor.", "No SM", 0)
+        return
+    end
+    local ip = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local proj = ip + src
+    local snapped = reaper.SnapToGrid(0, proj)
+    if math.abs(snapped - proj) < 0.0001 then return end
+    local new_src = src + (snapped - proj)
+    reaper.Undo_BeginBlock()
+    reaper.PreventUIRefresh(1)
+    reaper.DeleteTakeStretchMarkers(take, idx)
+    reaper.SetTakeStretchMarker(take, idx, new_src)
+    reaper.UpdateTimeline()
+    reaper.PreventUIRefresh(-1)
+    reaper.Undo_EndBlock("Snap stretch marker to grid", -1)
+end
+
+-- ============================================================================
+-- Snap nearest tempo marker to edit cursor to the nearest stretch marker position.
+-- ============================================================================
+function snap_tempo_to_sm()
+    local tidx, t_time, bpm, tsn, tsd, lin = find_tempo_near_cursor()
+    if tidx < 0 then
+        safe_msgbox("No tempo markers found near the edit cursor.", "No Tempo", 0)
+        return
+    end
+    local best_proj, best_dist = nil, math.huge
+    for i = 0, reaper.CountMediaItems(0) - 1 do
+        local it = reaper.GetMediaItem(0, i)
+        local tk = reaper.GetActiveTake(it)
+        if tk and not reaper.TakeIsMIDI(tk) then
+            local ip = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+            for si = 0, reaper.GetTakeNumStretchMarkers(tk) - 1 do
+                local _, src = reaper.GetTakeStretchMarker(tk, si)
+                local proj = ip + src
+                local d = math.abs(proj - t_time)
+                if d < best_dist then best_dist = d; best_proj = proj end
+            end
+        end
+    end
+    if not best_proj then
+        safe_msgbox("No stretch markers found in project.", "No SM", 0)
+        return
+    end
+    if math.abs(best_proj - t_time) < 0.0001 then return end
+    reaper.Undo_BeginBlock()
+    reaper.DeleteTempoTimeSigMarker(0, tidx)
+    reaper.SetTempoTimeSigMarker(0, -1, best_proj, -1, -1, bpm, tsn, tsd, lin)
+    reaper.UpdateTimeline()
+    reaper.Undo_EndBlock("Snap tempo marker to stretch marker", -1)
+end
+
+-- ============================================================================
+-- MIDI Stretch Markers mode
+-- Take markers on MIDI items act as pseudo-stretch markers.  When a take
+-- marker is moved the MIDI notes in the affected region are scaled
+-- proportionally and the marker name is updated to show the segment rate
+-- (e.g. "1.00x", "0.83x").
+-- ============================================================================
+
+-- Convert a take-marker srcpos (seconds from source start) to PPQ.
+-- For MIDI items D_STARTOFFS is typically 0; we use it defensively.
+local function midi_sm_srcpos_to_ppq(take, item_pos, take_startoffs, srcpos)
+    return reaper.MIDI_GetPPQPosFromProjTime(take, item_pos - take_startoffs + srcpos)
+end
+
+-- Initialize (or re-initialize) the cache entry for a MIDI take.
+-- Called the first time we see the take, or when the marker count changes.
+function midi_sm_init_take(take_key, item, take)
+    local item_pos      = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local take_startoffs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local n = reaper.GetNumTakeMarkers(take)
+    local markers = {}
+    for mi = 0, n - 1 do
+        local srcpos, name = reaper.GetTakeMarker(take, mi)
+        -- Only track markers that already carry a rated label (e.g. "1.00x").
+        -- Unrated markers are cached with rated=false so we can track their position
+        -- without ever triggering a stretch on them.
+        local rated = (name and name:match(MIDI_TM_LABEL_PATTERN)) and true or false
+        markers[mi + 1] = {orig_s = srcpos, last_s = srcpos, rated = rated}
+    end
+    -- Compute orig_ppq for each marker (PPQ position at its original source offset)
+    for mi_b = 1, #markers do
+        markers[mi_b].orig_ppq = midi_sm_srcpos_to_ppq(take, item_pos, take_startoffs, markers[mi_b].orig_s)
+    end
+    -- Snapshot all notes as pristine baseline for non-accumulating piecewise warp
+    local note_backup = {}
+    local n_nb = select(1, reaper.MIDI_CountEvts(take))
+    for ni_b = 0, n_nb - 1 do
+        local r_b, s_b, m_b, sp_b, ep_b, ch_b, pt_b, v_b = reaper.MIDI_GetNote(take, ni_b)
+        if r_b then note_backup[#note_backup + 1] = {ni=ni_b, sel=s_b, muted=m_b, sp=sp_b, ep=ep_b, chan=ch_b, pitch=pt_b, vel=v_b} end
+    end
+    midi_sm_state[take_key] = {
+        item          = item,
+        take          = take,
+        item_pos      = item_pos,
+        take_startoffs = take_startoffs,
+        markers       = markers,
+        note_backup   = note_backup,
+        needs_reindex = false,  -- set true after MIDI_Sort (indices become stale)
+        tm_drag       = {},     -- per-marker drag state {stable, undo_open}
+    }
+end
+
+-- Warp notes from pristine note_backup using piecewise-linear mapping.
+-- Uses MIDI_SetNote in-place (no visual flicker) when ni indices are valid.
+-- Falls back to delete+reinsert only when note count has changed since backup.
+-- Caller must call MIDI_Sort(take) only after drag ENDS — NOT every frame.
+function midi_sm_apply_piecewise_warp(take_key)
+    local cached = midi_sm_state[take_key]
+    if not cached or not cached.note_backup or #cached.note_backup == 0 then return end
+    local take        = cached.take
+    local ip          = cached.item_pos
+    local ts          = cached.take_startoffs
+    local markers     = cached.markers
+    local n_m         = #markers
+    local note_backup = cached.note_backup
+    -- Segment boundaries
+    local orig_ppqs = {}; local curr_ppqs = {}
+    orig_ppqs[0] = 0;  curr_ppqs[0] = 0
+    for mi = 1, n_m do
+        local m = markers[mi]
+        orig_ppqs[mi] = m.orig_ppq or reaper.MIDI_GetPPQPosFromProjTime(take, ip - ts + m.orig_s)
+        curr_ppqs[mi] = reaper.MIDI_GetPPQPosFromProjTime(take, ip - ts + m.last_s)
+    end
+    -- Warp: piecewise linear with exact pinning at marker boundaries
+    local function warp(x)
+        for si = 1, n_m do
+            if math.abs(x - orig_ppqs[si]) < 0.5 then return curr_ppqs[si] end
+        end
+        local prev_o, prev_c = 0, 0
+        for si = 1, n_m do
+            if x < orig_ppqs[si] then
+                local span = orig_ppqs[si] - prev_o
+                return span > 0.5 and (prev_c + (x - prev_o) / span * (curr_ppqs[si] - prev_c)) or prev_c
+            end
+            prev_o = orig_ppqs[si]; prev_c = curr_ppqs[si]
+        end
+        return x + (curr_ppqs[n_m] - orig_ppqs[n_m])
+    end
+    -- Rebuild ni mapping when indices are stale (after MIDI_Sort or drag start)
+    if cached.needs_reindex then
+        local n_curr = select(1, reaper.MIDI_CountEvts(take))
+        if n_curr == #note_backup then
+            local cn = {}
+            for ni = 0, n_curr - 1 do
+                local r, _, _, sp = reaper.MIDI_GetNote(take, ni)
+                if r then cn[#cn + 1] = {ni = ni, sp = sp} end
+            end
+            table.sort(cn, function(a, b) return a.sp < b.sp end)
+            local sbi = {}
+            for i = 1, #note_backup do sbi[i] = i end
+            table.sort(sbi, function(a, b) return note_backup[a].sp < note_backup[b].sp end)
+            for rank, bi in ipairs(sbi) do
+                note_backup[bi].ni = cn[rank] and cn[rank].ni or -1
+            end
+            cached._count_mismatch = false
+        else
+            cached._count_mismatch = true  -- note count changed: use fallback
+        end
+        cached.needs_reindex = false
+    end
+    reaper.PreventUIRefresh(1)
+    if cached._count_mismatch then
+        -- Fallback: delete+reinsert (slower, causes one-frame flicker, handles note count change)
+        local nn = select(1, reaper.MIDI_CountEvts(take))
+        for ni = nn - 1, 0, -1 do reaper.MIDI_DeleteNote(take, ni) end
+        for _, nb in ipairs(note_backup) do
+            local new_sp = math.floor(warp(nb.sp) + 0.5)
+            local new_ep = math.max(new_sp + 1, math.floor(warp(nb.ep) + 0.5))
+            reaper.MIDI_InsertNote(take, nb.sel, nb.muted, new_sp, new_ep, nb.chan, nb.pitch, nb.vel, true)
+        end
+    else
+        -- Fast path: update notes in-place (no visual flicker, stable indices during drag)
+        reaper.MIDI_DisableSort(take)
+        for _, nb in ipairs(note_backup) do
+            if nb.ni and nb.ni >= 0 then
+                local new_sp = math.floor(warp(nb.sp) + 0.5)
+                local new_ep = math.max(new_sp + 1, math.floor(warp(nb.ep) + 0.5))
+                reaper.MIDI_SetNote(take, nb.ni, nb.sel, nb.muted, new_sp, new_ep, nb.chan, nb.pitch, nb.vel, false)
+            end
+        end
+    end
+    reaper.PreventUIRefresh(-1)
+end
+
+-- Apply note stretching when the marker at changed_mi (0-based) moves
+-- from old_srcpos to new_srcpos.
+function midi_sm_apply_stretch(take_key, changed_mi, old_srcpos, new_srcpos)
+    local cached = midi_sm_state[take_key]
+    if not cached then return end
+    local take        = cached.take
+    local item        = cached.item
+    local item_pos    = cached.item_pos
+    local take_so     = cached.take_startoffs
+    local markers     = cached.markers
+    local n_m         = #markers
+
+    -- Neighbour source positions (use last_s which is current at call time)
+    local prev_srcpos = (changed_mi > 0) and markers[changed_mi].last_s or 0
+    local next_idx    = changed_mi + 2  -- 1-based index of next marker
+    local next_srcpos = (next_idx <= n_m) and markers[next_idx].last_s or nil
+
+    -- Convert everything to PPQ
+    local prev_ppq = midi_sm_srcpos_to_ppq(take, item_pos, take_so, prev_srcpos)
+    local old_ppq  = midi_sm_srcpos_to_ppq(take, item_pos, take_so, old_srcpos)
+    local new_ppq  = midi_sm_srcpos_to_ppq(take, item_pos, take_so, new_srcpos)
+    local next_ppq = next_srcpos and midi_sm_srcpos_to_ppq(take, item_pos, take_so, next_srcpos) or 1e9
+
+    -- Guard degenerate regions (marker would collapse to a point)
+    local left_span_old  = old_ppq  - prev_ppq
+    local right_span_old = next_ppq - old_ppq
+    if left_span_old < 0.5 and right_span_old < 0.5 then return end
+
+    local n_notes = select(1, reaper.MIDI_CountEvts(take))
+    if n_notes == 0 then return end
+
+    reaper.Undo_BeginBlock()
+    reaper.PreventUIRefresh(1)
+
+    -- Rescale all notes in the two affected sub-regions
+    for ni = 0, n_notes - 1 do
+        local ret, sel, muted, sp, ep, chan, pitch, vel = reaper.MIDI_GetNote(take, ni)
+        if ret then
+            local new_sp = sp
+            local new_ep = ep
+
+            -- Left region: [prev_ppq, old_ppq)
+            if left_span_old > 0.5 then
+                local new_left = new_ppq - prev_ppq
+                if sp >= prev_ppq and sp < old_ppq then
+                    new_sp = prev_ppq + (sp - prev_ppq) / left_span_old * new_left
+                end
+                if ep > prev_ppq and ep <= old_ppq then
+                    new_ep = prev_ppq + (ep - prev_ppq) / left_span_old * new_left
+                end
+            end
+
+            -- Right region: [old_ppq, next_ppq)
+            if right_span_old > 0.5 then
+                local new_right = next_ppq - new_ppq
+                if sp >= old_ppq and sp < next_ppq then
+                    new_sp = new_ppq + (sp - old_ppq) / right_span_old * new_right
+                end
+                if ep > old_ppq and ep <= next_ppq then
+                    new_ep = new_ppq + (ep - old_ppq) / right_span_old * new_right
+                end
+            end
+
+            new_sp = math.floor(new_sp + 0.5)
+            new_ep = math.max(new_sp + 1, math.floor(new_ep + 0.5))
+
+            if new_sp ~= sp or new_ep ~= ep then
+                reaper.MIDI_SetNote(take, ni, sel, muted, new_sp, new_ep, chan, pitch, vel, false)
+            end
+        end
+    end
+
+    -- Update marker name: rate shown = (original span) / (current span) for left segment
+    local left_orig  = markers[changed_mi + 1].orig_s - ((changed_mi > 0) and markers[changed_mi].orig_s or 0)
+    local left_curr  = new_srcpos - prev_srcpos
+    local rate_left  = (left_curr > 1e-7) and (left_orig / left_curr) or 0
+    local _, _, color_c = reaper.GetTakeMarker(take, changed_mi)
+    reaper.SetTakeMarker(take, changed_mi, string.format("%.2fx", rate_left), new_srcpos, color_c)
+
+    -- Update next marker's name too (its left segment changed)
+    if next_idx <= n_m then
+        local right_orig = markers[next_idx].orig_s - markers[changed_mi + 1].orig_s
+        local right_curr = (next_srcpos or new_srcpos) - new_srcpos
+        local rate_right = (right_curr > 1e-7) and (right_orig / right_curr) or 0
+        local next_curr_s, _, color_n = reaper.GetTakeMarker(take, next_idx - 1)
+        reaper.SetTakeMarker(take, next_idx - 1, string.format("%.2fx", rate_right), next_curr_s, color_n)
+    end
+
+    reaper.MIDI_Sort(take)
+    reaper.UpdateItemInProject(item)
+    reaper.PreventUIRefresh(-1)
+    reaper.Undo_EndBlock("MIDI SM: stretch notes", -1)
+end
+
+-- Called every frame when midi_sm_enabled.  Detects moved take markers on
+-- MIDI items and rebuilds note positions via non-accumulating piecewise warp.
+function check_midi_sm_changes()
+    local n_items = reaper.CountMediaItems(0)
+    for ii = 0, n_items - 1 do
+        local item = reaper.GetMediaItem(0, ii)
+        local take = reaper.GetActiveTake(item)
+        if take and reaper.TakeIsMIDI(take) then
+            local n_m = reaper.GetNumTakeMarkers(take)
+            if n_m > 0 then
+                local tk_key = tostring(take)
+                local cached = midi_sm_state[tk_key]
+
+                -- Init or re-init if marker count changed
+                if not cached or #cached.markers ~= n_m then
+                    midi_sm_init_take(tk_key, item, take)
+                    cached = midi_sm_state[tk_key]
+                end
+                if not cached.tm_drag then cached.tm_drag = {} end
+
+                -- Detect moved markers (process at most one rated marker per frame)
+                for mi = 0, n_m - 1 do
+                    local curr_s, curr_name = reaper.GetTakeMarker(take, mi)
+                    local cm = cached.markers[mi + 1]
+                    if cm then
+                        cm.rated = (curr_name and curr_name:match(MIDI_TM_LABEL_PATTERN)) and true or false
+                        local drag = cached.tm_drag[mi]
+                        if cm.rated and math.abs(curr_s - cm.last_s) > 1e-5 then
+                            -- Open undo block on first movement of this drag
+                            if not drag then
+                                drag = {stable=0, undo_open=false}
+                                cached.tm_drag[mi] = drag
+                                cached.needs_reindex = true  -- reindex at drag start
+                                reaper.Undo_BeginBlock()
+                                drag.undo_open = true
+                            end
+                            drag.stable = 0
+                            -- Update last_s BEFORE warp so warp reads current position
+                            cm.last_s = curr_s
+                            -- Rebuild all notes from pristine backup via piecewise warp
+                            reaper.PreventUIRefresh(1)
+                            midi_sm_apply_piecewise_warp(tk_key)
+                            -- Update rate label for moved marker
+                            local prev_s_a = (mi > 0) and cached.markers[mi].last_s or 0
+                            local left_orig_a = cached.markers[mi+1].orig_s - ((mi > 0) and cached.markers[mi].orig_s or 0)
+                            local left_curr_a = curr_s - prev_s_a
+                            local rate_left_a = (left_curr_a > 1e-7) and (left_orig_a / left_curr_a) or 0
+                            local _, _, color_a = reaper.GetTakeMarker(take, mi)
+                            reaper.SetTakeMarker(take, mi, string.format("%.2fx", rate_left_a), curr_s, color_a)
+                            -- Update next marker rate label
+                            local nxt_idx_a = mi + 2
+                            if nxt_idx_a <= n_m then
+                                local right_orig_a = cached.markers[nxt_idx_a].orig_s - cached.markers[mi+1].orig_s
+                                local next_s_a = cached.markers[nxt_idx_a].last_s
+                                local right_curr_a = next_s_a - curr_s
+                                local rate_right_a = (right_curr_a > 1e-7) and (right_orig_a / right_curr_a) or 0
+                                local ncs_a, _, color_na = reaper.GetTakeMarker(take, nxt_idx_a - 1)
+                                reaper.SetTakeMarker(take, nxt_idx_a - 1, string.format("%.2fx", rate_right_a), ncs_a, color_na)
+                            end
+                            -- MIDI_Sort deferred until drag settles (keeps indices stable during drag)
+                            reaper.UpdateItemInProject(item)
+                            reaper.PreventUIRefresh(-1)
+                            break  -- one change per frame
+                        else
+                            if not cm.rated then
+                                cm.last_s = curr_s  -- track unrated markers silently
+                            end
+                            -- Decay stable counter; close undo block when drag settles
+                            if drag then
+                                drag.stable = drag.stable + 1
+                                if drag.stable > 3 then
+                                    -- Sort once when drag settles, mark indices stale
+                                    reaper.MIDI_Sort(take)
+                                    reaper.UpdateItemInProject(item)
+                                    cached.needs_reindex = true
+                                    if drag.undo_open then
+                                        reaper.Undo_EndBlock("MIDI SM: stretch notes", -1)
+                                        drag.undo_open = false
+                                    end
+                                    cached.tm_drag[mi] = nil
+                                end
+                            end
+                        end
+                    end
+                end
+            else
+                -- No markers on this take; clear stale cache
+                midi_sm_state[tostring(take)] = nil
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- MIDI TM helpers: find nearest rated take marker, insert take marker, inner stretch
+-- ============================================================================
+
+-- Pattern that identifies a "rated" take marker label (e.g. "1.00x", "0.83x")
+MIDI_TM_LABEL_PATTERN = "^%-?%d+%.%d+x$"
+
+-- Find the rated take marker (label matches MIDI_TM_LABEL_PATTERN) on any MIDI item
+-- that is closest to the edit cursor.
+-- Returns: item, take, mi (0-based), srcpos  — or nil if none found.
+function find_midi_tm_near_cursor()
+    local cursor = reaper.GetCursorPosition()
+    local best_item, best_take, best_mi, best_srcpos = nil, nil, -1, 0
+    local best_dist = math.huge
+    local n_items = reaper.CountMediaItems(0)
+    for ii = 0, n_items - 1 do
+        local item = reaper.GetMediaItem(0, ii)
+        local take = reaper.GetActiveTake(item)
+        if take and reaper.TakeIsMIDI(take) then
+            local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+            local take_so  = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+            local n_m = reaper.GetNumTakeMarkers(take)
+            for mi = 0, n_m - 1 do
+                local srcpos, name = reaper.GetTakeMarker(take, mi)
+                if name and name:match(MIDI_TM_LABEL_PATTERN) then
+                    local proj_t = item_pos - take_so + srcpos
+                    local dist = math.abs(proj_t - cursor)
+                    if dist < best_dist then
+                        best_dist = dist
+                        best_item = item; best_take = take
+                        best_mi = mi; best_srcpos = srcpos
+                    end
+                end
+            end
+        end
+    end
+    return best_item, best_take, best_mi, best_srcpos
+end
+
+-- Insert a "1.00x" take marker at the edit cursor on the selected MIDI item.
+function insert_midi_tm_at_cursor()
+    local sel_item = reaper.GetSelectedMediaItem(0, 0)
+    if not sel_item then
+        safe_msgbox("Select a MIDI item first.", "No Selection", 0)
+        return
+    end
+    local take = reaper.GetActiveTake(sel_item)
+    if not take or not reaper.TakeIsMIDI(take) then
+        safe_msgbox("Selected item is not a MIDI item.", "Not MIDI", 0)
+        return
+    end
+    local cursor  = reaper.GetCursorPosition()
+    local item_pos = reaper.GetMediaItemInfo_Value(sel_item, "D_POSITION")
+    local take_so  = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local srcpos   = cursor - item_pos + take_so
+    if srcpos < 0 then
+        safe_msgbox("Edit cursor is before the MIDI item start.", "Out of Range", 0)
+        return
+    end
+    reaper.Undo_BeginBlock()
+    reaper.SetTakeMarker(take, -1, "1.00x", srcpos, 0)
+    -- Re-init cache so check_midi_sm_changes picks it up cleanly
+    midi_sm_init_take(tostring(take), sel_item, take)
+    reaper.UpdateItemInProject(sel_item)
+    reaper.Undo_EndBlock("Insert MIDI take marker", -1)
+end
+
+-- Snap the rated take marker nearest the edit cursor to the closest note start or end.
+function snap_midi_tm_to_note()
+    local bi, bt, bmi, bs = find_midi_tm_near_cursor()
+    if not bi or bmi < 0 then
+        safe_msgbox("No rated take markers (e.g. 1.00x) found near the edit cursor.", "No TM", 0)
+        return false
+    end
+    local item_pos = reaper.GetMediaItemInfo_Value(bi, "D_POSITION")
+    local take_so  = reaper.GetMediaItemTakeInfo_Value(bt, "D_STARTOFFS")
+    local n_notes  = select(1, reaper.MIDI_CountEvts(bt))
+    if n_notes == 0 then
+        safe_msgbox("No notes in the MIDI item.", "No Notes", 0)
+        return false
+    end
+    local best_dist = math.huge
+    local best_srcpos = bs
+    for ni = 0, n_notes - 1 do
+        local r, _, _, sp, ep = reaper.MIDI_GetNote(bt, ni)
+        if r then
+            local sp_s = reaper.MIDI_GetProjTimeFromPPQPos(bt, sp) - item_pos + take_so
+            local ep_s = reaper.MIDI_GetProjTimeFromPPQPos(bt, ep) - item_pos + take_so
+            if math.abs(sp_s - bs) < best_dist then best_dist = math.abs(sp_s - bs); best_srcpos = sp_s end
+            if math.abs(ep_s - bs) < best_dist then best_dist = math.abs(ep_s - bs); best_srcpos = ep_s end
+        end
+    end
+    if math.abs(best_srcpos - bs) < 1e-6 then return true end  -- already at note boundary
+    reaper.Undo_BeginBlock()
+    local _, cur_lbl, color_c = reaper.GetTakeMarker(bt, bmi)
+    reaper.SetTakeMarker(bt, bmi, cur_lbl or "1.00x", best_srcpos, color_c)
+    local tk_key = tostring(bt)
+    if midi_sm_state[tk_key] and midi_sm_state[tk_key].markers[bmi + 1] then
+        midi_sm_state[tk_key].markers[bmi + 1].last_s = best_srcpos
+    end
+    reaper.UpdateItemInProject(bi)
+    reaper.Undo_EndBlock("Snap MIDI TM to note boundary", -1)
+    return true
+end
+
+-- Silent version used during auto-snap drag: snaps TM in-place without msgboxes.
+-- take = take pointer, mi = marker index (0-based), srcpos = current src position.
+-- Returns the snapped srcpos (unchanged if no notes or already on boundary).
+function snap_tm_to_closest_note_silent(take, mi, srcpos)
+    local n_notes = select(1, reaper.MIDI_CountEvts(take))
+    if n_notes == 0 then return srcpos end
+    local item_pos = reaper.GetMediaItemInfo_Value(reaper.GetMediaItemTake_Item(take), "D_POSITION")
+    local take_so  = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local best_dist = math.huge
+    local best_srcpos = srcpos
+    for ni = 0, n_notes - 1 do
+        local r, _, _, sp, ep = reaper.MIDI_GetNote(take, ni)
+        if r then
+            local sp_s = reaper.MIDI_GetProjTimeFromPPQPos(take, sp) - item_pos + take_so
+            local ep_s = reaper.MIDI_GetProjTimeFromPPQPos(take, ep) - item_pos + take_so
+            if math.abs(sp_s - srcpos) < best_dist then best_dist = math.abs(sp_s - srcpos); best_srcpos = sp_s end
+            if math.abs(ep_s - srcpos) < best_dist then best_dist = math.abs(ep_s - srcpos); best_srcpos = ep_s end
+        end
+    end
+    return best_srcpos
+end
+
+-- Restore all notes in a take to their pre-warp positions (note_backup), reset all
+-- marker last_s to orig_s, and restore each marker label to "1.00x".
+function reset_midi_tm(take_key)
+    local cached = midi_sm_state[take_key]
+    if not cached or not cached.note_backup or #cached.note_backup == 0 then
+        safe_msgbox("No MIDI SM state found. Enable MIDI SM and move a marker first.", "Nothing to Reset", 0)
+        return false
+    end
+    local take    = cached.take
+    local item    = cached.item
+    local markers = cached.markers
+    reaper.Undo_BeginBlock()
+    reaper.PreventUIRefresh(1)
+    -- Restore all notes from backup at original (unwarped) positions
+    local nn = select(1, reaper.MIDI_CountEvts(take))
+    for ni = nn - 1, 0, -1 do reaper.MIDI_DeleteNote(take, ni) end
+    for _, nb in ipairs(cached.note_backup) do
+        reaper.MIDI_InsertNote(take, nb.sel, nb.muted, nb.sp, nb.ep, nb.chan, nb.pitch, nb.vel, true)
+    end
+    reaper.MIDI_Sort(take)
+    -- Reset all markers to orig_s with 1.00x label
+    for mi_1, m in ipairs(markers) do
+        local mi = mi_1 - 1
+        local _, _, color_r = reaper.GetTakeMarker(take, mi)
+        reaper.SetTakeMarker(take, mi, "1.00x", m.orig_s, color_r)
+        m.last_s = m.orig_s
+    end
+    -- Clear any in-flight drag state
+    cached.tm_drag = {}
+    cached.needs_reindex = true
+    reaper.UpdateItemInProject(item)
+    reaper.PreventUIRefresh(-1)
+    reaper.Undo_EndBlock("Reset MIDI TM to original state", -1)
+    return true
+end
+-- Used by the stretch slider drag loop (caller owns the undo block).
+function midi_sm_apply_stretch_inner(take_key, changed_mi, old_srcpos, new_srcpos)
+    local cached = midi_sm_state[take_key]
+    if not cached then return end
+    local take    = cached.take
+    local item    = cached.item
+    local item_pos = cached.item_pos
+    local take_so  = cached.take_startoffs
+    local markers  = cached.markers
+    local n_m      = #markers
+
+    local prev_srcpos = (changed_mi > 0) and markers[changed_mi].last_s or 0
+    local next_idx    = changed_mi + 2
+    local next_srcpos = (next_idx <= n_m) and markers[next_idx].last_s or nil
+
+    local prev_ppq = midi_sm_srcpos_to_ppq(take, item_pos, take_so, prev_srcpos)
+    local old_ppq  = midi_sm_srcpos_to_ppq(take, item_pos, take_so, old_srcpos)
+    local new_ppq  = midi_sm_srcpos_to_ppq(take, item_pos, take_so, new_srcpos)
+    local next_ppq = next_srcpos and midi_sm_srcpos_to_ppq(take, item_pos, take_so, next_srcpos) or 1e9
+
+    local left_span_old  = old_ppq  - prev_ppq
+    local right_span_old = next_ppq - old_ppq
+    if left_span_old < 0.5 and right_span_old < 0.5 then return end
+
+    local n_notes = select(1, reaper.MIDI_CountEvts(take))
+    if n_notes == 0 then return end
+
+    reaper.PreventUIRefresh(1)
+    for ni = 0, n_notes - 1 do
+        local ret, sel, muted, sp, ep, chan, pitch, vel = reaper.MIDI_GetNote(take, ni)
+        if ret then
+            local new_sp = sp
+            local new_ep = ep
+            if left_span_old > 0.5 then
+                local new_left = new_ppq - prev_ppq
+                if sp >= prev_ppq and sp < old_ppq then
+                    new_sp = prev_ppq + (sp - prev_ppq) / left_span_old * new_left
+                end
+                if ep > prev_ppq and ep <= old_ppq then
+                    new_ep = prev_ppq + (ep - prev_ppq) / left_span_old * new_left
+                end
+            end
+            if right_span_old > 0.5 then
+                local new_right = next_ppq - new_ppq
+                if sp >= old_ppq and sp < next_ppq then
+                    new_sp = new_ppq + (sp - old_ppq) / right_span_old * new_right
+                end
+                if ep > old_ppq and ep <= next_ppq then
+                    new_ep = new_ppq + (ep - old_ppq) / right_span_old * new_right
+                end
+            end
+            new_sp = math.floor(new_sp + 0.5)
+            new_ep = math.max(new_sp + 1, math.floor(new_ep + 0.5))
+            if new_sp ~= sp or new_ep ~= ep then
+                reaper.MIDI_SetNote(take, ni, sel, muted, new_sp, new_ep, chan, pitch, vel, false)
+            end
+        end
+    end
+    -- Update marker label with rate
+    local left_orig = markers[changed_mi + 1].orig_s - ((changed_mi > 0) and markers[changed_mi].orig_s or 0)
+    local left_curr = new_srcpos - prev_srcpos
+    local rate_left = (left_curr > 1e-7) and (left_orig / left_curr) or 0
+    local _, _, color_c = reaper.GetTakeMarker(take, changed_mi)
+    reaper.SetTakeMarker(take, changed_mi, string.format("%.2fx", rate_left), new_srcpos, color_c)
+    if next_idx <= n_m then
+        local right_orig = markers[next_idx].orig_s - markers[changed_mi + 1].orig_s
+        local right_curr = (next_srcpos or new_srcpos) - new_srcpos
+        local rate_right = (right_curr > 1e-7) and (right_orig / right_curr) or 0
+        local next_curr_s, _, color_n = reaper.GetTakeMarker(take, next_idx - 1)
+        reaper.SetTakeMarker(take, next_idx - 1, string.format("%.2fx", rate_right), next_curr_s, color_n)
+    end
+    reaper.MIDI_Sort(take)
+    reaper.UpdateItemInProject(item)
+    reaper.PreventUIRefresh(-1)
+end
+
+-- Apply proportional stretch to a pre-cached set of notes from their ORIGINAL positions.
+-- Does NOT call MIDI_Sort — caller must sort after drag ends.
+-- note_cache: array of {ni, sel, muted, sp, ep, chan, pitch, vel} (original PPQ positions)
+-- prev_ppq / orig_ppq / next_ppq: fixed region boundaries captured at drag start
+-- new_ppq: current position of the moving marker
+function midi_tm_apply_stretch_absolute(take, note_cache, prev_ppq, orig_ppq, new_ppq, next_ppq)
+    if #note_cache == 0 then return end
+    local left_span_orig  = orig_ppq - prev_ppq
+    local right_span_orig = next_ppq - orig_ppq
+    local left_span_new   = new_ppq  - prev_ppq
+    local right_span_new  = next_ppq - new_ppq
+    if left_span_orig < 0.5 and right_span_orig < 0.5 then return end
+    reaper.PreventUIRefresh(1)
+    for _, nc in ipairs(note_cache) do
+        local new_sp = nc.sp
+        local new_ep = nc.ep
+        local sp_left  = nc.sp >= prev_ppq and nc.sp < orig_ppq
+        local sp_right = nc.sp >= orig_ppq and nc.sp < next_ppq
+        local ep_left  = nc.ep > prev_ppq  and nc.ep <= orig_ppq
+        local ep_right = nc.ep > orig_ppq  and nc.ep <= next_ppq
+        -- Scale start position
+        if sp_left and left_span_orig > 0.5 then
+            new_sp = left_span_new > 0.5
+                and (prev_ppq + (nc.sp - prev_ppq) / left_span_orig * left_span_new)
+                or  prev_ppq
+        elseif sp_right and right_span_orig > 0.5 then
+            new_sp = right_span_new > 0.5
+                and (new_ppq + (nc.sp - orig_ppq) / right_span_orig * right_span_new)
+                or  new_ppq
+        end
+        -- Scale end position (may be in a different region than start)
+        if sp_left then
+            if ep_left and left_span_orig > 0.5 then
+                -- Both endpoints in left region
+                new_ep = left_span_new > 0.5
+                    and (prev_ppq + (nc.ep - prev_ppq) / left_span_orig * left_span_new)
+                    or  prev_ppq + 1
+            elseif ep_right and right_span_orig > 0.5 then
+                -- Note spans marker boundary: ep scaled by right formula
+                new_ep = right_span_new > 0.5
+                    and (new_ppq + (nc.ep - orig_ppq) / right_span_orig * right_span_new)
+                    or  new_ppq + 1
+            end
+            -- if ep > next_ppq: leave unchanged (note ends outside both regions)
+        elseif sp_right and ep_right and right_span_orig > 0.5 then
+            -- Both endpoints in right region
+            new_ep = right_span_new > 0.5
+                and (new_ppq + (nc.ep - orig_ppq) / right_span_orig * right_span_new)
+                or  new_ppq + 1
+        end
+        new_sp = math.floor(new_sp + 0.5)
+        new_ep = math.max(new_sp + 1, math.floor(new_ep + 0.5))
+        reaper.MIDI_SetNote(take, nc.ni, nc.sel, nc.muted, new_sp, new_ep, nc.chan, nc.pitch, nc.vel, false)
+    end
+    reaper.PreventUIRefresh(-1)
+end
+
+
+-- Same range logic and settings as detect_tempo_from_item().
+-- ============================================================================
+function detect_transients_manual()
+    local item, take = get_detect_tempo_item()
+    if not item then
+        safe_msgbox("No audio item found.\nSelect an item or set a razor edit.", "No Item", 0)
+        return
+    end
+    if not take or reaper.TakeIsMIDI(take) then
+        safe_msgbox("Selected item must be an audio item (not MIDI).", "Invalid Item", 0)
+        return
+    end
+    local detect_start, detect_end = get_slider_detect_bounds(item)
+    local detect_opts = {
+        sensitivity_dB = sm_sensitivity_dB,
+        retrig_ms      = sm_retrig_ms,
+        threshold_dB   = sm_threshold_dB,
+        proj_start     = detect_start,
+        proj_end       = detect_end,
+    }
+    local transients = detect_audio_transients(item, take, detect_opts)
+    if not transients or #transients == 0 then
+        safe_msgbox("No transients detected in the selected range.", "No Transients", 0)
+        return
+    end
+    local item_pos  = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local take_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local play_rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if play_rate == 0 then play_rate = 1 end
+    for _, tr in ipairs(transients) do
+        if not tr.src then
+            tr.src = take_offs + (tr.proj - item_pos) * play_rate
+        end
+    end
+    reaper.Undo_BeginBlock()
+    reaper.PreventUIRefresh(1)
+    -- Remove existing SMs in the target range only (preserve those outside range)
+    local sm_count_before = reaper.GetTakeNumStretchMarkers(take)
+    for i = sm_count_before - 1, 0, -1 do
+        local _, sm_pos = reaper.GetTakeStretchMarker(take, i)
+        local sm_proj = item_pos + sm_pos
+        local in_range = (not detect_start or sm_proj >= detect_start - 0.001) and
+                         (not detect_end   or sm_proj <= detect_end   + 0.001)
+        if in_range then
+            reaper.DeleteTakeStretchMarkers(take, i)
+        end
+    end
+    local count = 0
+    for _, tr in ipairs(transients) do
+        if tr.src then
+            reaper.SetTakeStretchMarker(take, -1, tr.src)
+            count = count + 1
+        end
+    end
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateTimeline()
+    reaper.Undo_EndBlock("Detect transients → stretch markers (" .. count .. ")", -1)
+    detect_transients_confirmed_until = os.clock() + 1.5
+end
+
+-- Detect tempo from selected audio item and create tempo markers
+-- Uses tempo_map_freq_index for marker spacing and tempo_detect_method_index for algorithm
+-- ============================================================================
+function detect_tempo_from_item()
+    -- Get item based on detect_tempo_item_index setting
+    local item, take = get_detect_tempo_item()
+    if not item then
+        safe_msgbox("No audio item found.\nSelect an item or choose one in Detect Item setting.", "No Item", 0)
+        return
+    end
+    if not take or reaper.TakeIsMIDI(take) then
+        safe_msgbox("Selected item must be an audio item (not MIDI).", "Invalid Item", 0)
+        return
+    end
+
+    -- Check frequency setting
+    local eff_ts_num, eff_ts_denom, eff_beats_qn = get_detect_tempo_timesig()
+    if not eff_ts_num then
+        safe_msgbox("Tempo map frequency is set to Off.\nPlease select a frequency first.", "Frequency Off", 0)
+        return
+    end
+
+    -- Determine detection range: razor edit > time selection > item bounds
+    local detect_start, detect_end = get_slider_detect_bounds(item)
+
+    -- Build opts for transient detection (use slider values)
+    local detect_opts = {
+        sensitivity_dB = sm_sensitivity_dB,
+        retrig_ms = sm_retrig_ms,
+        threshold_dB = sm_threshold_dB,
+        proj_start = detect_start,
+        proj_end = detect_end,
+    }
+
+    -- Detect transients or use existing stretch markers
+    local transients
+    local use_existing = detect_tempo_use_existing_markers
+
+    if use_existing then
+        -- Build transient list from existing stretch markers on the item
+        local item_pos_e = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        local sm_count_e = reaper.GetTakeNumStretchMarkers(take)
+        if sm_count_e < 2 then
+            safe_msgbox("Not enough stretch markers on the item.\nPlace at least 2 stretch markers first.", "No Markers", 0)
+            return
+        end
+        transients = {}
+        for si = 0, sm_count_e - 1 do
+            local _, pos_e = reaper.GetTakeStretchMarker(take, si)
+            local proj_t = item_pos_e + pos_e
+            if (not detect_start or proj_t >= detect_start) and
+               (not detect_end or proj_t <= detect_end) then
+                transients[#transients+1] = {proj = proj_t, src = pos_e, strength = 1}
+            end
+        end
+        if #transients < 2 then
+            safe_msgbox("Not enough stretch markers in the selected range.", "Insufficient Markers", 0)
+            return
+        end
+    elseif tempo_detect_method_index == 2 then
+        -- Python detection: run external script
+        local PCM_src = reaper.GetMediaItemTake_Source(take)
+        local audio_path = reaper.GetMediaSourceFileName(PCM_src)
+        if not audio_path or audio_path == "" then
+            safe_msgbox("Could not get audio file path.", "Error", 0)
+            return
+        end
+        local py_script = script_dir .. "konst_detect_onsets.py"
+        local pf = io.open(py_script, "r")
+        if not pf then
+            safe_msgbox("Python onset detection script not found:\n" .. py_script .. "\n\nFalling back to Lua detection.", "Script Not Found", 0)
+            transients = detect_audio_transients(item, take, detect_opts)
+        else
+            pf:close()
+            local py_exe = reaper.GetExtState("konst_ImportMusicXML", "python_exe")
+            if py_exe == "" then py_exe = "python" end
+            local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or reaper.GetResourcePath()
+            local output_path = temp_dir .. "\\konst_onsets_" .. tostring(os.time()) .. ".txt"
+            local cmd = string.format('"%s" "%s" "%s" "%s"', py_exe, py_script, audio_path, output_path)
+            reaper.ExecProcess(cmd, 60000)
+            local of = io.open(output_path, "r")
+            if of then
+                local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+                transients = {}
+                for line in of:lines() do
+                    local t = tonumber(line)
+                    if t then transients[#transients+1] = {proj = item_pos + t, src = t} end
+                end
+                of:close()
+                os.remove(output_path)
+                -- Filter by detection range if set
+                if detect_start or detect_end then
+                    local filtered = {}
+                    for _, tr in ipairs(transients) do
+                        if (not detect_start or tr.proj >= detect_start) and
+                           (not detect_end or tr.proj <= detect_end) then
+                            filtered[#filtered+1] = tr
+                        end
+                    end
+                    transients = filtered
+                end
+            else
+                safe_msgbox("Python onset detection produced no output.\nFalling back to Lua detection.", "Python Error", 0)
+                transients = detect_audio_transients(item, take, detect_opts)
+            end
+        end
+    else
+        -- Lua detection (same function used during MusicXML import)
+        transients = detect_audio_transients(item, take, detect_opts)
+    end
+
+    if not transients or #transients == 0 then
+        safe_msgbox("No transients detected in the selected audio item.", "No Transients", 0)
+        return
+    end
+
+    -- Ensure all transients have .proj
+    local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local take_offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local play_rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if play_rate == 0 then play_rate = 1 end
+    for _, tr in ipairs(transients) do
+        if not tr.proj then
+            tr.proj = item_pos + (tr.src - take_offs) / play_rate
+        end
+    end
+
+    -- ========================================================================
+    -- Estimate BPM using folded inter-onset intervals.
+    -- For each consecutive transient gap, compute the implied BPM, then fold
+    -- it into the 60-200 range by halving/doubling. This is octave-robust:
+    -- hi-hat 16ths at 480 BPM fold to 120, kick gaps at 60 BPM stay at 60.
+    -- The median of all folded BPMs is the estimate.
+    -- ========================================================================
+    local gap_bpms = {}
+    for i = 1, #transients - 1 do
+        local g = transients[i+1].proj - transients[i].proj
+        if g > 0.04 then  -- ignore gaps < 40ms (noise / retriggering)
+            local bpm = 60 / g
+            while bpm > 200 do bpm = bpm / 2 end
+            while bpm < 60 do bpm = bpm * 2 end
+            gap_bpms[#gap_bpms+1] = bpm
+        end
+    end
+    if #gap_bpms == 0 then
+        safe_msgbox("Could not estimate tempo from transients.", "Detection Failed", 0)
+        return
+    end
+    table.sort(gap_bpms)
+    local est_bpm = gap_bpms[math.ceil(#gap_bpms / 2)]
+    est_bpm = math.floor(est_bpm * 10 + 0.5) / 10  -- round to 1 decimal
+
+    -- ========================================================================
+    -- Preview: show popup menu with detected BPM, half, double, custom entry
+    -- ========================================================================
+    local half_bpm = math.floor(est_bpm / 2 * 10 + 0.5) / 10
+    local double_bpm = math.floor(est_bpm * 2 * 10 + 0.5) / 10
+    local menu_str = string.format(
+        "Write at %.1f BPM|Half (%.1f BPM)|Double (%.1f BPM)|Enter custom BPM...",
+        est_bpm, half_bpm, double_bpm)
+    gfx.x = gfx.mouse_x
+    gfx.y = gfx.mouse_y
+    local choice = gfx.showmenu(menu_str)
+
+    local final_bpm = nil
+    if choice == 1 then
+        final_bpm = est_bpm
+    elseif choice == 2 then
+        final_bpm = half_bpm
+    elseif choice == 3 then
+        final_bpm = double_bpm
+    elseif choice == 4 then
+        local retval, input = reaper.GetUserInputs(
+            "Custom BPM", 1, "BPM (10-999):,extrawidth=80",
+            string.format("%.1f", est_bpm))
+        if retval then
+            local v = tonumber(input)
+            if v and v >= 10 and v <= 999 then
+                final_bpm = v
+            else
+                safe_msgbox("Invalid BPM value.", "Error", 0)
+                return
+            end
+        end
+    end
+    if not final_bpm then return end  -- cancelled
+
+    -- ========================================================================
+    -- Grid-fit tempo detection (same approach as konst_Detect tempo.lua).
+    -- Uses stretch markers as transient positions. If the first stretch marker
+    -- exists, it defines bar 1 position; otherwise uses item start.
+    -- For each bar, try tempos in a range around the baseline and pick the one
+    -- whose subdivision grid best aligns with the transient/stretch markers.
+    -- ========================================================================
+    reaper.Undo_BeginBlock()
+    reaper.PreventUIRefresh(1)
+
+    -- Step 1: Insert stretch markers on transients if enabled, then collect
+    -- all stretch marker positions as the timing reference.
+    local stretch_markers_created = 0
+    if detect_stretch_markers_enabled and not use_existing then
+        for _, tr in ipairs(transients) do
+            if tr.src then
+                reaper.SetTakeStretchMarker(take, -1, tr.src)
+                stretch_markers_created = stretch_markers_created + 1
+            end
+        end
+        reaper.UpdateTimeline()
+    end
+
+    -- Collect stretch marker project-time positions (these are our "clicks")
+    -- Filter to the detect range so old markers outside the range are excluded.
+    local marker_times = {}
+    local sm_count = reaper.GetTakeNumStretchMarkers(take)
+    for si = 0, sm_count - 1 do
+        local _, pos = reaper.GetTakeStretchMarker(take, si)
+        local proj_t = item_pos + pos
+        if proj_t >= item_pos and proj_t <= item_pos + reaper.GetMediaItemInfo_Value(item, "D_LENGTH") then
+            if (not detect_start or proj_t >= detect_start - 0.001) and
+               (not detect_end   or proj_t <= detect_end   + 0.001) then
+                marker_times[#marker_times+1] = proj_t
+            end
+        end
+    end
+    table.sort(marker_times)
+
+    -- If no stretch markers in range, fall back to transient .proj times
+    if #marker_times < 2 then
+        marker_times = {}
+        for _, tr in ipairs(transients) do
+            marker_times[#marker_times+1] = tr.proj
+        end
+        table.sort(marker_times)
+    end
+
+    if #marker_times < 2 then
+        reaper.PreventUIRefresh(-1)
+        reaper.Undo_EndBlock("Detect Tempo (aborted)", -1)
+        safe_msgbox("Not enough markers/transients to build tempo map.", "Insufficient Data", 0)
+        return
+    end
+
+    -- Step 2: Determine bar start position.
+    -- When a range is set, start the tempo map at detect_start so bars don't
+    -- begin before the selection. Otherwise, start at the first marker.
+    local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local end_proj = detect_end or (item_pos + item_len)
+    local first_beat = detect_start or marker_times[1]
+    local beats_per_bar = eff_beats_qn  -- from get_detect_tempo_timesig()
+    local subdivisions_per_beat = 2  -- score 8th-note subdivisions
+
+    -- Step 3: Build tempo map bar-by-bar using grid-fit scoring.
+    -- For each bar, sweep tempos in [baseline*0.7 .. baseline*1.3] at 0.5 BPM
+    -- increments. Score = how well stretch markers align to the subdivision grid.
+    -- The tempo with the highest score wins.
+    local min_tempo = math.max(20, final_bpm * 0.7)
+    local max_tempo = math.min(300, final_bpm * 1.3)
+    local step = 0.5
+    local tolerance_factor = 0.25
+    local markers_created = 0
+    local bar_start = first_beat
+    local bar_tempo = final_bpm
+
+    while bar_start < end_proj do
+        -- Score each candidate tempo for this bar
+        local best_tempo = bar_tempo
+        local best_score = -math.huge
+
+        for tempo = min_tempo, max_tempo, step do
+            local beat_duration = 60 / tempo
+            local grid_step = beat_duration / subdivisions_per_beat
+            local bar_duration = beat_duration * beats_per_bar
+            local bar_end = bar_start + bar_duration
+            local margin = grid_step * tolerance_factor
+
+            local score = 0
+            local markers_in_bar = 0
+            for _, mt in ipairs(marker_times) do
+                if mt > bar_start + 0.0001 and mt <= bar_end then
+                    markers_in_bar = markers_in_bar + 1
+                    local offset = mt - bar_start
+                    local grid_index = math.floor(offset / grid_step + 0.5)
+                    local grid_pos = bar_start + grid_index * grid_step
+                    local dist = math.abs(mt - grid_pos)
+                    if dist <= margin then
+                        score = score + (1 - dist / margin)
+                    else
+                        score = score - 0.05
+                    end
+                end
+            end
+
+            -- Lookahead bonus: does bar_end align with a marker?
+            local next_window = math.max(0.05, (60 / tempo) * 0.4)
+            local nearest_dist = next_window * 2
+            for _, mt in ipairs(marker_times) do
+                if mt > bar_start + 0.0001 then
+                    local d = math.abs(mt - bar_end)
+                    if d < nearest_dist then nearest_dist = d end
+                end
+            end
+            if nearest_dist <= next_window then
+                score = score + (1 - nearest_dist / next_window) * 0.8
+            end
+
+            -- Closeness-to-baseline bonus
+            local closeness = 1 - math.abs(tempo - final_bpm) / math.max(1, max_tempo - min_tempo)
+            if closeness < 0 then closeness = 0 end
+            score = score + 0.1 * closeness
+
+            if markers_in_bar > 0 then score = score / markers_in_bar end
+
+            if score > best_score then
+                best_score = score
+                best_tempo = tempo
+            end
+        end
+
+        -- Use baseline if no markers scored positively
+        if best_score <= 0 then best_tempo = final_bpm end
+
+        -- Write tempo marker at bar_start (always include time signature)
+        reaper.SetTempoTimeSigMarker(0, -1, bar_start, -1, -1,
+            best_tempo, eff_ts_num, eff_ts_denom, false)
+        markers_created = markers_created + 1
+
+        -- Advance to next bar
+        local bar_duration = (60 / best_tempo) * beats_per_bar
+        bar_tempo = best_tempo
+        bar_start = bar_start + bar_duration
+    end
+
+    -- Step 4: Refinement pass — adjust each tempo marker's BPM so the next
+    -- bar start aligns exactly with the nearest stretch marker.
+    reaper.UpdateTimeline()
+    local n_tempo = reaper.CountTempoTimeSigMarkers(0)
+    -- Find our first marker index
+    local first_idx = nil
+    for mi = 0, n_tempo - 1 do
+        local rv, t = reaper.GetTempoTimeSigMarker(0, mi)
+        if rv and math.abs(t - first_beat) < 0.002 then
+            first_idx = mi
+            break
+        end
+    end
+    if first_idx and markers_created > 1 then
+        for mi = first_idx, first_idx + markers_created - 2 do
+            if mi + 1 >= n_tempo then break end
+            local rv_c, t_curr, _, _, bpm_curr, tsn_c, tsd_c, lin_c =
+                reaper.GetTempoTimeSigMarker(0, mi)
+            local rv_n, t_next = reaper.GetTempoTimeSigMarker(0, mi + 1)
+            if not (rv_c and rv_n) then break end
+
+            local bar_dur_curr = (60 / bpm_curr) * beats_per_bar
+            local search_radius = bar_dur_curr * 0.5
+
+            -- Find nearest stretch marker to t_next
+            local best_s = nil
+            local best_dist = math.huge
+            for _, mt in ipairs(marker_times) do
+                if mt > t_curr + 0.001 then
+                    local d = math.abs(mt - t_next)
+                    if d < best_dist and d < search_radius then
+                        best_dist = d
+                        best_s = mt
+                    end
+                end
+            end
+            if best_s then
+                local gap = best_s - t_curr
+                if gap > 0.005 then
+                    local new_bpm = beats_per_bar * 60 / gap
+                    if new_bpm >= min_tempo and new_bpm <= max_tempo then
+                        reaper.SetTempoTimeSigMarker(0, mi, t_curr, -1, -1, new_bpm,
+                            tsn_c > 0 and tsn_c or 0, tsd_c > 0 and tsd_c or 0, lin_c)
+                        -- Move next marker to align
+                        local rv_n2, _, mq_n, mqn_n, bpm_n, tsn_n, tsd_n, lin_n =
+                            reaper.GetTempoTimeSigMarker(0, mi + 1)
+                        if rv_n2 then
+                            reaper.SetTempoTimeSigMarker(0, mi + 1, best_s, -1, -1, bpm_n,
+                                tsn_n, tsd_n, lin_n)
+                        end
+                        reaper.UpdateTimeline()
+                    end
+                end
+            end
+        end
+    end
+
+    reaper.UpdateTimeline()
+    reaper.PreventUIRefresh(-1)
+    reaper.Undo_EndBlock("Detect Tempo (" .. markers_created .. " markers, baseline "
+        .. string.format("%.1f", final_bpm) .. " BPM)", -1)
+
+    local msg = string.format("%d tempo markers (baseline %.1f BPM).",
+        markers_created, final_bpm)
+    if stretch_markers_created > 0 then
+        msg = msg .. "\n" .. stretch_markers_created .. " stretch markers inserted."
+    end
+    safe_msgbox(msg, "Tempo Detection Complete", 0)
+end
+
+-- ============================================================================
 -- Import function with GUI-provided options
 -- ============================================================================
 function ImportMusicXMLWithOptions(filepath, options)
@@ -3011,6 +6030,11 @@ function ImportMusicXMLWithOptions(filepath, options)
   local insert_on_new_tracks = (options and options.insert_on_new_tracks) or false
   local insert_on_existing_tracks = (options and options.insert_on_existing_tracks) or false
   local insert_on_tracks_by_name = (options and options.insert_on_tracks_by_name) or true
+  local align_to_audio = (options and options.align_to_audio) or false
+  local align_notes_to_transients = (options and options.align_notes_to_transients) or false
+  local tempo_per_beat = false  -- legacy, replaced by tempo_map_freq
+  local tempo_map_freq = (options and options.tempo_map_freq) or 1  -- index into tempo_map_freq_options
+  local tempo_map_freq_enabled = (tempo_map_freq_options[tempo_map_freq] ~= "Off")  -- true if any tempo map mode
   local selected_tracks = options and options.selected_tracks  -- nil means import all
 
   -- Build a lookup set of selected track names for quick filtering
@@ -3086,6 +6110,13 @@ function ImportMusicXMLWithOptions(filepath, options)
             program = midi_program - 1  -- MusicXML is 1-based, MIDI is 0-based
           }
           break  -- take first midi-instrument with program info
+        elseif midi_channel == 10 and not part_midi_program[id] then
+          -- Drum parts often have channel 10 but no program
+          part_midi_program[id] = {
+            channel = 9,  -- 0-based
+            bank = midi_bank or 1,
+            program = -1
+          }
         end
       end
     end
@@ -3096,10 +6127,19 @@ function ImportMusicXMLWithOptions(filepath, options)
   local markers = {}                  -- time (sec) -> { tempo, beats, beat_type }
   local sections = {}                 -- { { name, start_time, end_time }, ... }
   local part_key_sig = {}             -- part_id -> { fifths, mode } from first <key> element
+  local tempo_map = {{ticks = 0, tempo = 120}}  -- beat position -> tempo, for PPQ->seconds conversion
+  local measure_boundaries = {}       -- for audio alignment: {measure, ticks, score_time, beats, beat_type}
+  local current_beats = 4             -- current time signature numerator
+  local current_beat_type = 4         -- current time signature denominator
 
   -- 8. Process each <part> element
   local parts = findChildren(root, "part")
+  local total_parts = #parts
   for part_idx, part_node in ipairs(parts) do
+    if import_progress.active then
+      update_import_progress(0.05 + 0.45 * ((part_idx - 1) / total_parts),
+        string.format("Parsing part %d/%d...", part_idx, total_parts))
+    end
     local part_id = getAttribute(part_node, "id")
     local base_track_name = part_names[part_id] or ("Part " .. part_id)
     local is_bass = isBassTrack(base_track_name)
@@ -3190,13 +6230,17 @@ function ImportMusicXMLWithOptions(filepath, options)
 
         -- Time signature change?
         local time_node = findChild(attrs, "time")
-        if time_node and import_markers and part_idx == 1 then
+        if time_node and part_idx == 1 then
           local beats = tonumber(getChildText(time_node, "beats"))
           local beat_type = tonumber(getChildText(time_node, "beat-type"))
           if beats and beat_type then
-            if not markers[cur_seconds] then markers[cur_seconds] = {} end
-            markers[cur_seconds].beats = beats
-            markers[cur_seconds].beat_type = beat_type
+            current_beats = beats
+            current_beat_type = beat_type
+            if import_markers then
+              if not markers[cur_seconds] then markers[cur_seconds] = {} end
+              markers[cur_seconds].beats = beats
+              markers[cur_seconds].beat_type = beat_type
+            end
           end
         end
 
@@ -3212,6 +6256,17 @@ function ImportMusicXMLWithOptions(filepath, options)
             end
           end
         end
+      end
+
+      -- Collect measure boundary for audio alignment (first part only, after attributes parsed)
+      if part_idx == 1 then
+        table.insert(measure_boundaries, {
+          measure = measure_idx,
+          ticks = cur_pos_ticks,
+          score_time = cur_seconds,
+          beats = current_beats,
+          beat_type = current_beat_type
+        })
       end
 
       -- Process all elements in measure
@@ -3977,18 +7032,23 @@ function ImportMusicXMLWithOptions(filepath, options)
           end
 
         elseif elem.name == "direction" then
-          -- Tempo change? (only from first part to avoid duplicates)
-          if import_markers and part_idx == 1 then
-            local sound = findChild(elem, "sound")
-            if sound then
-              local tempo_attr = getAttribute(sound, "tempo")
-              if tempo_attr then
-                local new_tempo = tonumber(tempo_attr)
-                if new_tempo then
+          -- Extract tempo from <sound> for ALL parts (needed for correct advance() timing)
+          local sound = findChild(elem, "sound")
+          if sound then
+            local tempo_attr = getAttribute(sound, "tempo")
+            if tempo_attr then
+              local new_tempo = tonumber(tempo_attr)
+              if new_tempo then
+                -- Record marker only for first part to avoid duplicates
+                if import_markers and part_idx == 1 then
                   if not markers[cur_seconds] then markers[cur_seconds] = {} end
                   markers[cur_seconds].tempo = new_tempo
-                  -- Update current tempo for subsequent time calculations
-                  current_tempo = new_tempo
+                end
+                -- Always update current tempo for correct advance() calculations
+                current_tempo = new_tempo
+                -- Record tempo change by tick position (first part only) for PPQ->seconds conversion
+                if part_idx == 1 then
+                  table.insert(tempo_map, {ticks = cur_pos_ticks, tempo = new_tempo})
                 end
               end
             end
@@ -4015,10 +7075,28 @@ function ImportMusicXMLWithOptions(filepath, options)
                     table.insert(sections, {
                       name = section_name,
                       start_time = cur_seconds,
-                      end_time = cur_seconds
+                      end_time = cur_seconds,
+                      ticks = cur_pos_ticks
                     })
                   end
                 end
+              end
+            end
+          end
+
+        elseif elem.name == "sound" then
+          -- Handle <sound> as direct child of <measure> (some exporters place it here)
+          local tempo_attr = getAttribute(elem, "tempo")
+          if tempo_attr then
+            local new_tempo = tonumber(tempo_attr)
+            if new_tempo then
+              if import_markers and part_idx == 1 then
+                if not markers[cur_seconds] then markers[cur_seconds] = {} end
+                markers[cur_seconds].tempo = new_tempo
+              end
+              current_tempo = new_tempo
+              if part_idx == 1 then
+                table.insert(tempo_map, {ticks = cur_pos_ticks, tempo = new_tempo})
               end
             end
           end
@@ -4031,32 +7109,956 @@ function ImportMusicXMLWithOptions(filepath, options)
       staff_notes = staff_notes,
       staff_texts = staff_texts,
       staff_tunings = staff_tunings,
-      total_seconds = cur_seconds
+      total_seconds = cur_seconds,
+      total_ticks = cur_pos_ticks
     }
+  end
+
+  if import_progress.active then
+    update_import_progress(0.50, "Processing alignment...")
   end
 
   -- 11. Determine overall max length across all parts (needed for region boundaries)
   local max_seconds = 0
+  local max_ticks = 0
   for _, data in pairs(all_parts_data) do
     if data.total_seconds > max_seconds then
       max_seconds = data.total_seconds
     end
+    if data.total_ticks and data.total_ticks > max_ticks then
+      max_ticks = data.total_ticks
+    end
   end
   if max_seconds < 0.001 then max_seconds = 1.0 end
 
-  -- 10. Insert tempo/time signature markers if requested
-  if import_markers and next(markers) then
-    insert_markers(markers)
+  -- 9b. Determine import position offset (used for markers, regions, and MIDI items)
+  -- When auto-loaded by region, always use that region's start position
+  local item_position = 0
+  if autoload_region_start_pos then
+    item_position = autoload_region_start_pos
+  elseif import_position_index == 2 then
+    -- Edit Cursor
+    item_position = reaper.GetCursorPosition()
+  elseif import_position_index == 3 then
+    -- Closest Region Start
+    local cursor = reaper.GetCursorPosition()
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    local best_dist = math.huge
+    for i = 0, num_markers + num_regions - 1 do
+      local _, is_rgn, pos = reaper.EnumProjectMarkers(i)
+      if is_rgn then
+        local d = math.abs(pos - cursor)
+        if d < best_dist then best_dist = d; item_position = pos end
+      end
+    end
+  elseif import_position_index == 4 then
+    -- Closest Marker
+    local cursor = reaper.GetCursorPosition()
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    local best_dist = math.huge
+    for i = 0, num_markers + num_regions - 1 do
+      local _, is_rgn, pos = reaper.EnumProjectMarkers(i)
+      if not is_rgn then
+        local d = math.abs(pos - cursor)
+        if d < best_dist then best_dist = d; item_position = pos end
+      end
+    end
+  elseif import_position_index == 6 then
+    -- START Marker: find any project marker whose name contains "START" (case-insensitive)
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    for i = 0, num_markers + num_regions - 1 do
+      local rv, is_rgn, pos, _, name = reaper.EnumProjectMarkers(i)
+      if rv and not is_rgn and name and name:upper():find("START", 1, true) then
+        item_position = pos
+        break
+      end
+    end
   end
 
-  -- 10b. Insert sections as regions if requested
+  -- 9b-onset. Region Onset: detect onset on selected onset item and use as import position
+  if import_position_index == 5 and not autoload_region_start_pos then
+    -- Find closest region
+    local cursor = reaper.GetCursorPosition()
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    local best_dist = math.huge
+    local rgn_start, rgn_end
+    for i = 0, num_markers + num_regions - 1 do
+      local _, is_rgn, pos, rgnend = reaper.EnumProjectMarkers(i)
+      if is_rgn then
+        local d = math.abs(pos - cursor)
+        if d < best_dist then best_dist = d; rgn_start = pos; rgn_end = rgnend end
+      end
+    end
+    if rgn_start then
+      -- Get the item to detect onset on (from Onset Item selector)
+      local onset_item = nil
+      if onset_item_index > 0 then
+        refresh_onset_item_items()
+        local si = onset_item_items[onset_item_index]
+        if si then onset_item = si.item end
+      end
+      if not onset_item then
+        -- Auto: find first audio item in region
+        local items = get_audio_items_in_region(rgn_start, rgn_end)
+        if #items > 0 then onset_item = items[1].item end
+      end
+      if onset_item then
+        local onset_pos = detect_song_start(onset_item)
+        if onset_pos then
+          item_position = onset_pos
+          -- Create START marker at onset
+          reaper.AddProjectMarker(0, false, onset_pos, 0, "START", -1)
+        else
+          item_position = rgn_start
+        end
+      else
+        item_position = rgn_start
+      end
+    end
+  end
+
+  -- 9c. Audio-to-score alignment (if enabled)
+  -- Per-note correction data (populated during alignment, used during insertion)
+  local note_corrections_table = nil
+  local tick_to_score_time = nil
+  local audio_onset_times = nil  -- onset positions (relative to item start) for stretch markers
+  local audio_stem_file_start = 0  -- project time where audio file time 0 maps to
+  local drum_transients = nil  -- native transient detections {proj, src, strength}
+  local drum_aud_item = nil    -- drum audio item reference for stretch markers
+  local beat_desired_offsets = nil  -- absolute project times for per-beat tempo correction
+  local beat_snap_details = nil   -- per-beat snap diagnostics for debug output
+  local bar_desired_offsets = nil  -- absolute project times for per-bar tempo correction
+  if align_to_audio and #measure_boundaries > 1 then
+    -- Find the audio stem to align to
+    local region_name = nil
+    if autoload_region_start_pos then
+      region_name = autoload_last_region_name
+    else
+      region_name, _ = get_region_at_cursor()
+    end
+
+    local audio_path = nil
+    local audio_file_start = 0  -- project time where file time 0 maps to
+
+    -- Check explicit stem selection first
+    if align_stem_index > 0 then
+      refresh_align_stem_items()
+      local si = align_stem_items[align_stem_index]
+      if si and si.item and si.take then
+        local src = reaper.GetMediaItemTake_Source(si.take)
+        if src then
+          audio_path = reaper.GetMediaSourceFileName(src)
+          if audio_path == "" then audio_path = nil end
+          if audio_path then
+            local ip = reaper.GetMediaItemInfo_Value(si.item, "D_POSITION")
+            local to = reaper.GetMediaItemTakeInfo_Value(si.take, "D_STARTOFFS")
+            audio_file_start = ip - to
+            drum_aud_item = si.item
+          end
+        end
+      end
+    end
+
+    if not audio_path and region_name then
+      audio_path, audio_file_start = find_audio_stem_for_region(region_name)
+    end
+
+    if not audio_path then
+      -- Fallback: try selected audio item
+      local sel_item = reaper.GetSelectedMediaItem(0, 0)
+      if sel_item then
+        local sel_take = reaper.GetActiveTake(sel_item)
+        if sel_take and not reaper.TakeIsMIDI(sel_take) then
+          local src = reaper.GetMediaItemTake_Source(sel_take)
+          if src then
+            audio_path = reaper.GetMediaSourceFileName(src)
+            if audio_path == "" then audio_path = nil end
+            if audio_path then
+              local ip = reaper.GetMediaItemInfo_Value(sel_item, "D_POSITION")
+              local to = reaper.GetMediaItemTakeInfo_Value(sel_take, "D_STARTOFFS")
+              audio_file_start = ip - to
+            end
+          end
+        end
+      end
+    end
+
+    if audio_path then
+      import_log("Aligning to audio: " .. audio_path)
+
+      -- Look for a "START" marker — search ALL project markers
+      local start_marker_pos = nil  -- project position of START marker
+      local start_marker_time = nil -- audio-file-relative time for Python
+      local _, nm, nr = reaper.CountProjectMarkers(0)
+      for i = 0, nm + nr - 1 do
+        local rv, is_rgn, pos, _, name, _ = reaper.EnumProjectMarkers(i)
+        if not is_rgn and name and name:upper():find("START", 1, true) then
+          -- If we have a region context, only accept markers within it
+          local in_range = true
+          if autoload_region_start_pos then
+            local rgn_s = autoload_region_start_pos
+            -- Find region end
+            for j = 0, nm + nr - 1 do
+              local _, jr, jp, je = reaper.EnumProjectMarkers(j)
+              if jr and math.abs(jp - rgn_s) < 0.01 then
+                if pos < jp - 0.01 or pos > je + 0.01 then
+                  in_range = false
+                end
+                break
+              end
+            end
+          end
+          if in_range then
+            start_marker_pos = pos
+            start_marker_time = pos - audio_file_start
+            import_log(string.format(
+              "Found START marker at %.3fs", pos))
+            break
+          end
+        end
+      end
+      if not start_marker_pos then
+        import_log("No START marker found. Using auto-detect.")
+      end
+
+      -- Collect all note onset times (score seconds) and build tick→score_time map
+      local score_onsets = {}
+      local onset_set = {}  -- dedup
+      tick_to_score_time = {}  -- tick pos → original score time (for per-note corrections)
+      for _, data in pairs(all_parts_data) do
+        for _, notes in pairs(data.staff_notes) do
+          for _, n in ipairs(notes) do
+            local t = ticks_to_seconds(n.pos, tempo_map, ppq)
+            tick_to_score_time[n.pos] = t
+            local key = string.format("%.4f", t)
+            if not onset_set[key] then
+              onset_set[key] = true
+              score_onsets[#score_onsets + 1] = t
+            end
+          end
+        end
+      end
+      table.sort(score_onsets)
+
+      -- Run alignment
+      local aligned, note_corr, audio_onsets = run_audio_alignment(audio_path, score_onsets, measure_boundaries, start_marker_time)
+
+      -- Store note corrections for per-note nudging during insertion
+      if note_corr and align_notes_to_transients then
+        note_corrections_table = note_corr
+      end
+
+      -- Store audio onset times for stretch markers on drum stems
+      audio_onset_times = audio_onsets
+      audio_stem_file_start = audio_file_start
+
+      -- Detect native transients on drum audio for tempo snapping + later reuse
+      local drum_aud_take
+      drum_aud_item, drum_aud_take = find_drum_audio_item()
+      if drum_aud_item and drum_aud_take then
+        drum_transients = detect_audio_transients(drum_aud_item, drum_aud_take)
+        import_log(string.format(
+          "Detected %d transients on drum stem",
+          #drum_transients))
+      end
+
+      if aligned and #aligned > 0 then
+        -- Snap bar positions to drum transients using BPM-closest logic.
+        -- For each bar, pick the transient that keeps tempo closest to the
+        -- expected baseline from the score, avoiding ghost note snaps.
+        -- Work in project time to avoid coordinate system mismatches.
+        if drum_transients and #drum_transients > 0 then
+          local snapped = 0
+          local first_tr_proj = drum_transients[1].proj
+
+          -- Store score-intended tempo per bar BEFORE snapping changes it.
+          -- Used later to detect and reject wild tempo artifacts from bad transients.
+          for _, ab in ipairs(aligned) do
+            ab.score_tempo = ab.tempo
+          end
+
+          for i, ab in ipairs(aligned) do
+            local bar_proj = audio_file_start + ab.real_time  -- project time
+
+            -- Skip bars before drums come in
+            if bar_proj < first_tr_proj - 0.1 then
+              goto continue_bar_snap
+            end
+
+            -- Expected tempo from score for this bar
+            local expected_bpm = ab.tempo
+
+            -- Previous bar's snapped position
+            local prev_proj = nil
+            if i > 1 then prev_proj = audio_file_start + aligned[i-1].real_time end
+
+            -- Binary search for closest transient by project time
+            local lo, hi = 1, #drum_transients
+            while lo < hi do
+              local mid = math.floor((lo + hi) / 2)
+              if drum_transients[mid].proj < bar_proj then lo = mid + 1 else hi = mid end
+            end
+
+            -- Search ±3 candidates, pick one whose resulting BPM is closest to expected
+            local best_bpm_err = math.huge
+            local best_proj = bar_proj
+            local search_lo = math.max(1, lo - 3)
+            local search_hi = math.min(#drum_transients, lo + 3)
+            local found = false
+            for ci = search_lo, search_hi do
+              local cand = drum_transients[ci].proj
+              if prev_proj then
+                local gap = cand - prev_proj
+                if gap > 0.05 then
+                  -- Bar duration in quarter notes
+                  local mb_beats = 4  -- default 4/4
+                  for _, m in ipairs(measure_boundaries) do
+                    if m.measure == ab.measure then
+                      mb_beats = m.beats * 4.0 / m.beat_type
+                      break
+                    end
+                  end
+                  local cand_bpm = mb_beats * 60.0 / gap
+                  local bpm_err = math.abs(cand_bpm - expected_bpm)
+                  if bpm_err < best_bpm_err then
+                    best_bpm_err = bpm_err
+                    best_proj = cand
+                    found = true
+                  end
+                end
+              else
+                -- First bar: use nearest
+                local d = math.abs(cand - bar_proj)
+                if d < best_bpm_err then
+                  best_bpm_err = d
+                  best_proj = cand
+                  found = true
+                end
+              end
+            end
+            if found then
+              ab.real_time = best_proj - audio_file_start
+              snapped = snapped + 1
+            end
+
+            ::continue_bar_snap::
+          end
+
+          -- Enforce strict monotonicity after snapping
+          for i = 2, #aligned do
+            if aligned[i].real_time <= aligned[i-1].real_time + 0.05 then
+              aligned[i].real_time = aligned[i-1].real_time +
+                (measure_boundaries[i].score_time - measure_boundaries[i-1].score_time) /
+                (aligned[i-1].tempo / 60.0)
+            end
+          end
+
+          -- Recalculate per-bar tempos from snapped positions.
+          -- If a recalculated tempo deviates >15% from the score's baseline
+          -- (e.g., drum fill caused wrong transient snap → 33 BPM instead of 99),
+          -- reject it and use the score tempo instead.
+          local MAX_TEMPO_DEVIATION = 0.15  -- 15% threshold
+          local smoothed_count = 0
+          for i = 1, #aligned do
+            local mb = nil
+            for _, m in ipairs(measure_boundaries) do
+              if m.measure == aligned[i].measure then mb = m; break end
+            end
+            if mb and i < #aligned then
+              local bar_dur = aligned[i+1].real_time - aligned[i].real_time
+              local qn = mb.beats * 4.0 / mb.beat_type
+              if bar_dur > 0.05 then
+                local new_tempo = math.max(30, math.min(300, qn * 60.0 / bar_dur))
+                local base = aligned[i].score_tempo or new_tempo
+                local deviation = math.abs(new_tempo - base) / base
+                if deviation > MAX_TEMPO_DEVIATION then
+                  -- Wild tempo — use score baseline instead
+                  aligned[i].tempo = base
+                  smoothed_count = smoothed_count + 1
+                else
+                  aligned[i].tempo = new_tempo
+                end
+              end
+            elseif i == #aligned and i > 1 then
+              aligned[i].tempo = aligned[i-1].tempo
+            end
+          end
+          if smoothed_count > 0 then
+            import_log(string.format(
+              "Smoothed %d/%d bar tempos",
+              smoothed_count, #aligned))
+          end
+
+          import_log(string.format(
+            "Snapped %d/%d bar positions to transients", snapped, #aligned))
+        end
+
+        if tempo_map_freq_enabled and drum_transients and #drum_transients > 0 then
+          -- Per-beat tempo map: each beat's position = nearest drum transient.
+          -- Work entirely in PROJECT TIME to avoid coordinate mismatches.
+          -- The drum transients ARE the ground truth — tempo markers go there.
+
+          -- Step 1: Build estimated beat positions in PROJECT time
+          local beat_entries = {}  -- {tick, proj_time, beat_type, snapped_sm}
+          for i = 1, #aligned do
+            local ab = aligned[i]
+            local mb = nil
+            for _, m in ipairs(measure_boundaries) do
+              if m.measure == ab.measure then mb = m; break end
+            end
+            if mb then
+              local bar_start_tick = mb.ticks
+              local num_beats = ab.beats
+              local beat_type = ab.beat_type
+              local ticks_per_beat = ppq * 4 / beat_type
+
+              if i < #aligned then
+                local bar_dur = aligned[i+1].real_time - ab.real_time
+                local beat_dur = bar_dur / num_beats
+                for k = 0, num_beats - 1 do
+                  local rt = ab.real_time + k * beat_dur
+                  beat_entries[#beat_entries+1] = {
+                    tick = bar_start_tick + k * ticks_per_beat,
+                    proj_time = audio_file_start + rt,  -- absolute project time
+                    beat_type = beat_type,
+                    snapped_sm = nil,  -- will hold transient index if snapped
+                  }
+                end
+              else
+                beat_entries[#beat_entries+1] = {
+                  tick = bar_start_tick,
+                  proj_time = audio_file_start + ab.real_time,
+                  beat_type = beat_type,
+                  snapped_sm = nil,
+                }
+              end
+            end
+          end
+
+          -- Step 2: For each beat, snap to the transient whose resulting BPM
+          -- is closest to the expected tempo from the score (baseline).
+          -- Beats before the first transient keep their interpolated positions
+          -- so they use pure baseline tempo (drums haven't started yet).
+          local snapped_beats = 0
+          local first_tr_proj = drum_transients[1].proj
+
+          for bi, be in ipairs(beat_entries) do
+            be.orig_proj = be.proj_time
+
+            -- Skip beats before drums come in — keep baseline position
+            if be.proj_time < first_tr_proj - 0.1 then
+              goto continue_beat_snap
+            end
+
+            -- Expected BPM from score = 60 / (original gap to next beat)
+            local expected_bpm = 98  -- fallback
+            if bi < #beat_entries then
+              -- Use .proj_time for look-ahead (orig_proj not yet set on next entry)
+              local gap = beat_entries[bi+1].proj_time - be.orig_proj
+              if gap > 0.01 then expected_bpm = 60 / gap end
+            elseif bi > 1 then
+              local gap = be.orig_proj - beat_entries[bi-1].orig_proj
+              if gap > 0.01 then expected_bpm = 60 / gap end
+            end
+
+            -- Previous beat's snapped position (needed to compute resulting BPM)
+            local prev_proj = nil
+            if bi > 1 then prev_proj = beat_entries[bi-1].proj_time end
+
+            -- Binary search for closest transient
+            local lo, hi = 1, #drum_transients
+            while lo < hi do
+              local mid = math.floor((lo + hi) / 2)
+              if drum_transients[mid].proj < be.proj_time then lo = mid + 1 else hi = mid end
+            end
+
+            -- Search candidates in neighborhood: pick the one whose BPM
+            -- (relative to previous beat) is closest to expected_bpm.
+            local best_bpm_err = math.huge
+            local best_proj = be.proj_time
+            local best_idx = nil
+            local search_lo = math.max(1, lo - 3)
+            local search_hi = math.min(#drum_transients, lo + 3)
+            for ci = search_lo, search_hi do
+              local cand = drum_transients[ci].proj
+              if prev_proj then
+                local gap = cand - prev_proj
+                if gap > 0.01 then
+                  local cand_bpm = 60 / gap
+                  local bpm_err = math.abs(cand_bpm - expected_bpm)
+                  if bpm_err < best_bpm_err then
+                    best_bpm_err = bpm_err
+                    best_proj = cand
+                    best_idx = ci
+                  end
+                end
+              else
+                -- First snapped beat: just use nearest
+                local d = math.abs(cand - be.proj_time)
+                if d < best_bpm_err then
+                  best_bpm_err = d
+                  best_proj = cand
+                  best_idx = ci
+                end
+              end
+            end
+            if best_idx then
+              be.proj_time = best_proj
+              be.snapped_sm = best_idx
+              snapped_beats = snapped_beats + 1
+            end
+
+            ::continue_beat_snap::
+          end
+
+          -- Step 3: Enforce strict monotonicity.
+          -- If collision, use baseline tempo gap instead of tiny 15ms gap
+          -- (which caused 300 BPM spam).
+          for i = 2, #beat_entries do
+            if beat_entries[i].proj_time <= beat_entries[i-1].proj_time + 0.01 then
+              -- Revert to interpolated position
+              beat_entries[i].proj_time = beat_entries[i].orig_proj
+              beat_entries[i].snapped_sm = nil
+              -- If still colliding, space by expected beat duration (baseline tempo)
+              if beat_entries[i].proj_time <= beat_entries[i-1].proj_time + 0.01 then
+                local baseline_gap = beat_entries[i].orig_proj - beat_entries[i-1].orig_proj
+                if baseline_gap < 0.1 then baseline_gap = 0.6 end  -- ~100 BPM fallback
+                beat_entries[i].proj_time = beat_entries[i-1].proj_time + baseline_gap
+              end
+            end
+          end
+
+          -- Step 4: Compute the effective item_position so marker_sec offsets
+          -- produce exact transient positions when insert_markers adds it back.
+          -- item_position will be start_marker_pos (if START marker exists)
+          -- or audio_file_start + aligned[1].real_time.
+          local eff_item_pos = start_marker_pos or (audio_file_start + aligned[1].real_time)
+
+          -- Step 5: Compute per-beat tempos and build tempo_map + markers.
+          -- 1/4 time signature: BPM = 60 / gap_to_next_beat.
+          -- If a beat's tempo deviates >15% from the score's expected BPM,
+          -- use the expected BPM instead (avoids drum fill artifacts).
+          -- marker_sec = proj_time - eff_item_pos, so that
+          -- insert_markers places at marker_sec + item_position = proj_time exactly.
+          local MAX_BEAT_DEVIATION = 0.15  -- 15% threshold
+          local smoothed_beats = 0
+          tempo_map = {}
+          markers = {}
+          for i, be in ipairs(beat_entries) do
+            -- Compute expected BPM from score (unsnapped positions)
+            local expected_bpm = 98  -- global fallback
+            if be.orig_proj then
+              if i < #beat_entries and beat_entries[i+1].orig_proj then
+                local gap = beat_entries[i+1].orig_proj - be.orig_proj
+                if gap > 0.01 then expected_bpm = 60 / gap end
+              elseif i > 1 and beat_entries[i-1].orig_proj then
+                local gap = be.orig_proj - beat_entries[i-1].orig_proj
+                if gap > 0.01 then expected_bpm = 60 / gap end
+              end
+            end
+
+            local beat_tempo = expected_bpm  -- default to score tempo
+            if i < #beat_entries then
+              local bd = beat_entries[i+1].proj_time - be.proj_time
+              if bd > 0.01 then
+                local raw_tempo = math.max(30, math.min(300, 60 / bd))
+                local deviation = math.abs(raw_tempo - expected_bpm) / expected_bpm
+                if deviation > MAX_BEAT_DEVIATION then
+                  beat_tempo = expected_bpm
+                  smoothed_beats = smoothed_beats + 1
+                else
+                  beat_tempo = raw_tempo
+                end
+              end
+            elseif i > 1 then
+              local bd = be.proj_time - beat_entries[i-1].proj_time
+              if bd > 0.01 then
+                local raw_tempo = math.max(30, math.min(300, 60 / bd))
+                local deviation = math.abs(raw_tempo - expected_bpm) / expected_bpm
+                if deviation > MAX_BEAT_DEVIATION then
+                  beat_tempo = expected_bpm
+                  smoothed_beats = smoothed_beats + 1
+                else
+                  beat_tempo = raw_tempo
+                end
+              end
+            end
+            table.insert(tempo_map, {ticks = be.tick, tempo = beat_tempo})
+            local marker_sec = be.proj_time - eff_item_pos
+            if not markers[marker_sec] then markers[marker_sec] = {} end
+            markers[marker_sec].tempo = beat_tempo
+            local eff_n, eff_d = get_detect_tempo_timesig()
+            markers[marker_sec].beats = eff_n or 1
+            markers[marker_sec].beat_type = eff_d or 4
+          end
+          table.sort(tempo_map, function(a, b) return a.ticks < b.ticks end)
+
+          import_log(string.format(
+            "Per-beat tempo map: %d beats, %d snapped, %d smoothed",
+            #beat_entries, snapped_beats, smoothed_beats))
+
+          -- Store desired ABSOLUTE project times for the correction pass.
+          -- No offset arithmetic — just the exact project time each marker must be at.
+          beat_desired_offsets = {}
+          for _, be in ipairs(beat_entries) do
+            beat_desired_offsets[#beat_desired_offsets + 1] = be.proj_time
+          end
+
+          -- Store snap details for debug output
+          beat_snap_details = {}
+          for bi, be in ipairs(beat_entries) do
+            beat_snap_details[bi] = {
+              orig_proj = be.orig_proj,
+              final_proj = be.proj_time,
+              snapped_sm = be.snapped_sm,
+            }
+          end
+        else
+          -- Per-bar tempo map (default)
+          -- Rebuild tempo_map from aligned boundaries (every bar)
+          tempo_map = {}
+          for i, ab in ipairs(aligned) do
+            for _, mb in ipairs(measure_boundaries) do
+              if mb.measure == ab.measure then
+                table.insert(tempo_map, {ticks = mb.ticks, tempo = ab.tempo})
+                break
+              end
+            end
+          end
+          if #tempo_map == 0 and #aligned > 0 then
+            table.insert(tempo_map, {ticks = 0, tempo = aligned[1].tempo})
+          end
+          table.sort(tempo_map, function(a, b) return a.ticks < b.ticks end)
+
+          -- Rebuild markers — every bar gets a tempo marker for tight alignment.
+          -- Use eff_item_pos pattern (same as per-beat) so that
+          -- marker_sec + item_position = proj_time exactly.
+          local bar_eff_item_pos = start_marker_pos or (audio_file_start + aligned[1].real_time)
+          markers = {}
+          bar_desired_offsets = {}
+          for i, ab in ipairs(aligned) do
+            local bar_proj = audio_file_start + ab.real_time  -- absolute project time
+            local marker_sec = bar_proj - bar_eff_item_pos
+            if not markers[marker_sec] then markers[marker_sec] = {} end
+            markers[marker_sec].tempo = ab.tempo
+            markers[marker_sec].beats = ab.beats
+            markers[marker_sec].beat_type = ab.beat_type
+            bar_desired_offsets[#bar_desired_offsets + 1] = bar_proj
+          end
+        end
+
+        -- Recompute max_seconds with aligned tempo map
+        max_seconds = 0
+        for _, data in pairs(all_parts_data) do
+          for _, notes in pairs(data.staff_notes) do
+            for _, n in ipairs(notes) do
+              local end_sec = ticks_to_seconds(n.endpos, tempo_map, ppq)
+              if end_sec > max_seconds then max_seconds = end_sec end
+            end
+          end
+        end
+        if max_seconds < 0.001 then max_seconds = 1.0 end
+
+        -- Recompute section times with aligned tempo map
+        for _, sec in ipairs(sections) do
+          if sec.ticks then
+            sec.start_time = ticks_to_seconds(sec.ticks, tempo_map, ppq)
+            sec.end_time = sec.start_time
+          end
+        end
+
+        -- Position: use START marker directly, or fall back to audio offset
+        if start_marker_pos then
+          item_position = start_marker_pos
+        else
+          item_position = audio_file_start + aligned[1].real_time
+        end
+
+        import_log(string.format(
+          "Aligned %d bars, position=%.3fs", #aligned, item_position))
+      else
+        import_log("Alignment failed, importing without alignment.")
+      end
+    else
+      import_log("No audio stem found for alignment.")
+    end
+  end
+
+  if import_progress.active then
+    update_import_progress(0.65, "Inserting tempo markers...")
+  end
+
+  -- 10. Insert tempo/time signature markers if requested
+  if import_markers and next(markers) then
+    insert_markers(markers, item_position)
+
+    -- Correction pass for per-bar mode: adjust each tempo marker's BPM
+    -- so the NEXT marker lands exactly at the desired bar position.
+    if not tempo_map_freq_enabled and bar_desired_offsets and #bar_desired_offsets > 1 then
+      local n_tempo = reaper.CountTempoTimeSigMarkers(0)
+      local desired = bar_desired_offsets
+      local first_idx = nil
+      for mi = 0, n_tempo - 1 do
+        local rv, t = reaper.GetTempoTimeSigMarker(0, mi)
+        if rv and math.abs(t - desired[1]) < 0.002 then
+          first_idx = mi
+          break
+        end
+      end
+      if first_idx then
+        local corrections = 0
+        for k = 2, #desired do
+          local mi = first_idx + k - 1
+          if mi >= n_tempo then break end
+          local prev_mi = mi - 1
+          local rv_p, t_prev, _, _, bpm_prev, tsn_p, tsd_p, lin_p = reaper.GetTempoTimeSigMarker(0, prev_mi)
+          local rv_k, t_cur = reaper.GetTempoTimeSigMarker(0, mi)
+          if rv_p and rv_k then
+            local target = desired[k]
+            local err = t_cur - target
+            if math.abs(err) > 0.0001 then
+              -- Find the measure_boundary for this bar to get quarter-note count
+              local ab = aligned and aligned[k]
+              local mb_beats = 4  -- default 4/4
+              if ab then
+                for _, m in ipairs(measure_boundaries) do
+                  if m.measure == ab.measure then
+                    mb_beats = m.beats * 4.0 / m.beat_type
+                    break
+                  end
+                end
+              end
+              local gap = target - t_prev
+              if gap > 0.005 then
+                local new_bpm = mb_beats * 60.0 / gap
+                new_bpm = math.max(30, math.min(300, new_bpm))
+                reaper.SetTempoTimeSigMarker(0, prev_mi, t_prev, -1, -1, new_bpm,
+                  tsn_p > 0 and tsn_p or 0, tsd_p > 0 and tsd_p or 0, lin_p)
+                reaper.UpdateTimeline()
+                corrections = corrections + 1
+              end
+            end
+          end
+        end
+        reaper.UpdateTimeline()
+        import_log(string.format(
+          "Per-bar tempo correction: adjusted %d/%d markers",
+          corrections, #desired - 1))
+      end
+    end
+
+    -- Correction pass for per-beat mode: adjust each tempo marker's BPM
+    -- so the NEXT marker lands exactly at the desired transient position.
+    -- This is equivalent to REAPER's "move tempo marker, adjusting previous tempo".
+    -- Done sequentially because adjusting marker N shifts all markers after it.
+    if tempo_map_freq_enabled and beat_desired_offsets and #beat_desired_offsets > 1 then
+      local n_tempo = reaper.CountTempoTimeSigMarkers(0)
+      -- beat_desired_offsets are ABSOLUTE project times (no offset needed)
+      local desired = beat_desired_offsets
+      -- We need to match our beat entries to the REAPER markers.
+      -- Our markers start at desired[1]; find which REAPER marker index that is.
+      local first_idx = nil
+      for mi = 0, n_tempo - 1 do
+        local rv, t = reaper.GetTempoTimeSigMarker(0, mi)
+        if rv and math.abs(t - desired[1]) < 0.002 then
+          first_idx = mi
+          break
+        end
+      end
+      if first_idx then
+        local corrections = 0
+        for k = 2, #desired do
+          local mi = first_idx + k - 1  -- REAPER marker index for beat k
+          if mi >= n_tempo then break end
+          local prev_mi = mi - 1
+          -- Read current position of the previous marker (which we may have just adjusted)
+          local rv_p, t_prev, _, _, bpm_prev, tsn_p, tsd_p, lin_p = reaper.GetTempoTimeSigMarker(0, prev_mi)
+          -- Read current position of marker k
+          local rv_k, t_cur = reaper.GetTempoTimeSigMarker(0, mi)
+          if rv_p and rv_k then
+            local target = desired[k]
+            local err = t_cur - target
+            if math.abs(err) > 0.0001 then  -- more than 0.1ms off
+              -- Adjust previous marker's BPM: BPM = 60 / (target - t_prev)
+              local gap = target - t_prev
+              if gap > 0.005 then
+                local new_bpm = 60.0 / gap
+                new_bpm = math.max(30, math.min(300, new_bpm))
+                reaper.SetTempoTimeSigMarker(0, prev_mi, t_prev, -1, -1, new_bpm,
+                  tsn_p > 0 and tsn_p or 1, tsd_p > 0 and tsd_p or 4, lin_p)
+                reaper.UpdateTimeline()
+                corrections = corrections + 1
+              end
+            end
+          end
+        end
+        reaper.UpdateTimeline()
+        import_log(string.format(
+          "Tempo correction: adjusted %d/%d markers",
+          corrections, #desired - 1))
+
+        -- Debug: write detailed comparison to file
+        local debug_path = reaper.GetResourcePath() .. "/Scripts/konst-reascripts/beat_debug.txt"
+        local dbg = io.open(debug_path, "w")
+        if dbg then
+          local function fmt_time(s)
+            if s < 0 then return "N/A             " end
+            local m = math.floor(s / 60)
+            local sec = s - m * 60
+            return string.format("%d:%06.3f", m, sec)
+          end
+
+          dbg:write("=== BEAT POSITION DEBUG ===\n")
+          dbg:write(string.format("item_position = %.6f  audio_file_start = %.6f\n\n",
+            item_position, audio_file_start or 0))
+
+          -- Snap diagnostics: show what each beat snapped to
+          dbg:write("=== BEAT SNAP DETAILS ===\n")
+          dbg:write(string.format("%-6s  %-16s  %-16s  %-10s  %-6s  %s\n",
+            "Beat", "Estimated (proj)", "Snapped (proj)", "Shift(ms)", "SM#", "SM strength"))
+          dbg:write(string.rep("-", 90) .. "\n")
+          if beat_snap_details then
+            for bi = 1, #beat_snap_details do
+              local sd = beat_snap_details[bi]
+              local shift_ms = (sd.final_proj - sd.orig_proj) * 1000
+              local sm_str = sd.snapped_sm and string.format("%-6d", sd.snapped_sm) or "  --  "
+              local strength_str = ""
+              if sd.snapped_sm and drum_transients and drum_transients[sd.snapped_sm] then
+                strength_str = string.format("%.6f", drum_transients[sd.snapped_sm].strength)
+              end
+              dbg:write(string.format("%-6d  %-16s  %-16s  %+8.1f    %s  %s\n",
+                bi, fmt_time(sd.orig_proj), fmt_time(sd.final_proj),
+                shift_ms, sm_str, strength_str))
+            end
+          end
+
+          dbg:write(string.format("\n%-6s  %-16s  %-16s  %-12s  %-16s  %s\n",
+            "Beat", "Tempo mkr (proj)", "Stretch mkr", "TM-SM (ms)", "Desired", "BPM"))
+          dbg:write(string.rep("-", 95) .. "\n")
+
+          local n_tempo_after = reaper.CountTempoTimeSigMarkers(0)
+          for k = 1, #desired do
+            local mi = first_idx + k - 1
+            local t_actual = -1
+            local bpm_val = 0
+            if mi < n_tempo_after then
+              local rv, t, _, _, bpm = reaper.GetTempoTimeSigMarker(0, mi)
+              if rv then t_actual = t; bpm_val = bpm end
+            end
+            -- Compare tempo marker to the stretch marker it should align with
+            local sm_proj = -1
+            local sm_diff_ms = 0
+            if beat_snap_details and beat_snap_details[k] and beat_snap_details[k].snapped_sm then
+              local si = beat_snap_details[k].snapped_sm
+              if drum_transients and drum_transients[si] then
+                sm_proj = drum_transients[si].proj
+                if t_actual >= 0 then
+                  sm_diff_ms = (t_actual - sm_proj) * 1000
+                end
+              end
+            end
+            local sm_str = sm_proj >= 0 and fmt_time(sm_proj) or "  --  "
+            local diff_str = sm_proj >= 0 and string.format("%+8.3f", sm_diff_ms) or "    --  "
+            dbg:write(string.format("%-6d  %-16s  %-16s  %-12s  %-16s  %.2f\n",
+              k, fmt_time(t_actual), sm_str, diff_str, fmt_time(desired[k]), bpm_val))
+          end
+
+          dbg:write(string.format("\n=== STRETCH MARKERS (transients) — %d total ===\n",
+            drum_transients and #drum_transients or 0))
+          if drum_transients then
+            for i = 1, #drum_transients do
+              local tr = drum_transients[i]
+              dbg:write(string.format("  SM %3d: proj=%s  src=%.6f  strength=%.6f\n",
+                i, fmt_time(tr.proj), tr.src, tr.strength or 0))
+            end
+          end
+
+          dbg:write("\n=== END DEBUG ===\n")
+          dbg:close()
+          import_log("Debug written to: " .. debug_path)
+        end
+      else
+        import_log("Tempo correction: could not find first beat marker")
+      end
+    end
+  end
+
+  -- 10a. Rebuild tempo_map from REAPER's actual corrected tempo markers.
+  -- The correction pass adjusts BPM values so tempo markers land at exact
+  -- transient positions. Our internal tempo_map still has the smoothed values
+  -- from before correction. If we use the stale tempo_map in ticks_to_seconds(),
+  -- the resulting seconds won't match REAPER's internal timeline, causing notes
+  -- to be off-tempo. Rebuilding ensures ticks_to_seconds() agrees with REAPER.
+  if import_markers and (beat_desired_offsets or bar_desired_offsets) then
+    local n_tempo = reaper.CountTempoTimeSigMarkers(0)
+    if n_tempo > 0 then
+      -- Read all REAPER tempo markers and rebuild tempo_map
+      -- We need to convert project-time markers back to tick-based entries.
+      -- Since our tempo_map is keyed by ticks, we rebuild it by reading each
+      -- REAPER marker and computing its tick position via MIDI_GetPPQPosFromProjTime.
+      -- But we don't have a take yet... Instead, recompute tempo_map entries
+      -- by matching our existing tick positions to the corrected BPM values.
+      local corrected_map = {}
+      for mi = 0, n_tempo - 1 do
+        local rv, t_pos, _, _, bpm, tsn, tsd, lin = reaper.GetTempoTimeSigMarker(0, mi)
+        if rv and bpm > 0 then
+          -- Find the matching tick position from our existing tempo_map
+          local best_tick = nil
+          local best_dist = math.huge
+          for _, entry in ipairs(tempo_map) do
+            -- Convert this entry's tick to project time using our old map
+            -- to find which tempo_map entry corresponds to this REAPER marker
+            local entry_sec = ticks_to_seconds(entry.ticks, tempo_map, ppq)
+            local entry_proj = item_position + entry_sec
+            local dist = math.abs(entry_proj - t_pos)
+            if dist < best_dist then
+              best_dist = dist
+              best_tick = entry.ticks
+            end
+          end
+          if best_tick and best_dist < 1.0 then
+            corrected_map[#corrected_map + 1] = {ticks = best_tick, tempo = bpm}
+          end
+        end
+      end
+      if #corrected_map > 0 then
+        table.sort(corrected_map, function(a, b) return a.ticks < b.ticks end)
+        tempo_map = corrected_map
+        import_log(string.format(
+          "Rebuilt tempo_map from %d corrected markers", #corrected_map))
+      end
+    end
+  end
   if import_regions and next(sections) then
-    insert_regions(sections, max_seconds)
+    insert_regions(sections, max_seconds, item_position)
+  end
+
+  -- 10b. Write stretch markers on detect item during import (if option enabled)
+  if detect_stretch_markers_enabled and align_to_audio and drum_aud_item and drum_transients and #drum_transients > 0 then
+    local sm_take = reaper.GetActiveTake(drum_aud_item)
+    if sm_take and not reaper.TakeIsMIDI(sm_take) then
+      for _, tr in ipairs(drum_transients) do
+        if tr.src then
+          reaper.SetTakeStretchMarker(sm_take, -1, tr.src)
+        end
+      end
+      reaper.UpdateTimeline()
+      import_log(string.format("Wrote %d stretch markers on detect item", #drum_transients))
+    end
+  end
+
+  if import_progress.active then
+    update_import_progress(0.75, "Creating tracks and inserting MIDI...")
   end
 
   -- 12. Create tracks for each part/staff that has notes (in MusicXML order)
   local initial_track_count = reaper.CountTracks(0)
   local tracks_created = 0
+  local track_insert_idx = 0
+  local total_parts_to_insert = 0
+  for _, pid in ipairs(parts_order) do
+    if all_parts_data[pid] then total_parts_to_insert = total_parts_to_insert + 1 end
+  end
   local next_existing_track_idx = 0  -- Track index for "insert on existing tracks" mode
   
   -- Determine insertion mode
@@ -4070,11 +8072,22 @@ function ImportMusicXMLWithOptions(filepath, options)
   for _, part_id in ipairs(parts_order) do
     local data = all_parts_data[part_id]
     if data then
+    track_insert_idx = track_insert_idx + 1
+    if import_progress.active then
+      update_import_progress(0.75 + 0.20 * (track_insert_idx / total_parts_to_insert),
+        string.format("Inserting track %d/%d...", track_insert_idx, total_parts_to_insert))
+    end
     local base_track_name = part_names[part_id] or ("Part " .. part_id)
     if gm_name_tracks_enabled then
       local mp = part_midi_program[part_id]
-      if mp and gm_program_to_name[mp.program] then
+      -- Check channel 10 (drums) first, then GM program lookup
+      if mp and mp.channel == 9 then
+        base_track_name = "Drums"
+      elseif mp and gm_program_to_name[mp.program] then
         base_track_name = gm_program_to_name[mp.program]
+      elseif isDrumTrack(base_track_name) then
+        -- Fallback: part name contains "drum"/"percussion"/"kit"
+        base_track_name = "Drums"
       end
     end
 
@@ -4210,15 +8223,29 @@ function ImportMusicXMLWithOptions(filepath, options)
           end
         end
 
-        -- Determine item position (always at 0 in new implementation)
-        local item_position = 0
+        -- Determine if we're in "Adapt to project tempo map" mode (index 5)
+        local adapt_to_tempo_map = (import_timebase_index == 5)
 
-        -- Create MIDI item (length = max_seconds)
-        local item = reaper.CreateNewMIDIItemInProj(track, item_position, item_position + max_seconds, false)
+        -- Compute item length: for adapt mode, use project tempo map duration
+        local item_length = max_seconds
+        if adapt_to_tempo_map and max_ticks > 0 then
+          local end_proj = ticks_to_project_time(max_ticks, ppq, item_position)
+          item_length = end_proj - item_position
+          if item_length < 0.001 then item_length = max_seconds end
+        end
+
+        -- Create MIDI item, using pre-computed item_position
+        local item = reaper.CreateNewMIDIItemInProj(track, item_position, item_position + item_length, false)
         if not item then
           item = reaper.AddMediaItemToTrack(track)
           reaper.SetMediaItemInfo_Value(item, "D_POSITION", item_position)
-          reaper.SetMediaItemInfo_Value(item, "D_LENGTH", max_seconds)
+          reaper.SetMediaItemInfo_Value(item, "D_LENGTH", item_length)
+        end
+
+        -- Apply MIDI timebase setting
+        local tb_mode = import_timebase_values[import_timebase_index]
+        if tb_mode and tb_mode >= 0 then
+          reaper.SetMediaItemInfo_Value(item, "C_BEATATTACHMODE", tb_mode)
         end
 
         local take = reaper.GetActiveTake(item)
@@ -4226,20 +8253,195 @@ function ImportMusicXMLWithOptions(filepath, options)
           take = reaper.AddTakeToMediaItem(item)
         end
 
-        -- Name the take after the track
-        reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", track_name, true)
+        -- Check if this is a drum track for per-note transient alignment
+        local is_drum = isDrumTrack(track_name)
+        local has_corrections = is_drum and note_corrections_table and tick_to_score_time
 
-        -- Insert notes
-        for _, n in ipairs(notes) do
-          reaper.MIDI_InsertNote(take, false, false, n.pos, n.endpos, n.channel, n.pitch, n.vel, false)
-        end
-
-        -- Insert text events
-        if staff_texts[staff] then
-          for _, t in ipairs(staff_texts[staff]) do
-            reaper.MIDI_InsertTextSysexEvt(take, false, false, t.pos, t.type, t.text)
+        -- Create nudge take for drum tracks BEFORE inserting notes
+        local nudge_take = nil
+        if has_corrections then
+          nudge_take = reaper.AddTakeToMediaItem(item)
+          if nudge_take then
+            local old_src = reaper.GetMediaItemTake_Source(nudge_take)
+            local src = reaper.GetMediaItemTake_Source(take)
+            reaper.SetMediaItemTake_Source(nudge_take, src)
+            if old_src then reaper.PCM_Source_Destroy(old_src) end
+            reaper.GetSetMediaItemTakeInfo_String(nudge_take, "P_NAME", track_name .. " (nudged)", true)
           end
         end
+
+        -- Take 1: tempo-map only (all tracks get this)
+        reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME",
+          has_corrections and (track_name .. " (tempo map)") or track_name, true)
+        if adapt_to_tempo_map then
+          -- Adapt mode: convert XML ticks → beat offset → project time via project tempo map
+          for _, n in ipairs(notes) do
+            local start_proj = ticks_to_project_time(n.pos, ppq, item_position)
+            local end_proj = ticks_to_project_time(n.endpos, ppq, item_position)
+            local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(take, start_proj)
+            local ppq_end = reaper.MIDI_GetPPQPosFromProjTime(take, end_proj)
+            reaper.MIDI_InsertNote(take, false, false, ppq_start, ppq_end, n.channel, n.pitch, n.vel, false)
+          end
+        else
+          -- Standard mode: convert XML ticks → seconds (using XML tempo) → project time
+          for _, n in ipairs(notes) do
+            local start_sec = ticks_to_seconds(n.pos, tempo_map, ppq)
+            local end_sec = ticks_to_seconds(n.endpos, tempo_map, ppq)
+            local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(take, item_position + start_sec)
+            local ppq_end = reaper.MIDI_GetPPQPosFromProjTime(take, item_position + end_sec)
+            reaper.MIDI_InsertNote(take, false, false, ppq_start, ppq_end, n.channel, n.pitch, n.vel, false)
+          end
+        end
+
+        -- Nudge take (drums only): read notes from Take 1, nudge to transients.
+        -- Take 1 has all notes correctly placed by the tempo map.
+        -- The nudge take snaps each onset to the nearest stretch marker
+        -- so within-bar beats align to the original drum recording.
+        if nudge_take then
+          -- Write stretch markers on drum audio item
+          local sm_positions_project = {}
+          if drum_aud_item and drum_transients and #drum_transients > 0 then
+            local drum_audio_take = reaper.GetActiveTake(drum_aud_item)
+            if drum_audio_take then
+              local existing = reaper.GetTakeNumStretchMarkers(drum_audio_take)
+              for si = existing - 1, 0, -1 do
+                reaper.DeleteTakeStretchMarkers(drum_audio_take, si)
+              end
+              for _, tr in ipairs(drum_transients) do
+                reaper.SetTakeStretchMarker(drum_audio_take, -1, tr.src)
+                sm_positions_project[#sm_positions_project + 1] = tr.proj
+              end
+              reaper.UpdateItemInProject(drum_aud_item)
+              import_log(string.format(
+                "Wrote %d stretch markers on drum audio", #sm_positions_project))
+            end
+          end
+
+          -- Read all notes from Take 1
+          local DRUM_NOTE_LEN = 0.010  -- 10ms fixed note length
+          local _, take1_count = reaper.MIDI_CountEvts(take)
+          local take1_notes = {}
+          for i = 0, take1_count - 1 do
+            local ret, sel, muted, startppq, endppq, chan, pitch, vel =
+              reaper.MIDI_GetNote(take, i)
+            if ret then
+              take1_notes[#take1_notes + 1] = {
+                proj_time = reaper.MIDI_GetProjTimeFromPPQPos(take, startppq),
+                startppq = startppq,
+                sel = sel, muted = muted,
+                chan = chan, pitch = pitch, vel = vel,
+              }
+            end
+          end
+
+          if #sm_positions_project > 0 and #take1_notes > 0 then
+            -- Insert nudged notes with short duration
+            reaper.MIDI_DisableSort(nudge_take)
+            local nudge_count = 0
+            for _, tn in ipairs(take1_notes) do
+              -- Binary search for closest transient
+              local lo, hi = 1, #sm_positions_project
+              while lo < hi do
+                local mid = math.floor((lo + hi) / 2)
+                if sm_positions_project[mid] < tn.proj_time then lo = mid + 1 else hi = mid end
+              end
+              local best_d = math.huge
+              local best_proj = tn.proj_time
+              for ci = lo - 1, lo + 1 do
+                if ci >= 1 and ci <= #sm_positions_project then
+                  local d = math.abs(sm_positions_project[ci] - tn.proj_time)
+                  if d < best_d then
+                    best_d = d
+                    best_proj = sm_positions_project[ci]
+                  end
+                end
+              end
+              if best_proj ~= tn.proj_time then nudge_count = nudge_count + 1 end
+
+              local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, best_proj)
+              local ppq_end = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, best_proj + DRUM_NOTE_LEN)
+              if ppq_end <= ppq_start then ppq_end = ppq_start + 10 end
+              reaper.MIDI_InsertNote(nudge_take, tn.sel, tn.muted,
+                ppq_start, ppq_end, tn.chan, tn.pitch, tn.vel, true)
+            end
+            reaper.MIDI_Sort(nudge_take)
+
+            -- Verify note count; re-insert any missing notes at original positions
+            local _, nudge_count_check = reaper.MIDI_CountEvts(nudge_take)
+            if nudge_count_check < #take1_notes then
+              local missing = #take1_notes - nudge_count_check
+              import_log(string.format(
+                "Drum '%s': %d notes re-inserted at original positions",
+                track_name, missing))
+              -- Build set of (ppq_start, pitch) present in nudge take
+              local present = {}
+              for i = 0, nudge_count_check - 1 do
+                local ret2, _, _, sppq, _, _, p = reaper.MIDI_GetNote(nudge_take, i)
+                if ret2 then
+                  present[string.format("%d_%d", math.floor(sppq + 0.5), p)] = true
+                end
+              end
+              -- Re-insert missing notes from Take 1 at their original (un-nudged) positions
+              reaper.MIDI_DisableSort(nudge_take)
+              for _, tn in ipairs(take1_notes) do
+                local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, tn.proj_time)
+                local ppq_end = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, tn.proj_time + DRUM_NOTE_LEN)
+                if ppq_end <= ppq_start then ppq_end = ppq_start + 10 end
+                local key = string.format("%d_%d", math.floor(ppq_start + 0.5), tn.pitch)
+                -- Check if any note with this pitch is near this position
+                local found = false
+                for delta = -5, 5 do
+                  if present[string.format("%d_%d", math.floor(ppq_start + 0.5) + delta, tn.pitch)] then
+                    found = true
+                    break
+                  end
+                end
+                if not found then
+                  reaper.MIDI_InsertNote(nudge_take, tn.sel, tn.muted,
+                    ppq_start, ppq_end, tn.chan, tn.pitch, tn.vel, true)
+                end
+              end
+              reaper.MIDI_Sort(nudge_take)
+            end
+
+            local _, final_count = reaper.MIDI_CountEvts(nudge_take)
+            reaper.SetActiveTake(nudge_take)
+            import_log(string.format(
+              "Drum '%s': %d/%d notes nudged to transients",
+              track_name, nudge_count, #take1_notes))
+          else
+            -- No transients: copy Take 1 notes with short duration
+            for _, tn in ipairs(take1_notes) do
+              local ppq_start = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, tn.proj_time)
+              local ppq_end = reaper.MIDI_GetPPQPosFromProjTime(nudge_take, tn.proj_time + DRUM_NOTE_LEN)
+              if ppq_end <= ppq_start then ppq_end = ppq_start + 10 end
+              reaper.MIDI_InsertNote(nudge_take, false, false,
+                ppq_start, ppq_end, tn.chan, tn.pitch, tn.vel, true)
+            end
+            reaper.MIDI_Sort(nudge_take)
+            reaper.SetActiveTake(nudge_take)
+            import_log(string.format(
+              "Drum '%s': no transients, copied %d notes",
+              track_name, #take1_notes))
+          end
+        end
+
+        -- Insert text events (convert beat-ticks to time-accurate REAPER PPQ)
+        if staff_texts[staff] then
+          for _, t in ipairs(staff_texts[staff]) do
+            local t_proj
+            if adapt_to_tempo_map then
+              t_proj = ticks_to_project_time(t.pos, ppq, item_position)
+            else
+              t_proj = item_position + ticks_to_seconds(t.pos, tempo_map, ppq)
+            end
+            local ppq_pos = reaper.MIDI_GetPPQPosFromProjTime(take, t_proj)
+            reaper.MIDI_InsertTextSysexEvt(take, false, false, ppq_pos, t.type, t.text)
+          end
+        end
+
+        -- Store tick-based remap data on the take for future tempo remap
+        store_remap_data(take, notes, staff_texts[staff], ppq)
 
         -- Insert MIDI bank/program change from MusicXML (once per part, on first staff with notes)
         local mp = part_midi_program[part_id]
@@ -4278,6 +8480,12 @@ function ImportMusicXMLWithOptions(filepath, options)
 
   reaper.UpdateArrange()
   
+  if import_progress.active then
+    import_log(string.format("Imported %d tracks from %s",
+      tracks_created, (filepath:match("[^\\/]+$") or filepath)))
+    update_import_progress(0.95, "Finalizing...")
+  end
+
   -- End undo block
   reaper.Undo_EndBlock("Import MusicXML", -1)
 end
@@ -4321,22 +8529,22 @@ gui = {
 }
 
 -- Global variables to store selected file info
-local selected_file_path = nil
-local selected_file_name = nil
-local selected_file_track_count = nil
-local last_import_dir = nil  -- Store the last imported file directory
-local default_import_dir = ""  -- Default directory for file explorer when no last path exists
+selected_file_path = nil
+selected_file_name = nil
+selected_file_track_count = nil
+last_import_dir = nil  -- Store the last imported file directory
+default_import_dir = ""  -- Default directory for file explorer when no last path exists
 path_mode = "last"  -- "default" = use default_import_dir, "last" = use last_import_dir
-local track_checkboxes = {}  -- Dynamic list: { {name="...", checked=true, part_id="..."}, ... }
-local import_all_checked = true  -- "Import All" master checkbox state
-local track_scroll_offset = 0  -- Scroll offset (in rows) for the track list
-local main_scroll_offset = 0     -- Scroll offset (in rows) for main settings area
-local scrollbar_dragging = false  -- Whether we're dragging the scrollbar
-local settings_mode = false  -- Whether the settings view is active
-local settings_scroll_offset = 0  -- Scroll offset for settings view (pixels)
-local settings_sb_dragging = false  -- Whether we're dragging the settings scrollbar thumb
-local settings_sb_drag_start_y = 0  -- Mouse Y when drag started
-local settings_sb_drag_start_offset = 0  -- settings_scroll_offset when drag started
+track_checkboxes = {}  -- Dynamic list: { {name="...", checked=true, part_id="..."}, ... }
+import_all_checked = true  -- "Import All" master checkbox state
+track_scroll_offset = 0  -- Scroll offset (in rows) for the track list
+main_scroll_offset = 0     -- Scroll offset (in rows) for main settings area
+scrollbar_dragging = false  -- Whether we're dragging the scrollbar
+settings_mode = false  -- Whether the settings view is active
+settings_scroll_offset = 0  -- Scroll offset for settings view (pixels)
+settings_sb_dragging = false  -- Whether we're dragging the settings scrollbar thumb
+settings_sb_drag_start_y = 0  -- Mouse Y when drag started
+settings_sb_drag_start_offset = 0  -- settings_scroll_offset when drag started
 auto_focus_enabled = true  -- Whether to auto-focus window on mouse hover
 stay_on_top_enabled = false  -- Whether to keep the window always on top
 font_list = {"Outfit", "Arial", "Segoe UI", "Tahoma", "Verdana", "Consolas", "Courier New", "Times New Roman", "Georgia", "Trebuchet MS", "Calibri", "Helvetica"}
@@ -4346,15 +8554,105 @@ docker_position = 1  -- 1=Bottom, 2=Left, 3=Top, 4=Right
 remember_window_size = false  -- Whether to save/restore window size across launches
 docker_positions = {"Bottom", "Left", "Top", "Right"}
 docker_dock_values = {769, 257, 513, 1}  -- gfx.dock values for each position
-local settings_btn_hovered = false  -- Hover state for settings button in main view
-local export_btn_hovered = false  -- Hover state for export button in main view
-local export_confirmed_until = 0   -- os.clock() time until which "Exported!" label is shown
-local pre_settings_width = nil  -- Window width before entering settings mode
-local pre_settings_height = nil -- Window height before entering settings mode
+settings_btn_hovered = false  -- Hover state for settings button in main view
+export_btn_hovered = false  -- Hover state for export button in main view
+undo_btn_hovered = false  -- Hover state for undo button in main view
+remap_btn_hovered = false  -- Hover state for remap button in main view
+remap_confirmed_until = 0  -- os.clock() time until which "Remapped!" label is shown
+nudge_btn_hovered = false  -- Hover state for nudge button in main view
+nudge_confirmed_until = 0  -- os.clock() time until which "Nudged!" label is shown
+export_confirmed_until = 0   -- os.clock() time until which "Exported!" label is shown
+del_tempo_btn_hovered = false  -- Hover state for Delete Tempo Markers button
+del_tempo_confirmed_until = 0  -- os.clock() time until which "Deleted!" label is shown
+del_sm_btn_hovered = false  -- Hover state for Remove Stretch Markers button
+del_sm_confirmed_until = 0  -- os.clock() time until which "Removed!" label is shown
+detect_transients_confirmed_until = 0  -- "Detected!" label timer for Detect Transients button
+
+-- Nudge SM slider state (moves nearest stretch marker to edit cursor)
+sm_nudge_value = 0           -- current nudge delta in ms (±500)
+sm_nudge_slider_dragging = false
+sm_nudge_drag_start_x = 0
+sm_nudge_drag_start_val = 0
+sm_nudge_item = nil          -- item locked at drag start
+sm_nudge_take = nil
+sm_nudge_idx = -1            -- SM index at drag start (0-based)
+sm_nudge_orig_src = 0        -- original take-time position (fixed during offset drag)
+sm_nudge_orig_srcpos = 0     -- original source media position (varies during offset drag)
+sm_nudge_undo_open = false
+
+-- Nudge Tempo slider state (moves nearest tempo marker to edit cursor)
+tempo_nudge_value = 0        -- current nudge delta in ms (±500)
+tempo_nudge_slider_dragging = false
+tempo_nudge_drag_start_x = 0
+tempo_nudge_drag_start_val = 0
+tempo_nudge_idx = -1         -- tempo marker index at drag start (0-based)
+tempo_nudge_orig_t = 0       -- original project time at drag start
+tempo_nudge_orig_bpm = 120
+tempo_nudge_orig_tsn = 4
+tempo_nudge_orig_tsd = 4
+tempo_nudge_orig_lin = false
+tempo_nudge_undo_open = false
+tempo_nudge_prev_idx = -1        -- index of the tempo marker immediately before the nudged one
+tempo_nudge_prev_t = 0           -- original time of that previous marker
+tempo_nudge_prev_bpm = 120       -- original BPM of that previous marker
+tempo_nudge_prev_tsn = 4
+tempo_nudge_prev_tsd = 4
+tempo_nudge_prev_lin = false
+
+-- Snap toggle states for nudge sliders
+sm_snap_to_grid_enabled = false    -- when ON, SM nudge slider snaps SM to grid
+tempo_snap_to_sm_enabled = false   -- when ON, tempo nudge slider snaps incrementally to stretch markers
+midi_sm_enabled = false            -- when ON, take markers on MIDI items act as pseudo-stretch markers
+midi_sm_state  = {}                -- [tostring(take)] = {item, take, item_pos, markers=[{orig_s, last_s},...]}
+
+-- MIDI Take Marker move slider (moves nearest rated take marker, no note stretch)
+midi_tm_move_value = 0
+midi_tm_move_dragging = false
+midi_tm_move_drag_start_x = 0
+midi_tm_move_drag_start_val = 0
+midi_tm_move_item = nil
+midi_tm_move_take = nil
+midi_tm_move_mi = -1
+midi_tm_move_orig_s = 0
+midi_tm_move_undo_open = false
+
+-- MIDI Take Marker stretch slider (moves nearest rated take marker AND stretches notes)
+midi_tm_stretch_value = 0
+midi_tm_stretch_dragging = false
+midi_tm_stretch_drag_start_x = 0
+midi_tm_stretch_drag_start_val = 0
+midi_tm_stretch_item = nil
+midi_tm_stretch_take = nil
+midi_tm_stretch_mi = -1
+midi_tm_stretch_orig_s = 0
+midi_tm_stretch_last_s = 0      -- last applied srcpos (kept for compatibility, not used in absolute mode)
+midi_tm_stretch_undo_open = false
+-- Absolute-stretch cache: populated at drag start, cleared on release
+midi_tm_stretch_note_cache = {}  -- kept for compatibility (no longer used in warp)
+midi_tm_stretch_prev_ppq  = 0
+midi_tm_stretch_next_ppq  = 0
+midi_tm_stretch_orig_ppq  = 0
+
+-- MIDI TM snap + beat-based slider globals
+midi_tm_snap_enabled = false            -- when true, sliders snap to project grid
+midi_tm_autosnap_note_enabled = false   -- when true, auto-snap TM to closest note edge after every move
+midi_tm_snap_to_note_confirmed_until = 0 -- timer for "Snapped!" button confirmation
+midi_tm_move_beat_dur    = 0.5          -- beat duration at drag start (±2 beats range)
+midi_tm_stretch_beat_dur = 0.5          -- beat duration for Warp TM slider
+midi_tm_stretch_display_str = "1.00x"   -- rate label shown on Warp TM slider
+midi_tm_reset_confirmed_until = 0       -- timer for "Reset!" button confirmation
+
+-- Insert at Mouse script settings (written to ExtState "konst_InsertAtMouse")
+iam_enable_stretch  = true   -- toggle stretch markers on audio items
+iam_enable_take_tm  = true   -- toggle 1.00x take markers on MIDI items
+iam_enable_tempo    = true   -- toggle tempo markers on ruler / empty arrange
+
+pre_settings_width = nil  -- Window width before entering settings mode
+pre_settings_height = nil -- Window height before entering settings mode
 articulations_in_file = {}  -- Set of articulation names found in the selected file's checked tracks
 
 -- Text selection state
-local text_sel = {
+text_sel = {
     active = false,        -- whether a selection drag is in progress
     element_id = nil,      -- id of the selected text element
     start_char = 0,        -- character index where selection started
@@ -4363,14 +8661,176 @@ local text_sel = {
     full_text = "",        -- original (non-truncated) text for clipboard
     text_x = 0,            -- x position of the text element
 }
-local text_elements_frame = {} -- rebuilt each frame for hit testing
-local file_info_click_pending = false  -- track file info click for drag detection
-local file_info_click_x = 0  -- mouse x when file info was clicked
-local file_info_click_y = 0  -- mouse y when file info was clicked
-local text_sel_mouse_start_x = 0  -- mouse x at selection start
-local text_sel_mouse_start_y = 0  -- mouse y at selection start
-local DRAG_THRESHOLD = 3  -- minimum pixels to distinguish drag from click
+text_elements_frame = {} -- rebuilt each frame for hit testing
+file_info_click_pending = false  -- track file info click for drag detection
+file_info_click_x = 0  -- mouse x when file info was clicked
+file_info_click_y = 0  -- mouse y when file info was clicked
+text_sel_mouse_start_x = 0  -- mouse x at selection start
+text_sel_mouse_start_y = 0  -- mouse y at selection start
+DRAG_THRESHOLD = 3  -- minimum pixels to distinguish drag from click
 pending_tooltip = nil  -- tooltip text to draw at end of frame (set during draw functions)
+
+-- ============================================================================
+-- IMPORT PROGRESS BAR
+-- ============================================================================
+import_progress = {
+    active = false,       -- whether import is in progress
+    pct = 0,              -- 0.0 to 1.0
+    status = "",          -- current status text
+    start_time = 0,       -- reaper.time_precise() at start
+    end_time = 0,         -- reaper.time_precise() when done
+    log = {},             -- log messages collected during import
+    done = false,         -- import finished, showing results
+}
+
+function draw_import_progress()
+    if not import_progress.active then return end
+    -- Full-window dim
+    gfx.set(0, 0, 0, 0.7)
+    gfx.rect(0, 0, gfx.w, gfx.h, 1)
+
+    local pad = 16
+    local card_w = math.max(300, math.floor(gfx.w * 0.7))
+
+    -- Compute card height based on state
+    local card_h
+    if import_progress.done then
+        local log_lines = math.min(#import_progress.log, 8)
+        local extra = (#import_progress.log > 8) and 1 or 0
+        -- title + spacing + log lines + overflow + spacing + button row
+        card_h = pad + gfx.texth + 10 + (log_lines + extra) * gfx.texth + 12 + 26 + pad
+        card_h = math.max(card_h, 120)
+    else
+        card_h = 140
+    end
+
+    local card_x = math.floor((gfx.w - card_w) / 2)
+    local card_y = math.floor((gfx.h - card_h) / 2)
+
+    -- Card background
+    gfx.set(0.13, 0.13, 0.13, 1)
+    gfx.rect(card_x, card_y, card_w, card_h, 1)
+    gfx.set(0.35, 0.35, 0.40, 1)
+    gfx.rect(card_x, card_y, card_w, card_h, 0)
+
+    local inner_w = card_w - pad * 2
+
+    -- Title
+    gfx.set(0.17, 0.45, 0.39, 1)
+    local title = import_progress.done and "Import Complete" or "Importing MusicXML..."
+    local tw = gfx.measurestr(title)
+    gfx.x = card_x + math.floor((card_w - tw) / 2)
+    gfx.y = card_y + pad
+    gfx.drawstr(title)
+
+    if import_progress.done then
+        -- Show log messages
+        gfx.set(0.85, 0.85, 0.85, 1)
+        local log_y = card_y + pad + gfx.texth + 10
+        local max_lines = 8
+        for i = 1, math.min(#import_progress.log, max_lines) do
+            local msg = import_progress.log[i]
+            local disp = msg
+            local msg_w = gfx.measurestr(msg)
+            if msg_w > inner_w then
+                while gfx.measurestr(disp .. "...") > inner_w and #disp > 1 do
+                    disp = disp:sub(1, -2)
+                end
+                disp = disp .. "..."
+            end
+            gfx.x = card_x + pad
+            gfx.y = log_y + (i - 1) * gfx.texth
+            gfx.drawstr(disp)
+        end
+        if #import_progress.log > max_lines then
+            gfx.set(0.5, 0.5, 0.5, 1)
+            gfx.x = card_x + pad
+            gfx.y = log_y + max_lines * gfx.texth
+            gfx.drawstr(string.format("(+%d more)", #import_progress.log - max_lines))
+        end
+
+        -- Elapsed time (frozen at completion)
+        local elapsed = import_progress.end_time - import_progress.start_time
+        gfx.set(0.5, 0.5, 0.5, 1)
+        local time_str = string.format("Completed in %.1fs", elapsed)
+        local time_w = gfx.measurestr(time_str)
+        gfx.x = card_x + card_w - pad - time_w
+        gfx.y = card_y + card_h - pad - gfx.texth
+        gfx.drawstr(time_str)
+
+        -- OK button
+        local btn_w = 80
+        local btn_h = 26
+        local btn_x = card_x + pad
+        local btn_y = card_y + card_h - pad - btn_h
+        local mx, my = gfx.mouse_x, gfx.mouse_y
+        local hov = mx >= btn_x and mx < btn_x + btn_w and my >= btn_y and my < btn_y + btn_h
+        gfx.set(table.unpack(hov and {0.17, 0.45, 0.39, 1} or {0.2, 0.2, 0.2, 1}))
+        gfx.rect(btn_x, btn_y, btn_w, btn_h, 1)
+        gfx.set(0.35, 0.35, 0.40, 1)
+        gfx.rect(btn_x, btn_y, btn_w, btn_h, 0)
+        gfx.set(1, 1, 1, 1)
+        local ok_w = gfx.measurestr("OK")
+        gfx.x = btn_x + math.floor((btn_w - ok_w) / 2)
+        gfx.y = btn_y + math.floor((btn_h - gfx.texth) / 2)
+        gfx.drawstr("OK")
+    else
+        -- Progress bar
+        local bar_w = inner_w
+        local bar_h = 22
+        local bar_x = card_x + pad
+        local bar_y = card_y + pad + gfx.texth + 14
+
+        -- Track
+        gfx.set(0.2, 0.2, 0.22, 1)
+        gfx.rect(bar_x, bar_y, bar_w, bar_h, 1)
+        -- Fill
+        gfx.set(0.17, 0.55, 0.46, 1)
+        gfx.rect(bar_x, bar_y, math.floor(bar_w * import_progress.pct), bar_h, 1)
+        -- Border
+        gfx.set(0.35, 0.35, 0.40, 1)
+        gfx.rect(bar_x, bar_y, bar_w, bar_h, 0)
+
+        -- Percentage centered on bar
+        gfx.set(1, 1, 1, 1)
+        local pct_str = string.format("%d%%", math.floor(import_progress.pct * 100))
+        local pw = gfx.measurestr(pct_str)
+        gfx.x = bar_x + math.floor((bar_w - pw) / 2)
+        gfx.y = bar_y + math.floor((bar_h - gfx.texth) / 2)
+        gfx.drawstr(pct_str)
+
+        -- Status text
+        gfx.set(0.85, 0.85, 0.85, 1)
+        local sw = gfx.measurestr(import_progress.status)
+        gfx.x = bar_x + math.floor((bar_w - sw) / 2)
+        gfx.y = bar_y + bar_h + 8
+        gfx.drawstr(import_progress.status)
+
+        -- Elapsed / ETA
+        local elapsed = reaper.time_precise() - import_progress.start_time
+        local eta = import_progress.pct > 0 and (elapsed / import_progress.pct * (1 - import_progress.pct)) or 0
+        gfx.set(0.5, 0.5, 0.5, 1)
+        local time_str = string.format("Elapsed: %.1fs   Remaining: ~%.1fs", elapsed, eta)
+        local tw2 = gfx.measurestr(time_str)
+        gfx.x = bar_x + math.floor((bar_w - tw2) / 2)
+        gfx.y = bar_y + bar_h + 8 + gfx.texth + 4
+        gfx.drawstr(time_str)
+    end
+end
+
+function update_import_progress(pct, status)
+    import_progress.pct = pct
+    if status then import_progress.status = status end
+    -- Clear entire window then draw overlay so it renders during sync import
+    gfx.set(0.118, 0.118, 0.118, 1)
+    gfx.rect(0, 0, gfx.w, gfx.h, 1)
+    draw_import_progress()
+    gfx.update()
+end
+
+function import_log(msg)
+    table.insert(import_progress.log, msg)
+end
 
 -- ============================================================================
 -- PATH PERSISTENCE FUNCTIONS
@@ -4426,27 +8886,155 @@ function load_path_mode()
     return "last"
 end
 
+-- ============================================================================
+-- AUTO-LOAD BY REGION
+-- ============================================================================
+-- Track the last auto-loaded region name so we don't re-trigger on the same region
+autoload_last_region_name = nil
+-- When auto-load triggers, store the matched region's start position for import
+autoload_region_start_pos = nil
+
+-- Normalize a string for fuzzy matching: lowercase, strip non-alphanumeric, collapse spaces
+function normalize_for_match(s)
+    if not s then return "" end
+    s = s:lower()
+    -- Replace dashes, underscores, dots with spaces
+    s = s:gsub("[%-%_%.]", " ")
+    -- Remove non-alphanumeric except spaces
+    s = s:gsub("[^%w%s]", "")
+    -- Collapse whitespace
+    s = s:gsub("%s+", " ")
+    s = s:match("^%s*(.-)%s*$") or ""
+    return s
+end
+
+-- Find region at the edit cursor position. Returns region name and start position, or nil.
+function get_region_at_cursor()
+    local cursor = reaper.GetCursorPosition()
+    local _, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    for i = 0, num_markers + num_regions - 1 do
+        local _, is_rgn, pos, rgnend, name = reaper.EnumProjectMarkers(i)
+        if is_rgn and cursor >= pos and cursor < rgnend then
+            return name, pos
+        end
+    end
+    return nil, nil
+end
+
+-- Search the import directory for an XML file whose name contains the region name.
+-- Returns the full path of the best match, or nil.
+function find_xml_for_region(region_name)
+    if not region_name or region_name == "" then return nil end
+    local dir = ""
+    if path_mode == "default" and default_import_dir ~= "" then
+        dir = default_import_dir
+    elseif last_import_dir and last_import_dir ~= "" then
+        dir = last_import_dir
+    else
+        dir = load_last_import_path()
+    end
+    if dir == "" then return nil end
+
+    -- Normalize region name for matching
+    local norm_region = normalize_for_match(region_name)
+    if norm_region == "" then return nil end
+
+    -- List XML files in the directory
+    local i = 0
+    local best_path = nil
+    local best_len = math.huge
+    while true do
+        local filename = reaper.EnumerateFiles(dir, i)
+        if not filename then break end
+        i = i + 1
+        if filename:lower():match("%.xml$") then
+            -- Normalize the filename (without extension) for comparison
+            local basename = filename:match("^(.+)%.[^%.]+$") or filename
+            local norm_file = normalize_for_match(basename)
+            -- Check if the normalized file name contains the normalized region name
+            if norm_file:find(norm_region, 1, true) then
+                -- Prefer shorter filenames (closer match) 
+                if #filename < best_len then
+                    best_len = #filename
+                    -- Build full path
+                    local sep = dir:match("[/\\]$") and "" or "/"
+                    best_path = dir .. sep .. filename
+                end
+            end
+        end
+    end
+    return best_path
+end
+
+-- Attempt auto-load if conditions are met. Called from main_loop.
+-- Returns true if a file was auto-loaded.
+function try_autoload_by_region()
+    if not autoload_by_region_enabled then return false end
+
+    local region_name, region_pos = get_region_at_cursor()
+    if not region_name or region_name == "" then
+        autoload_last_region_name = nil
+        autoload_region_start_pos = nil
+        return false
+    end
+
+    -- Don't re-trigger if we already loaded for this region
+    if region_name == autoload_last_region_name then return false end
+
+    local filepath = find_xml_for_region(region_name)
+    if not filepath then return false end
+
+    -- Store the matched region's start position so import uses it directly
+    autoload_region_start_pos = region_pos
+
+    -- Auto-load the file (same logic as drag-and-drop / file dialog)
+    selected_file_path = filepath
+    selected_file_name = get_filename_from_path(filepath)
+    save_last_import_path(filepath)
+    last_import_dir = load_last_import_path()
+    local f = io.open(filepath, "r")
+    if f then
+        local content = f:read("*all")
+        f:close()
+        local track_names = get_tracks_from_xml(content)
+        selected_file_track_count = #track_names
+        track_checkboxes = {}
+        for _, t in ipairs(track_names) do
+            table.insert(track_checkboxes, {name = t.name, gm_name = t.gm_name, checked = true})
+        end
+        import_all_checked = true
+    else
+        selected_file_track_count = 0
+        track_checkboxes = {}
+    end
+    resize_window()
+    if highlight_scan_enabled then scan_articulations_in_xml() end
+    autoload_last_region_name = region_name
+    return true
+end
+
 -- Checkbox items (add your items here)
-local checkboxes_list = {
-    {name = "Import tempo and time signature", checked = true, show_in_menu = true},
-    {name = "Import segments as regions", checked = true, show_in_menu = true},
-    {name = "Import MIDI program banks", checked = true, show_in_menu = true},
-    {name = "Import key signatures", checked = true, show_in_menu = true},
-    {name = "Insert items on new tracks", checked = false, show_in_menu = true},
-    {name = "Insert items on existing tracks", checked = false, show_in_menu = true},
-    {name = "Insert items on tracks by name", checked = true, show_in_menu = true},
+checkboxes_list = {
+    {name = "Import tempo and time signature", checked = true, show_in_menu = true, tip = "Import tempo markers and time signatures\nfrom the MusicXML file into the project."},
+    {name = "Import segments as regions", checked = true, show_in_menu = true, tip = "Import rehearsal marks (segments) from the\nMusicXML file as REAPER project regions."},
+    {name = "Import MIDI program banks", checked = true, show_in_menu = true, tip = "Import MIDI bank/program change info\nfrom the MusicXML file into MIDI items."},
+    {name = "Import key signatures", checked = true, show_in_menu = true, tip = "Import key signatures from the MusicXML file.\nAlso writes a KSIG notation event."},
+    {name = "Insert items on new tracks", checked = false, show_in_menu = true, tip = "Create new tracks for each imported\npart, even if matching tracks exist."},
+    {name = "Insert items on existing tracks", checked = false, show_in_menu = true, tip = "Place imported MIDI items on existing\ntracks that match the part name."},
+    {name = "Insert items on tracks by name", checked = true, show_in_menu = true, tip = "Match imported parts to existing tracks\nby comparing part names to track names."},
+    {name = "Align drum MIDI to transients", checked = false, show_in_menu = false, tip = "Nudge individual drum notes to the nearest\naudio transient during import."},
 }
 
 -- Save/Load import checkbox settings (checked state + show_in_menu flags)
 EXTSTATE_IMPORT_KEY = "import_settings"
-local function save_import_settings()
+function save_import_settings()
     local parts = {}
     for _, cb in ipairs(checkboxes_list) do
         table.insert(parts, (cb.checked and "1" or "0") .. "," .. (cb.show_in_menu and "1" or "0"))
     end
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_IMPORT_KEY, table.concat(parts, ";"), true)
 end
-local function load_import_settings()
+function load_import_settings()
     local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_IMPORT_KEY)
     if not saved or saved == "" then return end
     -- Count saved entries; if mismatch with current list, discard stale settings
@@ -4472,13 +9060,13 @@ load_import_settings()
 EXTSTATE_WINPOS_KEY = "window_position"
 EXTSTATE_WINPOS_MODE_KEY = "window_position_mode"
 window_position_mode = "mouse"  -- "last" or "mouse"
-local function save_window_position()
+function save_window_position()
     local dock, wx, wy = gfx.dock(-1, 0, 0, 0, 0)
     if dock == 0 then  -- only save when not docked
         reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_WINPOS_KEY, tostring(math.floor(wx)) .. "," .. tostring(math.floor(wy)), true)
     end
 end
-local function load_window_position()
+function load_window_position()
     local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_WINPOS_KEY)
     if not saved or saved == "" then return nil, nil end
     local sx, sy = saved:match("(%-?%d+),(%-?%d+)")
@@ -4488,7 +9076,7 @@ end
 function save_window_position_mode(mode)
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_WINPOS_MODE_KEY, mode, true)
 end
-local function load_window_position_mode()
+function load_window_position_mode()
     local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_WINPOS_MODE_KEY)
     if saved == "last" or saved == "mouse" then return saved end
     return "mouse"
@@ -4502,11 +9090,11 @@ EXTSTATE_WINSIZE_SETTINGS_KEY = "window_size_settings"
 function save_remember_window_size_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_WINSIZE_KEY, remember_window_size and "1" or "0", true)
 end
-local function load_remember_window_size_setting()
+function load_remember_window_size_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_WINSIZE_KEY)
     if val == "1" then remember_window_size = true end
 end
-local function save_window_size(tab)
+function save_window_size(tab)
     if remember_window_size then
         local dock = gfx.dock(-1, 0, 0, 0, 0)
         if dock == 0 then
@@ -4515,7 +9103,7 @@ local function save_window_size(tab)
         end
     end
 end
-local function load_window_size(tab)
+function load_window_size(tab)
     local key = (tab == "settings") and EXTSTATE_WINSIZE_SETTINGS_KEY or EXTSTATE_WINSIZE_MAIN_KEY
     local saved = reaper.GetExtState(EXTSTATE_SECTION, key)
     if not saved or saved == "" then return nil, nil end
@@ -4527,10 +9115,10 @@ load_remember_window_size_setting()
 
 -- Save/Load auto-focus setting
 EXTSTATE_AUTOFOCUS_KEY = "auto_focus"
-local function save_auto_focus_setting()
+function save_auto_focus_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_AUTOFOCUS_KEY, auto_focus_enabled and "1" or "0", true)
 end
-local function load_auto_focus_setting()
+function load_auto_focus_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_AUTOFOCUS_KEY)
     if val == "0" then auto_focus_enabled = false end
 end
@@ -4538,7 +9126,7 @@ load_auto_focus_setting()
 
 -- Save/Load/Apply stay-on-top setting
 EXTSTATE_STAYONTOP_KEY = "stay_on_top"
-local function apply_stay_on_top()
+function apply_stay_on_top()
     if window_script then
         if stay_on_top_enabled then
             reaper.JS_Window_SetZOrder(window_script, "TOPMOST")
@@ -4547,10 +9135,10 @@ local function apply_stay_on_top()
         end
     end
 end
-local function save_stay_on_top_setting()
+function save_stay_on_top_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_STAYONTOP_KEY, stay_on_top_enabled and "1" or "0", true)
 end
-local function load_stay_on_top_setting()
+function load_stay_on_top_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_STAYONTOP_KEY)
     if val == "1" then stay_on_top_enabled = true end
 end
@@ -4559,11 +9147,11 @@ load_stay_on_top_setting()
 -- Save/Load export open-with setting
 EXTSTATE_OPENWITH_KEY = "export_open_with"
 EXTSTATE_OPENWITH_PATH_KEY = "export_open_with_path"
-local function save_open_with_setting()
+function save_open_with_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_OPENWITH_KEY, export_open_with_enabled and "1" or "0", true)
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_OPENWITH_PATH_KEY, export_open_with_path, true)
 end
-local function load_open_with_setting()
+function load_open_with_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_OPENWITH_KEY)
     if val == "1" then export_open_with_enabled = true end
     local path = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_OPENWITH_PATH_KEY)
@@ -4573,10 +9161,10 @@ load_open_with_setting()
 
 -- Save/Load export open-folder setting
 EXTSTATE_OPENFOLDER_KEY = "export_open_folder"
-local function save_open_folder_setting()
+function save_open_folder_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_OPENFOLDER_KEY, export_open_folder_enabled and "1" or "0", true)
 end
-local function load_open_folder_setting()
+function load_open_folder_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_OPENFOLDER_KEY)
     if val == "1" then export_open_folder_enabled = true end
 end
@@ -4587,14 +9175,14 @@ EXTSTATE_KEYSIG_KEY = "export_key_sig"
 function save_key_sig_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEYSIG_KEY, export_key_sig_enabled and "1" or "0", true)
 end
-local function load_key_sig_setting()
+function load_key_sig_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_KEYSIG_KEY)
     if val == "0" then export_key_sig_enabled = false end
 end
 load_key_sig_setting()
 
 -- Custom GUI message box state (replaces reaper.ShowMessageBox to avoid z-order issues)
-local gui_msgbox = {
+gui_msgbox = {
     active = false,
     title = "",
     message = "",
@@ -4733,10 +9321,10 @@ end
 
 -- Save/Load font setting
 EXTSTATE_FONT_KEY = "font_name"
-local function save_font_setting()
+function save_font_setting()
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_FONT_KEY, font_list[current_font_index], true)
 end
-local function load_font_setting()
+function load_font_setting()
     local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_FONT_KEY)
     if val and val ~= "" then
         for i, name in ipairs(font_list) do
@@ -4748,11 +9336,11 @@ load_font_setting()
 
 -- Save/Load docker settings
 EXTSTATE_DOCKER_KEY = "docker_settings"
-local function save_docker_settings()
+function save_docker_settings()
     local val = (docker_enabled and "1" or "0") .. "," .. tostring(docker_position)
     reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_DOCKER_KEY, val, true)
 end
-local function load_docker_settings()
+function load_docker_settings()
     local saved = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_DOCKER_KEY)
     if not saved or saved == "" then return end
     local en, pos = saved:match("([01]),(%d+)")
@@ -4762,17 +9350,17 @@ end
 load_docker_settings()
 
 -- Dimensions
-local header_height = 50  -- header area height
-local file_info_height = 60  -- file info section height
-local checkbox_size = gui.settings.font_size
-local checkbox_row_height = gui.settings.font_size*2  -- add some vertical spacing between rows
-local horizontal_margin = 32  -- left/right margin
-local vertical_margin = 20  -- top/bottom margin
-local button_height_area = 50  -- space for import button
+header_height = 50  -- header area height
+file_info_height = 60  -- file info section height
+checkbox_size = gui.settings.font_size
+checkbox_row_height = gui.settings.font_size*2  -- add some vertical spacing between rows
+horizontal_margin = 32  -- left/right margin
+vertical_margin = 20  -- top/bottom margin
+button_height_area = 50  -- space for import button
 
 -- Calculate max label width for aligned checkboxes
 gfx.setfont(1, font_list[current_font_index] .. "|Arial|Helvetica", gui.settings.font_size)
-local max_label_width = 0
+max_label_width = 0
 for i, cb in ipairs(checkboxes_list) do
     local label_width = gfx.measurestr(cb.name)
     if label_width > max_label_width then
@@ -4781,10 +9369,10 @@ for i, cb in ipairs(checkboxes_list) do
 end
 
 -- Column widths for settings layout
-local SYM_BOX_WIDTH = 100      -- symbol text input box width
-local TYPE_BTN_WIDTH = 80      -- type selector button width
-local REPL_COL_WIDTH = 100     -- replace fret column width (wide enough for header label)
-local COL_SPACING = 8          -- spacing between columns
+SYM_BOX_WIDTH = 100      -- symbol text input box width
+TYPE_BTN_WIDTH = 80      -- type selector button width
+REPL_COL_WIDTH = 100     -- replace fret column width (wide enough for header label)
+COL_SPACING = 8          -- spacing between columns
 
 -- Calculate window dimensions dynamically (vertical layout)
 local min_btn_area_width = 110 * 4 + 10 * 3 + horizontal_margin * 2  -- 4 buttons + margins
@@ -4806,21 +9394,42 @@ local initial_visible_extra = #initial_extras
 gui.height = header_height + vertical_margin + ((initial_visible_import + initial_visible_extra) * checkbox_row_height) + vertical_margin + file_info_height + vertical_margin + button_height_area
 
 -- Global state
-local last_mouse_cap = 0
-local import_btn_hovered = false
-local cancel_btn_hovered = false
-local is_dragging = false
-local drag_offset_x = 0
-local drag_offset_y = 0
-local window_script = nil
+last_mouse_cap = 0
+import_btn_hovered = false
+cancel_btn_hovered = false
+remap_btn_hovered = false
+nudge_btn_hovered = false
+is_dragging = false
+drag_offset_x = 0
+drag_offset_y = 0
+window_script = nil
+
+-- Track drag-to-arrange state
+track_drag = {
+    active = false,         -- whether a track drag is in progress
+    track_index = nil,       -- index into track_checkboxes being dragged
+    start_x = 0,             -- mouse x at drag start
+    start_y = 0,             -- mouse y at drag start
+    confirmed = false,       -- true once mouse moved past threshold
+    last_click_index = nil,  -- track index of last label click (for double-click)
+    last_click_time = 0,     -- os.clock() of last label click
+}
+
+-- Reset track drag state
+function reset_track_drag()
+    track_drag.active = false
+    track_drag.track_index = nil
+    track_drag.confirmed = false
+end
 
 -- Resize handle state (bundled to reduce top-level local count)
-local RS = { active = false, sx = 0, sy = 0, sw = 0, sh = 0, HANDLE = 14, MIN_W = 300, MIN_H = 200 }
+RS = { active = false, sx = 0, sy = 0, sw = 0, sh = 0, HANDLE = 14, MIN_W = 300, MIN_H = 200 }
 
 -- Initialize window
 local mouse_x, mouse_y = reaper.GetMousePosition()
-local init_x, init_y
-local launch_from_fretboard = false
+init_x = nil
+init_y = nil
+launch_from_fretboard = false
 
 -- Check if Fretboard sent a launch hint (format: "right_x,top_y,fb_width,fb_height")
 local hint = reaper.GetExtState("konst_window_manager", "launch_hint")
@@ -4894,9 +9503,13 @@ function get_tracks_from_xml(xml_content)
         local part_name = score_part_block:match("<part%-name>([^<]*)</part%-name>")
         if part_name and part_name ~= "" then
             local gm_name = nil
+            local midi_channel = score_part_block:match("<midi%-channel>(%d+)</midi%-channel>")
             local midi_program = score_part_block:match("<midi%-program>(%d+)</midi%-program>")
-            if midi_program then
-                local prog = tonumber(midi_program) - 1  -- MusicXML is 1-based, GM table is 0-based
+            local has_unpitched = score_part_block:find("<midi%-unpitched>") ~= nil
+            if (midi_channel and tonumber(midi_channel) == 10) or has_unpitched then
+                gm_name = "Drums"
+            elseif midi_program then
+                local prog = tonumber(midi_program) - 1
                 gm_name = gm_program_to_name[prog]
             end
             table.insert(tracks, {name = part_name, gm_name = gm_name})
@@ -5069,9 +9682,9 @@ end
 -- Scan MIDI text events in selected items / active editor for articulations
 -- ============================================================================
 -- Build a list of { pattern, art_name } for reverse-matching text events
-local midi_art_patterns  -- lazily built
+midi_art_patterns = nil  -- lazily built
 
-local function build_midi_art_patterns()
+function build_midi_art_patterns()
     if midi_art_patterns then return end
     midi_art_patterns = {}
     for _, art_name in ipairs(articulation_names_ordered) do
@@ -5102,7 +9715,7 @@ local function build_midi_art_patterns()
     end
 end
 
-local function match_text_to_articulation(text)
+function match_text_to_articulation(text)
     build_midi_art_patterns()
     for _, entry in ipairs(midi_art_patterns) do
         if text:match(entry.pattern) then
@@ -5113,7 +9726,7 @@ local function match_text_to_articulation(text)
 end
 
 -- Gather MIDI takes using the same fallback chain as the articulation write handler
-local function gather_midi_takes_for_scan()
+function gather_midi_takes_for_scan()
     local takes = {}
     local seen = {}
     local function add_take(take)
@@ -5198,9 +9811,9 @@ function scan_articulations_in_midi()
 end
 
 -- Track last known selection state so we only re-scan when selection changes
-local last_midi_scan_sel_hash = ""
+last_midi_scan_sel_hash = ""
 
-local function compute_selection_hash()
+function compute_selection_hash()
     local parts = {}
     -- Selected items
     local num_items = reaper.CountSelectedMediaItems(0)
@@ -5601,20 +10214,69 @@ function draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released,
     return hovered or RS.active
 end
 
--- Forward declarations for main view editing state (used in draw_checkboxes_list, defined later)
-local main_sym_edit_active
-local main_sym_edit_index
-local main_sym_edit_text
-local main_sym_edit_cursor
-local main_defpath_edit_active
-local main_defpath_edit_text
-local main_defpath_edit_cursor
-local main_defpath_edit_sel
+-- Forward declarations for main view editing state (globals, used in draw_checkboxes_list)
+main_sym_edit_active = nil
+main_sym_edit_index = nil
+main_sym_edit_text = nil
+main_sym_edit_cursor = nil
+main_defpath_edit_active = nil
+main_defpath_edit_text = nil
+main_defpath_edit_cursor = nil
+main_defpath_edit_sel = nil
 
 -- Draw all checkboxes from list (filtered by show_in_menu) plus extra settings
 function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox_h, cb_size, max_width, colors, scroll_offset, max_vis_rows)
     scroll_offset = scroll_offset or 0
     local visible_idx = 0
+    -- Draw "SETTINGS" fold header as the first row
+    do
+        local scrolled = visible_idx - scroll_offset
+        local hdr_visible = not max_vis_rows or (scrolled >= 0 and scrolled < max_vis_rows)
+        if hdr_visible then
+            local hdr_y = header_h + v_margin + scrolled * checkbox_h
+            local hdr_h = cb_size
+            local tri_size = math.floor(gfx.texth * 0.4)
+            local tri_cy = hdr_y + math.floor(hdr_h / 2)
+            local hdr_hovered = (gfx.mouse_x >= h_margin and gfx.mouse_x < gfx.w - h_margin and
+                                 gfx.mouse_y >= hdr_y and gfx.mouse_y < hdr_y + hdr_h)
+            if hdr_hovered then
+                gfx.set(0.17, 0.45, 0.39, 1)
+            else
+                gfx.set(0.45, 0.45, 0.45, 1)
+            end
+            -- Triangle
+            if main_settings_folded then
+                local tx = h_margin
+                local ty = tri_cy - tri_size
+                for row = 0, tri_size * 2 do
+                    local w = math.floor(tri_size * (1 - math.abs(row - tri_size) / tri_size))
+                    if w > 0 then gfx.line(tx, ty + row, tx + w, ty + row) end
+                end
+            else
+                local tx = h_margin
+                local ty = tri_cy - math.floor(tri_size * 0.5)
+                for row = 0, tri_size do
+                    local half_w = tri_size - row
+                    if half_w >= 0 then
+                        local cx = tx + tri_size
+                        gfx.line(cx - half_w, ty + row, cx + half_w, ty + row)
+                    end
+                end
+            end
+            -- Label
+            local label_x = h_margin + tri_size * 2 + 6
+            local text_y = hdr_y + (hdr_h - gfx.texth) / 2
+            gfx.x = label_x
+            gfx.y = text_y
+            gfx.drawstr("SETTINGS")
+            local lw = gfx.measurestr("SETTINGS")
+            local line_y = hdr_y + math.floor(hdr_h / 2)
+            gfx.set(0.3, 0.3, 0.3, 1)
+            gfx.line(label_x + lw + 8, line_y, gfx.w - h_margin, line_y)
+        end
+        visible_idx = visible_idx + 1
+    end
+    if not main_settings_folded then
     for i, cb in ipairs(checkboxes) do
         if cb.show_in_menu ~= false then
             local scrolled = visible_idx - scroll_offset
@@ -5624,6 +10286,13 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
                 local cb_x = gfx.w - h_margin - cb_size
                 
                 draw_checkbox(cb_x, cb_y, cb_size, label_x, cb.name, cb.checked, colors, nil, "option_" .. i)
+                -- Tooltip for import checkbox row
+                if cb.tip and not pending_tooltip then
+                    if gfx.mouse_x >= h_margin and gfx.mouse_x < gfx.w - h_margin
+                       and gfx.mouse_y >= cb_y and gfx.mouse_y < cb_y + cb_size then
+                        pending_tooltip = cb.tip
+                    end
+                end
             end
             visible_idx = visible_idx + 1
         end
@@ -5803,7 +10472,7 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
             local text_y = cb_y + (cb_size - gfx.texth) / 2
             local ikey = item.key
 
-            if ikey == "docker" or ikey == "font" or ikey == "midibank" then
+            if ikey == "docker" or ikey == "font" or ikey == "midibank" or ikey == "importpos" or ikey == "timebase" or ikey == "alignstem" or ikey == "onsetitem" or ikey == "tempofreq" or ikey == "detectmethod" or ikey == "detectitem" then
                 -- Label
                 gfx.set(table.unpack(colors.TEXT))
                 gfx.x = label_x
@@ -5813,7 +10482,7 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
                 local lbl_w = gfx.measurestr(item.label .. "  ")
                 local btn_x = label_x + lbl_w
                 local btn_w
-                if ikey == "font" then
+                if ikey == "font" or ikey == "importpos" or ikey == "timebase" or ikey == "alignstem" or ikey == "onsetitem" or ikey == "tempofreq" or ikey == "detectmethod" or ikey == "detectitem" then
                     btn_w = gfx.w - h_margin - btn_x
                 else
                     btn_w = cb_x_pos - COL_SPACING - btn_x
@@ -5825,6 +10494,38 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
                     btn_label = docker_positions[docker_position] or "Bottom"
                 elseif ikey == "font" then
                     btn_label = font_list[current_font_index] or "Outfit"
+                elseif ikey == "importpos" then
+                    btn_label = import_position_options[import_position_index] or "Start of Project"
+                elseif ikey == "timebase" then
+                    btn_label = import_timebase_options[import_timebase_index] or "Project default"
+                elseif ikey == "alignstem" then
+                    if align_stem_index == 0 then
+                        btn_label = "Auto"
+                    elseif align_stem_items[align_stem_index] then
+                        btn_label = align_stem_items[align_stem_index].name
+                    else
+                        btn_label = "Auto"
+                    end
+                elseif ikey == "onsetitem" then
+                    if onset_item_index == 0 then
+                        btn_label = "Auto"
+                    elseif onset_item_items[onset_item_index] then
+                        btn_label = onset_item_items[onset_item_index].name
+                    else
+                        btn_label = "Auto"
+                    end
+                elseif ikey == "tempofreq" then
+                    btn_label = tempo_map_freq_options[tempo_map_freq_index] or "Off"
+                elseif ikey == "detectmethod" then
+                    btn_label = tempo_detect_method_options[tempo_detect_method_index] or "Lua"
+                elseif ikey == "detectitem" then
+                    if detect_tempo_item_index <= 0 then
+                        btn_label = "Selected Item"
+                    elseif detect_tempo_item_items[detect_tempo_item_index] then
+                        btn_label = detect_tempo_item_items[detect_tempo_item_index].name
+                    else
+                        btn_label = "Selected Item"
+                    end
                 elseif ikey == "midibank" then
                     btn_label = "—"
                     local num_sel = reaper.CountSelectedMediaItems(0)
@@ -5878,8 +10579,8 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
                 gfx.x = btn_x + (btn_w - disp_w) / 2
                 gfx.y = text_y
                 gfx.drawstr(disp)
-                -- Draw checkbox (for docker/midibank, not for font)
-                if ikey ~= "font" then
+                -- Draw checkbox (for docker/midibank, not for font/importpos)
+                if ikey ~= "font" and ikey ~= "importpos" and ikey ~= "timebase" and ikey ~= "alignstem" and ikey ~= "onsetitem" and ikey ~= "tempofreq" and ikey ~= "detectmethod" then
                     local checked = get_extra_setting_checked(ikey)
                     draw_checkbox(cb_x_pos, cb_y, cb_size, cb_x_pos, "", checked, colors, 0, nil)
                 end
@@ -5971,6 +10672,7 @@ function draw_checkboxes_list(checkboxes, header_h, h_margin, v_margin, checkbox
         end
         visible_idx = visible_idx + 1
     end
+    end -- end if not main_settings_folded
 end
 
 -- ============================================================================
@@ -6015,7 +10717,7 @@ main_defpath_edit_sel = -1
 -- ============================================================================
 -- CUSTOM DARK MENU
 -- ============================================================================
-local dark_menu = {
+dark_menu = {
     active = false,         -- whether the menu is currently shown
     items = {},             -- all parsed items (flat)
     parent_items = {},      -- items shown in parent menu (headers if has_groups, all otherwise)
@@ -6045,7 +10747,7 @@ DARK_MENU_PADDING = 6
 DARK_MENU_MAX_VISIBLE = 20
 
 -- Parse a gfx.showmenu-format string into dark_menu.items
-local function dark_menu_parse(menu_str)
+function dark_menu_parse(menu_str)
     local items = {}
     local parts = {}
     local i = 1
@@ -6093,7 +10795,7 @@ local function dark_menu_parse(menu_str)
 end
 
 -- Get children of a header group
-local function dark_menu_get_children(header_label)
+function dark_menu_get_children(header_label)
     local children = {}
     for _, item in ipairs(dark_menu.items) do
         if not item.is_header and item.group == header_label then
@@ -6104,7 +10806,7 @@ local function dark_menu_get_children(header_label)
 end
 
 -- Close only the submenu
-local function dark_menu_close_submenu()
+function dark_menu_close_submenu()
     local s = dark_menu.submenu
     s.active = false
     s.header_label = nil
@@ -6114,7 +10816,7 @@ local function dark_menu_close_submenu()
 end
 
 -- Open a submenu for a given parent header index
-local function dark_menu_open_submenu(header_idx)
+function dark_menu_open_submenu(header_idx)
     local m = dark_menu
     local header = m.parent_items[header_idx]
     local children = dark_menu_get_children(header.label)
@@ -6165,7 +10867,7 @@ local function dark_menu_open_submenu(header_idx)
 end
 
 -- Open the dark menu at position (x, y) with the given menu_str and callback
-local function open_dark_menu(menu_str, x, y, callback)
+function open_dark_menu(menu_str, x, y, callback)
     local items = dark_menu_parse(menu_str)
     local has_groups = false
     for _, item in ipairs(items) do
@@ -6226,7 +10928,7 @@ local function open_dark_menu(menu_str, x, y, callback)
 end
 
 -- Close the dark menu completely
-local function close_dark_menu()
+function close_dark_menu()
     dark_menu.active = false
     dark_menu.items = {}
     dark_menu.parent_items = {}
@@ -6236,7 +10938,7 @@ local function close_dark_menu()
 end
 
 -- Open a right-click dock/undock context menu on the header
-local function open_header_dock_menu(mx, my)
+function open_header_dock_menu(mx, my)
     local cur_dock = gfx.dock(-1)
     local is_docked = (cur_dock & 1) ~= 0
     local menu_str
@@ -6272,7 +10974,7 @@ local function open_header_dock_menu(mx, my)
 end
 
 -- Helper: draw a single menu panel (background, border, items, scroll arrows)
-local function dark_menu_draw_panel(px, py, pw, p_items, p_visible, p_scroll, p_hovered, is_parent)
+function dark_menu_draw_panel(px, py, pw, p_items, p_visible, p_scroll, p_hovered, is_parent)
     local item_h = DARK_MENU_ITEM_HEIGHT
     local total = #p_items
     local menu_h = p_visible * item_h + 2
@@ -6356,7 +11058,7 @@ local function dark_menu_draw_panel(px, py, pw, p_items, p_visible, p_scroll, p_
 end
 
 -- Draw the dark menu and handle input. Returns true if menu consumed the input.
-local function draw_and_handle_dark_menu(mouse_x, mouse_y, mouse_clicked, mouse_released, char_input)
+function draw_and_handle_dark_menu(mouse_x, mouse_y, mouse_clicked, mouse_released, char_input)
     if not dark_menu.active then return false end
 
     local m = dark_menu
@@ -6608,47 +11310,129 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     -- Layout: compute virtual positions (before scroll)
     local vy = content_top
 
+    -- Helper: advance vy or return offscreen if folded
+    local function next_row(folded)
+        if folded then return -9999 end
+        local y = vy; vy = vy + checkbox_row_height; return y
+    end
+
     -- GENERAL section
     local general_hdr_y = vy; vy = vy + section_hdr_h
-    local autofocus_row_y = vy; vy = vy + checkbox_row_height
-    local stayontop_row_y = vy; vy = vy + checkbox_row_height
-    local font_row_y = vy; vy = vy + checkbox_row_height
-    local docker_row_y = vy; vy = vy + checkbox_row_height
-    local winpos_last_row_y = vy; vy = vy + checkbox_row_height
-    local winpos_mouse_row_y = vy; vy = vy + checkbox_row_height
-    local winsize_row_y = vy; vy = vy + checkbox_row_height
-    local defpath_row_y = vy; vy = vy + checkbox_row_height
-    local lastpath_row_y = vy; vy = vy + checkbox_row_height
+    local gf = settings_fold.general
+    local autofocus_row_y = next_row(gf)
+    local stayontop_row_y = next_row(gf)
+    local font_row_y = next_row(gf)
+    local docker_row_y = next_row(gf)
+    local winpos_last_row_y = next_row(gf)
+    local winpos_mouse_row_y = next_row(gf)
+    local winsize_row_y = next_row(gf)
+    local defpath_row_y = next_row(gf)
+    local lastpath_row_y = next_row(gf)
+    local tips_row_y = next_row(gf)
 
     -- EXPORT section
     local export_hdr_y = vy; vy = vy + section_hdr_h
-    local expreg_row_y = vy; vy = vy + checkbox_row_height
-    local midibank_row_y = vy; vy = vy + checkbox_row_height
-    local keysig_row_y = vy; vy = vy + checkbox_row_height
-    local openwith_row_y = vy; vy = vy + checkbox_row_height
-    local openfolder_row_y = vy; vy = vy + checkbox_row_height
+    local ef = settings_fold.export
+    local expreg_row_y = next_row(ef)
+    local midibank_row_y = next_row(ef)
+    local keysig_row_y = next_row(ef)
+    local openwith_row_y = next_row(ef)
+    local openfolder_row_y = next_row(ef)
 
     -- IMPORT section
     local import_hdr_y = vy; vy = vy + section_hdr_h
+    local imf = settings_fold.import
     local import_row_y = {}
     for i = 1, #checkboxes_list do
-        import_row_y[i] = vy
-        vy = vy + checkbox_row_height
+        import_row_y[i] = next_row(imf)
     end
-    local gmname_row_y = vy; vy = vy + checkbox_row_height
+    local gmname_row_y = next_row(imf)
+    local autoloadrgn_row_y = next_row(imf)
+    local timebase_row_y = next_row(imf)
+    local alignstem_row_y = next_row(imf)
+    local importpos_row_y = next_row(imf)
+    local onsetitem_row_y = next_row(imf)
+    local imdup = {}
+    imdup.tempofreq    = next_row(imf)
+    imdup.tempotimesig = next_row(imf)
+    imdup.detectmethod = next_row(imf)
+
+    -- TRANSIENTS section
+    local transients_hdr_y = vy; vy = vy + section_hdr_h
+    local trf = settings_fold.transients
+    local stretchmarkers_row_y = next_row(trf)
+    local threshold_row_y = next_row(trf)
+    local sensitivity_row_y = next_row(trf)
+    local retrig_row_y = next_row(trf)
+    local offset_row_y = next_row(trf)
+    local del_sm_row_y = next_row(trf)
+    local sm_nudge_row_y = next_row(trf)
+    local sm_snap_row_y = next_row(trf)
+    -- Big Detect Transients button (file_info_height tall), last in section
+    local detect_transients_row_y
+    if trf then detect_transients_row_y = -9999 else detect_transients_row_y = vy; vy = vy + file_info_height end
+
+    -- TEMPO MAP section
+    local tempomap_hdr_y = vy; vy = vy + section_hdr_h
+    local tmf = settings_fold.tempomap
+    local tempofreq_row_y = next_row(tmf)
+    local tempotimesig_row_y = next_row(tmf)
+    local detectmethod_row_y = next_row(tmf)
+    local detectitem_row_y = next_row(tmf)
+    local useexisting_row_y = next_row(tmf)
+    local remap_row_y = next_row(tmf)
+    local del_tempo_row_y = next_row(tmf)
+    local tempo_nudge_row_y = next_row(tmf)
+    local tempo_snap_row_y = next_row(tmf)
+    -- Big Detect Tempo button (file_info_height tall), last in section
+    local detecttempo_row_y
+    if tmf then detecttempo_row_y = -9999 else detecttempo_row_y = vy; vy = vy + file_info_height end
+
+    -- MIDI TOOLS section
+    local miditools_hdr_y = vy; vy = vy + section_hdr_h
+    local mtf = settings_fold.miditools
+    local midi_sm_row_y       = next_row(mtf)
+    local midi_tm_insert_row_y = next_row(mtf)   -- Insert TM at cursor button
+    local midi_tm_move_row_y   = next_row(mtf)   -- Move take marker slider
+    local midi_tm_stretch_row_y = next_row(mtf)  -- Move + stretch notes slider
+    local midi_tm_snap_row_y      = next_row(mtf)  -- TM Grid Snap toggle
+    local midi_tm_snap_note_row_y = next_row(mtf)  -- Snap TM to Note button
+    local midi_tm_autosnap_row_y  = next_row(mtf)  -- Auto-snap TM to note edge checkbox
+    local midi_tm_reset_row_y     = next_row(mtf)  -- Reset TM button
+    local nudge_row_y = next_row(mtf)            -- Nudge to Transients button
+
+    -- INSERT AT MOUSE section
+    local iam_hdr_y = vy; vy = vy + section_hdr_h
+    local iamf = settings_fold.insertmouse
+    local iam_stretch_row_y  = next_row(iamf)
+    local iam_take_tm_row_y  = next_row(iamf)
+    local iam_tempo_row_y    = next_row(iamf)
 
     -- ARTICULATION section
     local art_hdr_y = vy; vy = vy + section_hdr_h
-    local hlscan_row_y = vy; vy = vy + checkbox_row_height
-    local fret_row_y = vy; vy = vy + checkbox_row_height
-    local span_row_y = vy; vy = vy + checkbox_row_height
-    local separator_y = vy
+    local af = settings_fold.articulation
+    local hlscan_row_y = next_row(af)
+    local fret_row_y = next_row(af)
+    local span_row_y = next_row(af)
+    local separator_y = af and -9999 or vy
     local col_header_h = math.floor(gfx.texth) + 4
-    local col_header_y = separator_y + 4
-    vy = separator_y + 2 + col_header_h + 2
-    local list_top = vy
+    local col_header_y = af and -9999 or (separator_y + 4)
+    if not af then vy = separator_y + 2 + col_header_h + 2 end
+    local list_top = af and -9999 or vy
     local total_items = #articulation_names_ordered
-    vy = vy + total_items * checkbox_row_height
+    if not af then vy = vy + total_items * checkbox_row_height end
+
+    -- ARTICULATION GRID section (Guitar Pro style)
+    local artgrid_hdr_y = vy; vy = vy + section_hdr_h
+    local artgrid_top
+    do -- compute artgrid content height inline to save outer locals
+        local gap, cols = 2, 8
+        local bsz = math.max(16, math.floor((gfx.w - 2 * horizontal_margin - (cols - 1) * gap) / cols))
+        local s1h = 5 * (bsz + gap) - gap
+        local s2h = 7 * (bsz + gap) - gap
+        artgrid_top = settings_fold.artgrid and -9999 or vy
+        if not settings_fold.artgrid then vy = vy + s1h + 6 + s2h + 8 end
+    end
 
     -- Scroll
     local total_content_h = vy - content_top
@@ -6698,6 +11482,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     winsize_row_y = winsize_row_y - scroll_y
     defpath_row_y = defpath_row_y - scroll_y
     lastpath_row_y = lastpath_row_y - scroll_y
+    tips_row_y = tips_row_y - scroll_y
     export_hdr_y = export_hdr_y - scroll_y
     expreg_row_y = expreg_row_y - scroll_y
     midibank_row_y = midibank_row_y - scroll_y
@@ -6709,6 +11494,49 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         import_row_y[i] = import_row_y[i] - scroll_y
     end
     gmname_row_y = gmname_row_y - scroll_y
+    importpos_row_y = importpos_row_y - scroll_y
+    autoloadrgn_row_y = autoloadrgn_row_y - scroll_y
+    timebase_row_y = timebase_row_y - scroll_y
+    transients_hdr_y = transients_hdr_y - scroll_y
+    stretchmarkers_row_y = stretchmarkers_row_y - scroll_y
+    threshold_row_y = threshold_row_y - scroll_y
+    sensitivity_row_y = sensitivity_row_y - scroll_y
+    retrig_row_y = retrig_row_y - scroll_y
+    offset_row_y = offset_row_y - scroll_y
+    del_sm_row_y = del_sm_row_y - scroll_y
+    sm_nudge_row_y = sm_nudge_row_y - scroll_y
+    sm_snap_row_y = sm_snap_row_y - scroll_y
+    detect_transients_row_y = detect_transients_row_y - scroll_y
+    tempomap_hdr_y = tempomap_hdr_y - scroll_y
+    tempofreq_row_y = tempofreq_row_y - scroll_y
+    tempotimesig_row_y = tempotimesig_row_y - scroll_y
+    detectmethod_row_y = detectmethod_row_y - scroll_y
+    detectitem_row_y = detectitem_row_y - scroll_y
+    useexisting_row_y = useexisting_row_y - scroll_y
+    alignstem_row_y = alignstem_row_y - scroll_y
+    onsetitem_row_y = onsetitem_row_y - scroll_y
+    imdup.tempofreq    = imdup.tempofreq    - scroll_y
+    imdup.tempotimesig = imdup.tempotimesig - scroll_y
+    imdup.detectmethod = imdup.detectmethod - scroll_y
+    remap_row_y = remap_row_y - scroll_y
+    del_tempo_row_y = del_tempo_row_y - scroll_y
+    tempo_nudge_row_y = tempo_nudge_row_y - scroll_y
+    tempo_snap_row_y = tempo_snap_row_y - scroll_y
+    detecttempo_row_y = detecttempo_row_y - scroll_y
+    miditools_hdr_y = miditools_hdr_y - scroll_y
+    midi_sm_row_y = midi_sm_row_y - scroll_y
+    midi_tm_insert_row_y  = midi_tm_insert_row_y  - scroll_y
+    midi_tm_move_row_y    = midi_tm_move_row_y    - scroll_y
+    midi_tm_stretch_row_y = midi_tm_stretch_row_y - scroll_y
+    midi_tm_snap_row_y      = midi_tm_snap_row_y      - scroll_y
+    midi_tm_snap_note_row_y = midi_tm_snap_note_row_y - scroll_y
+    midi_tm_autosnap_row_y  = midi_tm_autosnap_row_y  - scroll_y
+    midi_tm_reset_row_y     = midi_tm_reset_row_y     - scroll_y
+    nudge_row_y = nudge_row_y - scroll_y
+    iam_hdr_y = iam_hdr_y - scroll_y
+    iam_stretch_row_y  = iam_stretch_row_y  - scroll_y
+    iam_take_tm_row_y  = iam_take_tm_row_y  - scroll_y
+    iam_tempo_row_y    = iam_tempo_row_y    - scroll_y
     art_hdr_y = art_hdr_y - scroll_y
     hlscan_row_y = hlscan_row_y - scroll_y
     fret_row_y = fret_row_y - scroll_y
@@ -6716,6 +11544,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     separator_y = separator_y - scroll_y
     col_header_y = col_header_y - scroll_y
     list_top = list_top - scroll_y
+    artgrid_hdr_y = artgrid_hdr_y - scroll_y
+    artgrid_top = artgrid_top - scroll_y
 
     -- Visibility helper
     local function is_row_visible(y) return y + checkbox_row_height > content_top and y < content_bottom end
@@ -6739,6 +11569,296 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         gfx.measurestr("Font  "),
         gfx.measurestr("Docker  ")) + 4
     local sett_simple_btn_x = math.max(sym_box_x, _sett_label_floor)
+
+    do -- scope: click + keyboard + mousewheel handlers (free locals before drawing)
+    -- Handle stretch marker slider drag (continues while mouse is held down)
+    -- All sliders apply instantly: detection is cached at minimum settings,
+    -- post-filtering is O(N) over candidates (microseconds).
+    if sm_slider_dragging then
+        if mouse_down then
+            local slider_x = sett_simple_btn_x
+            local slider_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            local frac = (mouse_x - slider_x) / slider_w
+            frac = math.max(0, math.min(1, frac))
+            local val_changed = false
+            if sm_slider_dragging == "threshold" then
+                local new_val = math.max(0, math.min(60, math.floor(frac * 60 + 0.5)))
+                if new_val ~= sm_threshold_dB then sm_threshold_dB = new_val; val_changed = true end
+            elseif sm_slider_dragging == "sensitivity" then
+                local new_val = math.max(1, math.min(20, math.floor(frac * 19 + 0.5) + 1))
+                if new_val ~= sm_sensitivity_dB then sm_sensitivity_dB = new_val; val_changed = true end
+            elseif sm_slider_dragging == "retrig" then
+                local new_val = math.max(10, math.min(500, math.floor(frac * 490 + 0.5) + 10))
+                if new_val ~= sm_retrig_ms then sm_retrig_ms = new_val; val_changed = true end
+            elseif sm_slider_dragging == "offset" then
+                local new_val = math.max(-100, math.min(100, math.floor((frac * 200 - 100) + 0.5)))
+                if new_val ~= sm_offset_ms then sm_offset_ms = new_val; val_changed = true end
+            end
+            if val_changed then
+                local sm_item, sm_take = get_detect_tempo_item()
+                if sm_item and sm_take then
+                    apply_cached_stretch_markers(sm_item, sm_take)
+                end
+            end
+        else
+            -- Mouse released: save settings
+            sm_slider_dragging = nil
+            save_articulation_settings()
+        end
+    end
+
+    -- Handle SM nudge slider drag (moves nearest stretch marker to edit cursor)
+    if sm_nudge_slider_dragging then
+        if mouse_down then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            local dx = mouse_x - sm_nudge_drag_start_x
+            local new_val = math.max(-500, math.min(500, math.floor(sm_nudge_drag_start_val + dx / sl_w * 1000 + 0.5)))
+            if new_val ~= sm_nudge_value then
+                sm_nudge_value = new_val
+                if sm_nudge_idx >= 0 and sm_nudge_take then
+                    -- Slide behavior: move both timeline pos and srcpos by the same delta
+                    -- so the marker moves on the timeline without changing the playback rate.
+                    local delta_s = sm_nudge_value / 1000
+                    local new_pos    = sm_nudge_orig_src    + delta_s
+                    local new_srcpos = sm_nudge_orig_srcpos + delta_s
+                    reaper.PreventUIRefresh(1)
+                    reaper.DeleteTakeStretchMarkers(sm_nudge_take, sm_nudge_idx)
+                    local new_idx = reaper.SetTakeStretchMarker(sm_nudge_take, sm_nudge_idx, new_pos, new_srcpos)
+                    if new_idx >= 0 then sm_nudge_idx = new_idx end
+                    reaper.UpdateTimeline()
+                    reaper.PreventUIRefresh(-1)
+                end
+            end
+        else
+            -- Release: commit undo block and reset
+            sm_nudge_slider_dragging = false
+            if sm_nudge_undo_open then
+                reaper.Undo_EndBlock("Nudge stretch marker", -1)
+                sm_nudge_undo_open = false
+            end
+            sm_nudge_value = 0
+            sm_nudge_item = nil; sm_nudge_take = nil; sm_nudge_idx = -1
+        end
+    end
+
+    -- Handle Tempo nudge slider drag (moves nearest tempo marker to edit cursor)
+    if tempo_nudge_slider_dragging then
+        if mouse_down then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            local dx = mouse_x - tempo_nudge_drag_start_x
+            local new_val = math.max(-500, math.min(500, math.floor(tempo_nudge_drag_start_val + dx / sl_w * 1000 + 0.5)))
+            if new_val ~= tempo_nudge_value then
+                tempo_nudge_value = new_val
+                if tempo_nudge_idx >= 0 then
+                    local new_t
+                    if tempo_snap_to_sm_enabled then
+                        -- Snap-incremental mode: snap to nearest stretch marker
+                        local sm_positions = {}
+                        for ii = 0, reaper.CountMediaItems(0) - 1 do
+                            local it = reaper.GetMediaItem(0, ii)
+                            local tk = reaper.GetActiveTake(it)
+                            if tk and not reaper.TakeIsMIDI(tk) then
+                                local ip = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+                                for si = 0, reaper.GetTakeNumStretchMarkers(tk) - 1 do
+                                    local _, smp = reaper.GetTakeStretchMarker(tk, si)
+                                    sm_positions[#sm_positions + 1] = ip + smp
+                                end
+                            end
+                        end
+                        local target_t = tempo_nudge_orig_t + new_val / 1000
+                        local nearest_t = tempo_nudge_orig_t
+                        local nearest_dist = math.huge
+                        for _, sp in ipairs(sm_positions) do
+                            local d = math.abs(sp - target_t)
+                            if d < nearest_dist then nearest_dist = d; nearest_t = sp end
+                        end
+                        new_t = nearest_t
+                    else
+                        new_t = tempo_nudge_orig_t + tempo_nudge_value / 1000
+                    end
+                    reaper.PreventUIRefresh(1)
+                    -- Adjust the previous tempo marker's BPM to preserve beat count
+                    -- in the region [prev_t .. new_t], so the musical grid stays aligned.
+                    if tempo_nudge_prev_idx >= 0 and new_t > tempo_nudge_prev_t + 0.0001 then
+                        local span_orig = tempo_nudge_orig_t - tempo_nudge_prev_t
+                        local span_new  = new_t - tempo_nudge_prev_t
+                        local adj_bpm = tempo_nudge_prev_bpm * span_orig / span_new
+                        reaper.DeleteTempoTimeSigMarker(0, tempo_nudge_prev_idx)
+                        reaper.SetTempoTimeSigMarker(0, -1, tempo_nudge_prev_t, -1, -1,
+                            adj_bpm, tempo_nudge_prev_tsn, tempo_nudge_prev_tsd, tempo_nudge_prev_lin)
+                    end
+                    -- Rebuild index map since DeleteTempoTimeSigMarker may shift indices
+                    -- Re-find the nudged marker and previous marker by their original times
+                    reaper.DeleteTempoTimeSigMarker(0,
+                        (function()
+                            for mi = 0, reaper.CountTempoTimeSigMarkers(0) - 1 do
+                                local rv2, t2 = reaper.GetTempoTimeSigMarker(0, mi)
+                                if rv2 and math.abs(t2 - tempo_nudge_orig_t) < 0.001 then return mi end
+                            end
+                            return tempo_nudge_idx
+                        end)()
+                    )
+                    reaper.SetTempoTimeSigMarker(0, -1, new_t, -1, -1,
+                        tempo_nudge_orig_bpm, tempo_nudge_orig_tsn, tempo_nudge_orig_tsd, tempo_nudge_orig_lin)
+                    -- Re-find updated indices
+                    for mi = 0, reaper.CountTempoTimeSigMarkers(0) - 1 do
+                        local rv2, t2 = reaper.GetTempoTimeSigMarker(0, mi)
+                        if rv2 and math.abs(t2 - new_t) < 0.001 then tempo_nudge_idx = mi end
+                        if rv2 and tempo_nudge_prev_idx >= 0 and math.abs(t2 - tempo_nudge_prev_t) < 0.001 then
+                            tempo_nudge_prev_idx = mi
+                        end
+                    end
+                    reaper.UpdateTimeline()
+                    reaper.PreventUIRefresh(-1)
+                end
+            end
+        else
+            tempo_nudge_slider_dragging = false
+            if tempo_nudge_undo_open then
+                reaper.Undo_EndBlock("Nudge tempo marker", -1)
+                tempo_nudge_undo_open = false
+            end
+            tempo_nudge_value = 0
+            tempo_nudge_idx = -1
+            tempo_nudge_prev_idx = -1
+        end
+    end
+
+    -- Handle MIDI TM Move slider drag (moves nearest rated take marker, no note change)
+    if midi_tm_move_dragging then
+        if mouse_down then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            local dx = mouse_x - midi_tm_move_drag_start_x
+            local new_val = math.max(-500, math.min(500, math.floor(midi_tm_move_drag_start_val + dx / sl_w * 1000 + 0.5)))
+            if new_val ~= midi_tm_move_value then
+                midi_tm_move_value = new_val
+                if midi_tm_move_mi >= 0 and midi_tm_move_take then
+                    local new_srcpos = midi_tm_move_orig_s + midi_tm_move_value / 500 * 2 * midi_tm_move_beat_dur
+                    -- Snap to grid if TM snap is enabled
+                    if midi_tm_snap_enabled then
+                        local ip_snap = reaper.GetMediaItemInfo_Value(midi_tm_move_item, "D_POSITION")
+                        local ts_snap = reaper.GetMediaItemTakeInfo_Value(midi_tm_move_take, "D_STARTOFFS")
+                        local proj_snap = reaper.SnapToGrid(0, ip_snap - ts_snap + new_srcpos)
+                        new_srcpos = proj_snap - ip_snap + ts_snap
+                    end
+                    local _, _, color_c = reaper.GetTakeMarker(midi_tm_move_take, midi_tm_move_mi)
+                    local cur_lbl = select(2, reaper.GetTakeMarker(midi_tm_move_take, midi_tm_move_mi))
+                    -- Auto-snap to closest note edge if enabled
+                    if midi_tm_autosnap_note_enabled then
+                        new_srcpos = snap_tm_to_closest_note_silent(midi_tm_move_take, midi_tm_move_mi, new_srcpos)
+                    end
+                    reaper.SetTakeMarker(midi_tm_move_take, midi_tm_move_mi, cur_lbl or "1.00x", new_srcpos, color_c)
+                    -- Keep cache in sync so check_midi_sm_changes doesn't fire on this move
+                    local tk_key = tostring(midi_tm_move_take)
+                    if midi_sm_state[tk_key] and midi_sm_state[tk_key].markers[midi_tm_move_mi + 1] then
+                        midi_sm_state[tk_key].markers[midi_tm_move_mi + 1].last_s = new_srcpos
+                    end
+                    reaper.UpdateItemInProject(midi_tm_move_item)
+                end
+            end
+        else
+            midi_tm_move_dragging = false
+            if midi_tm_move_undo_open then
+                reaper.Undo_EndBlock("MIDI TM: move take marker", -1)
+                midi_tm_move_undo_open = false
+            end
+            midi_tm_move_value = 0
+            midi_tm_move_item = nil; midi_tm_move_take = nil; midi_tm_move_mi = -1
+        end
+    end
+
+    -- Handle MIDI TM Stretch slider drag (moves take marker AND stretches notes)
+    if midi_tm_stretch_dragging then
+        if mouse_down then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            local dx = mouse_x - midi_tm_stretch_drag_start_x
+            local new_val = math.max(-500, math.min(500, math.floor(midi_tm_stretch_drag_start_val + dx / sl_w * 1000 + 0.5)))
+            if new_val ~= midi_tm_stretch_value then
+                midi_tm_stretch_value = new_val
+                if midi_tm_stretch_mi >= 0 and midi_tm_stretch_take then
+                    local new_srcpos = midi_tm_stretch_orig_s + midi_tm_stretch_value / 500 * 2 * midi_tm_stretch_beat_dur
+                    -- Compute item/take offsets (also used for snap)
+                    local item_pos_d = reaper.GetMediaItemInfo_Value(midi_tm_stretch_item, "D_POSITION")
+                    local take_so_d  = reaper.GetMediaItemTakeInfo_Value(midi_tm_stretch_take, "D_STARTOFFS")
+                    -- Snap to grid if TM snap is enabled
+                    if midi_tm_snap_enabled then
+                        local proj_snap = reaper.SnapToGrid(0, item_pos_d - take_so_d + new_srcpos)
+                        new_srcpos = proj_snap - item_pos_d + take_so_d
+                    end
+                    -- Auto-snap to closest note edge if enabled
+                    if midi_tm_autosnap_note_enabled then
+                        new_srcpos = snap_tm_to_closest_note_silent(midi_tm_stretch_take, midi_tm_stretch_mi, new_srcpos)
+                    end
+                    -- Piecewise warp from pristine backup (non-accumulating, no drift)
+                    local tk_key_s = tostring(midi_tm_stretch_take)
+                    local cached_s = midi_sm_state[tk_key_s]
+                    -- Sync last_s so warp uses current position AND check_midi_sm_changes won't re-trigger
+                    if cached_s and cached_s.markers[midi_tm_stretch_mi + 1] then
+                        cached_s.markers[midi_tm_stretch_mi + 1].last_s = new_srcpos
+                    end
+                    reaper.PreventUIRefresh(1)
+                    midi_sm_apply_piecewise_warp(tk_key_s)
+                    -- Move the actual take marker (keep original label during drag, update rate on release)
+                    local _, cur_lbl_s, color_cs = reaper.GetTakeMarker(midi_tm_stretch_take, midi_tm_stretch_mi)
+                    reaper.SetTakeMarker(midi_tm_stretch_take, midi_tm_stretch_mi, cur_lbl_s or "1.00x", new_srcpos, color_cs)
+                    -- Update rate display string for Warp TM slider
+                    if cached_s then
+                        local mkrs_d = cached_s.markers
+                        local lo_d = mkrs_d[midi_tm_stretch_mi + 1].orig_s - ((midi_tm_stretch_mi > 0) and mkrs_d[midi_tm_stretch_mi].orig_s or 0)
+                        local lc_d = new_srcpos - ((midi_tm_stretch_mi > 0) and mkrs_d[midi_tm_stretch_mi].last_s or 0)
+                        midi_tm_stretch_display_str = (lc_d > 1e-7) and string.format("%.2fx", lo_d / lc_d) or "---"
+                    end
+                    reaper.PreventUIRefresh(-1)
+                    reaper.UpdateItemInProject(midi_tm_stretch_item)
+                    -- MIDI_Sort deferred to drag release for performance
+                end
+            end
+        else
+            -- Drag released: sort MIDI once, update rate labels, close undo
+            if midi_tm_stretch_mi >= 0 and midi_tm_stretch_take then
+                local new_srcpos = midi_tm_stretch_orig_s + midi_tm_stretch_value / 500 * 2 * midi_tm_stretch_beat_dur
+                local tk_key = tostring(midi_tm_stretch_take)
+                local mkrs = midi_sm_state[tk_key] and midi_sm_state[tk_key].markers
+                if mkrs then
+                    -- Update rate label for the moved marker (left span rate)
+                    local prev_s  = (midi_tm_stretch_mi > 0) and mkrs[midi_tm_stretch_mi].last_s or 0
+                    local left_orig = mkrs[midi_tm_stretch_mi + 1].orig_s - ((midi_tm_stretch_mi > 0) and mkrs[midi_tm_stretch_mi].orig_s or 0)
+                    local left_curr = new_srcpos - prev_s
+                    local rate_left = (left_curr > 1e-7) and (left_orig / left_curr) or 0
+                    local _, _, color_c = reaper.GetTakeMarker(midi_tm_stretch_take, midi_tm_stretch_mi)
+                    reaper.SetTakeMarker(midi_tm_stretch_take, midi_tm_stretch_mi, string.format("%.2fx", rate_left), new_srcpos, color_c)
+                    -- Update rate label for the next marker (right span rate)
+                    local next_idx = midi_tm_stretch_mi + 2
+                    if next_idx <= #mkrs then
+                        local right_orig = mkrs[next_idx].orig_s - mkrs[midi_tm_stretch_mi + 1].orig_s
+                        local next_s     = mkrs[next_idx].last_s
+                        local right_curr = next_s - new_srcpos
+                        local rate_right = (right_curr > 1e-7) and (right_orig / right_curr) or 0
+                        local next_curr_s, _, color_n = reaper.GetTakeMarker(midi_tm_stretch_take, next_idx - 1)
+                        reaper.SetTakeMarker(midi_tm_stretch_take, next_idx - 1, string.format("%.2fx", rate_right), next_curr_s, color_n)
+                    end
+                end
+                reaper.MIDI_Sort(midi_tm_stretch_take)
+                reaper.UpdateItemInProject(midi_tm_stretch_item)
+                -- Mark indices stale after MIDI_Sort
+                local tk_key_ri = tostring(midi_tm_stretch_take)
+                if midi_sm_state[tk_key_ri] then midi_sm_state[tk_key_ri].needs_reindex = true end
+            end
+            midi_tm_stretch_dragging = false
+            if midi_tm_stretch_undo_open then
+                reaper.Undo_EndBlock("MIDI TM: stretch notes", -1)
+                midi_tm_stretch_undo_open = false
+            end
+            midi_tm_stretch_value = 0
+            midi_tm_stretch_display_str = "1.00x"
+            midi_tm_stretch_item = nil; midi_tm_stretch_take = nil; midi_tm_stretch_mi = -1
+            midi_tm_stretch_note_cache = {}
+        end
+    end
 
     -- Handle clicks (skip when dark menu or gui msgbox is active)
     if mouse_clicked and not dark_menu.active and not gui_msgbox.active then
@@ -6818,6 +11938,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             save_remember_window_size_setting()
             current_font_index = 1
             gfx.setfont(1, font_list[1], gui.settings.font_size)
+            import_position_index = 1
             settings_save_confirmed_until = 0  -- clear any "Saved!" label
         end
         -- Close settings button
@@ -6913,12 +12034,26 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                     insert_on_new_tracks = checkboxes_list[5].checked,
                     insert_on_existing_tracks = checkboxes_list[6].checked,
                     insert_on_tracks_by_name = checkboxes_list[7].checked,
+                    align_to_audio = (import_timebase_index == 6),
+                    align_notes_to_transients = checkboxes_list[8].checked,
+                    tempo_map_freq = tempo_map_freq_index,
                     selected_tracks = selected_tracks
                 }
+                import_progress.active = true
+                import_progress.pct = 0
+                import_progress.status = "Starting..."
+                import_progress.start_time = reaper.time_precise()
+                import_progress.log = {}
+                import_progress.done = false
+                update_import_progress(0, "Parsing MusicXML...")
+                local pre_import_state = capture_pre_import_state()
+                autoload_region_start_pos = nil  -- manual import: honour import_position_index, not autoload override
                 ImportMusicXMLWithOptions(selected_file_path, options)
-                save_window_position()
-                save_window_size("settings")
-                gfx.quit()
+                capture_post_import_history(pre_import_state, selected_file_path)
+                import_progress.done = true
+                import_progress.end_time = reaper.time_precise()
+                import_progress.pct = 1
+                update_import_progress(1, "Done")
             else
                 safe_msgbox("Please select a MusicXML file first.", "No File Selected", 0)
             end
@@ -6926,6 +12061,32 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
 
         -- Content area click guard (only handle scrollable row clicks within visible area)
         local mouse_in_content = mouse_y >= content_top and mouse_y < content_bottom
+
+        -- Section header fold toggles
+        if mouse_in_content then
+            local function hdr_clicked(hdr_y)
+                return mouse_y >= hdr_y and mouse_y < hdr_y + section_hdr_h
+            end
+            if hdr_clicked(general_hdr_y) then
+                settings_fold.general = not settings_fold.general; save_fold_state()
+            elseif hdr_clicked(export_hdr_y) then
+                settings_fold.export = not settings_fold.export; save_fold_state()
+            elseif hdr_clicked(import_hdr_y) then
+                settings_fold.import = not settings_fold.import; save_fold_state()
+            elseif hdr_clicked(transients_hdr_y) then
+                settings_fold.transients = not settings_fold.transients; save_fold_state()
+            elseif hdr_clicked(tempomap_hdr_y) then
+                settings_fold.tempomap = not settings_fold.tempomap; save_fold_state()
+            elseif hdr_clicked(miditools_hdr_y) then
+                settings_fold.miditools = not settings_fold.miditools; save_fold_state()
+            elseif hdr_clicked(iam_hdr_y) then
+                settings_fold.insertmouse = not settings_fold.insertmouse; save_fold_state()
+            elseif hdr_clicked(art_hdr_y) then
+                settings_fold.articulation = not settings_fold.articulation; save_fold_state()
+            elseif hdr_clicked(artgrid_hdr_y) then
+                settings_fold.artgrid = not settings_fold.artgrid; save_fold_state()
+            end
+        end
 
         -- Check click on fret number row
         if mouse_in_content and mouse_y > fret_row_y and mouse_y < fret_row_y + checkbox_size then
@@ -7338,6 +12499,647 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
         end
 
+        -- Check click on Import Position row
+        if mouse_y > importpos_row_y and mouse_y < importpos_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.importpos = not settings_menu_flags.importpos
+            else
+                local importpos_btn_x = sett_simple_btn_x
+                local importpos_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= importpos_btn_x and mouse_x < importpos_btn_x + importpos_btn_w then
+                    local menu_str = ""
+                    for j, v in ipairs(import_position_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == import_position_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. v
+                    end
+                    open_dark_menu(menu_str, importpos_btn_x, importpos_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            import_position_index = choice
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Auto-load by Region row
+        if mouse_y > autoloadrgn_row_y and mouse_y < autoloadrgn_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.autoloadrgn = not settings_menu_flags.autoloadrgn
+            elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                autoload_by_region_enabled = not autoload_by_region_enabled
+            end
+        end
+
+        -- Check click on MIDI Timebase row
+        if mouse_y > timebase_row_y and mouse_y < timebase_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.timebase = not settings_menu_flags.timebase
+            else
+                local timebase_btn_x = sett_simple_btn_x
+                local timebase_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= timebase_btn_x and mouse_x < timebase_btn_x + timebase_btn_w then
+                    local menu_str = ""
+                    for j, v in ipairs(import_timebase_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == import_timebase_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. v
+                    end
+                    open_dark_menu(menu_str, timebase_btn_x, timebase_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            import_timebase_index = choice
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check clicks on import section duplicate rows (shared settings)
+        if mouse_y > imdup.tempofreq and mouse_y < imdup.tempofreq + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.tempofreq = not settings_menu_flags.tempofreq
+            else
+                local btn_x = sett_simple_btn_x
+                local btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= btn_x and mouse_x < btn_x + btn_w then
+                    local menu_str = ""
+                    for j, opt in ipairs(tempo_map_freq_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == tempo_map_freq_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. opt
+                    end
+                    open_dark_menu(menu_str, btn_x, imdup.tempofreq + checkbox_size, function(choice)
+                        if choice > 0 then tempo_map_freq_index = choice end
+                    end)
+                end
+            end
+        end
+        if mouse_y > imdup.tempotimesig and mouse_y < imdup.tempotimesig + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.tempotimesig = not settings_menu_flags.tempotimesig
+            else
+                local btn_x = sett_simple_btn_x
+                local btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= btn_x and mouse_x < btn_x + btn_w then
+                    local menu_str = ""
+                    for j, opt in ipairs(tempo_timesig_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == tempo_timesig_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. opt
+                    end
+                    open_dark_menu(menu_str, btn_x, imdup.tempotimesig + checkbox_size, function(choice)
+                        if choice > 0 then tempo_timesig_index = choice end
+                    end)
+                end
+            end
+        end
+        if mouse_y > imdup.detectmethod and mouse_y < imdup.detectmethod + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.detectmethod = not settings_menu_flags.detectmethod
+            else
+                local btn_x = sett_simple_btn_x
+                local btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= btn_x and mouse_x < btn_x + btn_w then
+                    local menu_str = ""
+                    for j, opt in ipairs(tempo_detect_method_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == tempo_detect_method_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. opt
+                    end
+                    open_dark_menu(menu_str, btn_x, imdup.detectmethod + checkbox_size, function(choice)
+                        if choice > 0 then tempo_detect_method_index = choice end
+                    end)
+                end
+            end
+        end
+        -- Check click on Tempo Map Freq row
+        if mouse_y > tempofreq_row_y and mouse_y < tempofreq_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.tempofreq = not settings_menu_flags.tempofreq
+            else
+                local tempofreq_btn_x = sett_simple_btn_x
+                local tempofreq_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= tempofreq_btn_x and mouse_x < tempofreq_btn_x + tempofreq_btn_w then
+                    local menu_str = ""
+                    for j, opt in ipairs(tempo_map_freq_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == tempo_map_freq_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. opt
+                    end
+                    open_dark_menu(menu_str, tempofreq_btn_x, tempofreq_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            tempo_map_freq_index = choice
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Time Signature row
+        if mouse_y > tempotimesig_row_y and mouse_y < tempotimesig_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.tempotimesig = not settings_menu_flags.tempotimesig
+            else
+                local timesig_btn_x = sett_simple_btn_x
+                local timesig_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= timesig_btn_x and mouse_x < timesig_btn_x + timesig_btn_w then
+                    local menu_str = ""
+                    for j, opt in ipairs(tempo_timesig_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == tempo_timesig_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. opt
+                    end
+                    open_dark_menu(menu_str, timesig_btn_x, tempotimesig_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            tempo_timesig_index = choice
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Detect Method row
+        if mouse_y > detectmethod_row_y and mouse_y < detectmethod_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.detectmethod = not settings_menu_flags.detectmethod
+            else
+                local detectmethod_btn_x = sett_simple_btn_x
+                local detectmethod_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= detectmethod_btn_x and mouse_x < detectmethod_btn_x + detectmethod_btn_w then
+                    local menu_str = ""
+                    for j, opt in ipairs(tempo_detect_method_options) do
+                        if j > 1 then menu_str = menu_str .. "|" end
+                        if j == tempo_detect_method_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. opt
+                    end
+                    open_dark_menu(menu_str, detectmethod_btn_x, detectmethod_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            tempo_detect_method_index = choice
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Detect Item row
+        if mouse_y > detectitem_row_y and mouse_y < detectitem_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.detectitem = not settings_menu_flags.detectitem
+            else
+                local detectitem_btn_x = sett_simple_btn_x
+                local detectitem_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= detectitem_btn_x and mouse_x < detectitem_btn_x + detectitem_btn_w then
+                    refresh_detect_tempo_items()
+                    local menu_str = "Selected Item"
+                    if detect_tempo_item_index == 0 then menu_str = "!Selected Item" end
+                    for j, si in ipairs(detect_tempo_item_items) do
+                        menu_str = menu_str .. "|"
+                        if j == detect_tempo_item_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. si.name
+                    end
+                    open_dark_menu(menu_str, detectitem_btn_x, detectitem_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            detect_tempo_item_index = choice - 1  -- 0=Selected Item, 1+=specific items
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Detect Tempo button row (full-width big button, last in Tempo Map)
+        if mouse_y > detecttempo_row_y and mouse_y < detecttempo_row_y + file_info_height then
+            detect_tempo_from_item()
+        end
+
+        -- Check click on Stretch Markers checkbox row
+        if mouse_y > stretchmarkers_row_y and mouse_y < stretchmarkers_row_y + checkbox_size then
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                detect_stretch_markers_enabled = not detect_stretch_markers_enabled
+                save_articulation_settings()
+            end
+        end
+
+        -- Check click on slider rows (Threshold, Sensitivity, Retrig, Offset)
+        -- Sets value, applies instantly (post-filter is microseconds), and starts drag.
+        local slider_rows = {
+            {y = threshold_row_y, name = "threshold"},
+            {y = sensitivity_row_y, name = "sensitivity"},
+            {y = retrig_row_y, name = "retrig"},
+            {y = offset_row_y, name = "offset"},
+        }
+        for _, sr in ipairs(slider_rows) do
+            if mouse_y > sr.y and mouse_y < sr.y + checkbox_size then
+                local slider_x = sett_simple_btn_x
+                local slider_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= slider_x and mouse_x < slider_x + slider_w then
+                    local frac = (mouse_x - slider_x) / slider_w
+                    frac = math.max(0, math.min(1, frac))
+                    if sr.name == "threshold" then
+                        sm_threshold_dB = math.max(0, math.min(60, math.floor(frac * 60 + 0.5)))
+                    elseif sr.name == "sensitivity" then
+                        sm_sensitivity_dB = math.max(1, math.min(20, math.floor(frac * 19 + 0.5) + 1))
+                    elseif sr.name == "retrig" then
+                        sm_retrig_ms = math.max(10, math.min(500, math.floor(frac * 490 + 0.5) + 10))
+                    elseif sr.name == "offset" then
+                        sm_offset_ms = math.max(-100, math.min(100, math.floor((frac * 200 - 100) + 0.5)))
+                    end
+                    local sm_item, sm_take = get_detect_tempo_item()
+                    if sm_item and sm_take then
+                        apply_cached_stretch_markers(sm_item, sm_take)
+                    end
+                    sm_slider_dragging = sr.name
+                end
+            end
+        end
+
+        -- Check click on Use Existing Markers checkbox row
+        if mouse_y > useexisting_row_y and mouse_y < useexisting_row_y + checkbox_size then
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                detect_tempo_use_existing_markers = not detect_tempo_use_existing_markers
+                save_articulation_settings()
+            end
+        end
+
+        -- Check click on Align Stem row
+        if mouse_y > alignstem_row_y and mouse_y < alignstem_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.alignstem = not settings_menu_flags.alignstem
+            else
+                local alignstem_btn_x = sett_simple_btn_x
+                local alignstem_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= alignstem_btn_x and mouse_x < alignstem_btn_x + alignstem_btn_w then
+                    refresh_align_stem_items()
+                    local menu_str = "Auto"
+                    if align_stem_index == 0 then menu_str = "!Auto" end
+                    for j, si in ipairs(align_stem_items) do
+                        menu_str = menu_str .. "|"
+                        if j == align_stem_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. si.name
+                    end
+                    open_dark_menu(menu_str, alignstem_btn_x, alignstem_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            align_stem_index = choice - 1  -- 0=Auto, 1+=specific items
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Onset Item row
+        if mouse_y > onsetitem_row_y and mouse_y < onsetitem_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.onsetitem = not settings_menu_flags.onsetitem
+            else
+                local onsetitem_btn_x = sett_simple_btn_x
+                local onsetitem_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+                if mouse_x >= onsetitem_btn_x and mouse_x < onsetitem_btn_x + onsetitem_btn_w then
+                    refresh_onset_item_items()
+                    local menu_str = "Auto"
+                    if onset_item_index == 0 then menu_str = "!Auto" end
+                    for j, si in ipairs(onset_item_items) do
+                        menu_str = menu_str .. "|"
+                        if j == onset_item_index then menu_str = menu_str .. "!" end
+                        menu_str = menu_str .. si.name
+                    end
+                    open_dark_menu(menu_str, onsetitem_btn_x, onsetitem_row_y + checkbox_size, function(choice)
+                        if choice > 0 then
+                            onset_item_index = choice - 1
+                        end
+                    end)
+                end
+            end
+        end
+
+        -- Check click on Remap button row
+        if mouse_y > remap_row_y and mouse_y < remap_row_y + checkbox_size then
+            local remap_sett_btn_x = sett_simple_btn_x
+            local remap_sett_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x >= remap_sett_btn_x and mouse_x < remap_sett_btn_x + remap_sett_btn_w then
+                local num_items = reaper.CountSelectedMediaItems(0)
+                if num_items > 0 then
+                    local count = remap_midi_to_tempo_map()
+                    if count > 0 then
+                        remap_confirmed_until = os.clock() + 1.5
+                    else
+                        safe_msgbox("No remap data found on selected items.\nOnly items imported with this script contain remap data.", "No Remap Data", 0)
+                    end
+                else
+                    safe_msgbox("Please select MIDI items to remap.", "No Items Selected", 0)
+                end
+            end
+        end
+
+        -- Check click on Delete Tempo Markers button row
+        if mouse_y > del_tempo_row_y and mouse_y < del_tempo_row_y + checkbox_size then
+            local del_tempo_btn_x = sett_simple_btn_x
+            local del_tempo_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x >= del_tempo_btn_x and mouse_x < del_tempo_btn_x + del_tempo_btn_w then
+                local rng_start, rng_end = get_edit_range()
+                if rng_start then
+                    reaper.Undo_BeginBlock()
+                    local count = delete_tempo_markers_in_range(rng_start, rng_end)
+                    reaper.Undo_EndBlock("Delete tempo markers in range", -1)
+                    reaper.UpdateTimeline()
+                    if count > 0 then
+                        del_tempo_confirmed_until = os.clock() + 1.5
+                    else
+                        safe_msgbox("No tempo markers found in the active range.", "Nothing to Delete", 0)
+                    end
+                else
+                    safe_msgbox("No active range found.\nMake a time selection, razor edit,\nor select items to define the range.", "No Range", 0)
+                end
+            end
+        end
+
+        -- Check click on Remove Stretch Markers button row
+        if mouse_y > del_sm_row_y and mouse_y < del_sm_row_y + checkbox_size then
+            local del_sm_btn_x = sett_simple_btn_x
+            local del_sm_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x >= del_sm_btn_x and mouse_x < del_sm_btn_x + del_sm_btn_w then
+                local rng_start, rng_end = get_edit_range()
+                local n_selected = reaper.CountSelectedMediaItems(0)
+                if n_selected == 0 and not rng_start then
+                    safe_msgbox("Please select audio items, or set a razor edit / time selection.", "No Selection", 0)
+                else
+                    local items_list = nil
+                    if n_selected == 0 then
+                        -- Auto-collect audio items overlapping the range
+                        items_list = {}
+                        for ii = 0, reaper.CountMediaItems(0) - 1 do
+                            local it = reaper.GetMediaItem(0, ii)
+                            local ipos = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+                            local ilen = reaper.GetMediaItemInfo_Value(it, "D_LENGTH")
+                            if ipos < rng_end + 0.001 and ipos + ilen > rng_start - 0.001 then
+                                local tk = reaper.GetActiveTake(it)
+                                if tk and not reaper.TakeIsMIDI(tk) then
+                                    items_list[#items_list + 1] = it
+                                end
+                            end
+                        end
+                        if #items_list == 0 then
+                            safe_msgbox("No audio items found in the active range.", "Nothing to Remove", 0)
+                            goto continue_del_sm
+                        end
+                    end
+                    reaper.Undo_BeginBlock()
+                    local count = remove_stretch_markers_in_range(rng_start, rng_end, items_list)
+                    reaper.Undo_EndBlock("Remove stretch markers in range", -1)
+                    if count > 0 then
+                        del_sm_confirmed_until = os.clock() + 1.5
+                    else
+                        safe_msgbox("No stretch markers found in the active range.", "Nothing to Remove", 0)
+                    end
+                    ::continue_del_sm::
+                end
+            end
+        end
+
+        -- Check click on Nudge SM slider row
+        if not sm_nudge_slider_dragging and mouse_y > sm_nudge_row_y and mouse_y < sm_nudge_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                -- Start nudge drag: lock nearest SM to cursor
+                local item_n, take_n, idx_n, src_n, proj_n, srcpos_n = find_sm_near_cursor()
+                if item_n and idx_n >= 0 then
+                    sm_nudge_slider_dragging = true
+                    sm_nudge_drag_start_x = mouse_x
+                    sm_nudge_drag_start_val = sm_nudge_value
+                    sm_nudge_item = item_n; sm_nudge_take = take_n
+                    sm_nudge_idx = idx_n
+                    sm_nudge_orig_src = src_n        -- take-time pos (fixed)
+                    sm_nudge_orig_srcpos = srcpos_n  -- source media pos (varies)
+                    reaper.Undo_BeginBlock()
+                    sm_nudge_undo_open = true
+                else
+                    safe_msgbox("No stretch markers found near the edit cursor.", "No SM", 0)
+                end
+            end
+        end
+
+        -- Check click on Snap SM to Grid checkbox row
+        if mouse_y > sm_snap_row_y and mouse_y < sm_snap_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.smsnap = not settings_menu_flags.smsnap
+                save_settings_menu_flags()
+            elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                sm_snap_to_grid_enabled = not sm_snap_to_grid_enabled
+            end
+        end
+
+        -- Check click on Detect Transients button row (full-width big button, last in Transients)
+        if mouse_y > detect_transients_row_y and mouse_y < detect_transients_row_y + file_info_height then
+            detect_transients_manual()
+        end
+
+        -- Check click on Nudge Tempo slider row
+        if not tempo_nudge_slider_dragging and mouse_y > tempo_nudge_row_y and mouse_y < tempo_nudge_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                -- Start nudge drag: lock nearest tempo marker to cursor
+                local tidx, t_t, t_bpm, t_tsn, t_tsd, t_lin = find_tempo_near_cursor()
+                if tidx >= 0 then
+                    tempo_nudge_slider_dragging = true
+                    tempo_nudge_drag_start_x = mouse_x
+                    tempo_nudge_drag_start_val = tempo_nudge_value
+                    tempo_nudge_idx = tidx; tempo_nudge_orig_t = t_t
+                    tempo_nudge_orig_bpm = t_bpm; tempo_nudge_orig_tsn = t_tsn
+                    tempo_nudge_orig_tsd = t_tsd; tempo_nudge_orig_lin = t_lin
+                    -- Find the tempo marker immediately before this one
+                    -- (needed to adjust its BPM to preserve beat count during nudge)
+                    tempo_nudge_prev_idx = -1
+                    tempo_nudge_prev_t = 0; tempo_nudge_prev_bpm = 120
+                    tempo_nudge_prev_tsn = 4; tempo_nudge_prev_tsd = 4
+                    tempo_nudge_prev_lin = false
+                    for mi = tidx - 1, 0, -1 do
+                        local rv_p, t_p, _, _, bpm_p, tsn_p, tsd_p, lin_p = reaper.GetTempoTimeSigMarker(0, mi)
+                        if rv_p and t_p < t_t - 0.0001 then
+                            tempo_nudge_prev_idx = mi
+                            tempo_nudge_prev_t   = t_p
+                            tempo_nudge_prev_bpm = bpm_p
+                            tempo_nudge_prev_tsn = tsn_p
+                            tempo_nudge_prev_tsd = tsd_p
+                            tempo_nudge_prev_lin = lin_p
+                            break
+                        end
+                    end
+                    reaper.Undo_BeginBlock()
+                    tempo_nudge_undo_open = true
+                else
+                    safe_msgbox("No tempo markers found near the edit cursor.", "No Tempo", 0)
+                end
+            end
+        end
+
+        -- Check click on Snap Tempo to SM checkbox row
+        if mouse_y > tempo_snap_row_y and mouse_y < tempo_snap_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.temposnap = not settings_menu_flags.temposnap
+                save_settings_menu_flags()
+            elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                tempo_snap_to_sm_enabled = not tempo_snap_to_sm_enabled
+            end
+        end
+
+        -- Check click on MIDI SM Mode checkbox row
+        if mouse_y > midi_sm_row_y and mouse_y < midi_sm_row_y + checkbox_size then
+            if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
+                settings_menu_flags.midism = not settings_menu_flags.midism
+                save_settings_menu_flags()
+            elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                midi_sm_enabled = not midi_sm_enabled
+                if not midi_sm_enabled then midi_sm_state = {} end
+            end
+        end
+
+        -- Check click on Insert TM at cursor button
+        if mouse_y > midi_tm_insert_row_y and mouse_y < midi_tm_insert_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                insert_midi_tm_at_cursor()
+            end
+        end
+
+        -- Check click on MIDI TM Move slider row
+        if not midi_tm_move_dragging and mouse_y > midi_tm_move_row_y and mouse_y < midi_tm_move_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                local bi, bt, bmi, bs = find_midi_tm_near_cursor()
+                if bi and bmi >= 0 then
+                    midi_tm_move_dragging = true
+                    midi_tm_move_drag_start_x = mouse_x
+                    midi_tm_move_drag_start_val = midi_tm_move_value
+                    midi_tm_move_item = bi; midi_tm_move_take = bt
+                    midi_tm_move_mi = bmi; midi_tm_move_orig_s = bs
+                    -- Compute beat duration at cursor for beat-based slider range (±2 beats)
+                    local cur_qn_mv = reaper.TimeMap2_timeToQN(0, reaper.GetCursorPosition())
+                    midi_tm_move_beat_dur = math.max(0.05, math.min(4.0,
+                        reaper.TimeMap2_QNToTime(0, cur_qn_mv + 1) - reaper.TimeMap2_QNToTime(0, cur_qn_mv)))
+                    reaper.Undo_BeginBlock()
+                    midi_tm_move_undo_open = true
+                else
+                    safe_msgbox("No rated take markers (e.g. 1.00x) found near the edit cursor.\nUse the 'Insert TM at cursor' button to add one.", "No TM", 0)
+                end
+            end
+        end
+
+        -- Check click on MIDI TM Stretch slider row
+        if not midi_tm_stretch_dragging and mouse_y > midi_tm_stretch_row_y and mouse_y < midi_tm_stretch_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                local bi, bt, bmi, bs = find_midi_tm_near_cursor()
+                if bi and bmi >= 0 then
+                    local tk_key = tostring(bt)
+                    if not midi_sm_state[tk_key] then
+                        midi_sm_init_take(tk_key, bi, bt)
+                    end
+                    midi_tm_stretch_dragging = true
+                    midi_tm_stretch_drag_start_x = mouse_x
+                    midi_tm_stretch_drag_start_val = midi_tm_stretch_value
+                    midi_tm_stretch_item = bi; midi_tm_stretch_take = bt
+                    midi_tm_stretch_mi = bmi; midi_tm_stretch_orig_s = bs
+                    midi_tm_stretch_last_s = bs
+                    -- Compute beat duration at cursor for beat-based slider range (±2 beats)
+                    local cur_qn_st = reaper.TimeMap2_timeToQN(0, reaper.GetCursorPosition())
+                    midi_tm_stretch_beat_dur = math.max(0.05, math.min(4.0,
+                        reaper.TimeMap2_QNToTime(0, cur_qn_st + 1) - reaper.TimeMap2_QNToTime(0, cur_qn_st)))
+                    midi_tm_stretch_display_str = "1.00x"
+                    -- Mark needs_reindex so warp rebuilds ni mapping at first drag call
+                    local tk_key = tostring(bt)
+                    if midi_sm_state[tk_key] then midi_sm_state[tk_key].needs_reindex = true end
+                    -- Note backup lives in midi_sm_state[tk_key].note_backup;
+                    -- piecewise warp is used during drag (no per-drag note cache needed)
+                    reaper.Undo_BeginBlock()
+                    midi_tm_stretch_undo_open = true
+                else
+                    safe_msgbox("No rated take markers (e.g. 1.00x) found near the edit cursor.\nUse the 'Insert TM at cursor' button to add one.", "No TM", 0)
+                end
+            end
+        end
+
+        -- Check click on TM Grid Snap toggle (MIDI TOOLS)
+        if mouse_y > midi_tm_snap_row_y and mouse_y < midi_tm_snap_row_y + checkbox_size then
+            if mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+                midi_tm_snap_enabled = not midi_tm_snap_enabled
+            end
+        end
+        -- Check click on Snap TM to Note button (MIDI TOOLS)
+        if mouse_y > midi_tm_snap_note_row_y and mouse_y < midi_tm_snap_note_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                if snap_midi_tm_to_note() then
+                    midi_tm_snap_to_note_confirmed_until = os.clock() + 1.5
+                end
+            end
+        end
+        -- Check click on Auto-snap TM to note toggle (MIDI TOOLS)
+        if mouse_y > midi_tm_autosnap_row_y and mouse_y < midi_tm_autosnap_row_y + checkbox_size then
+            if mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+                midi_tm_autosnap_note_enabled = not midi_tm_autosnap_note_enabled
+            end
+        end
+        -- Check click on Reset TM button (MIDI TOOLS)
+        if mouse_y > midi_tm_reset_row_y and mouse_y < midi_tm_reset_row_y + checkbox_size then
+            local sl_x = sett_simple_btn_x
+            local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+            if mouse_x >= sl_x and mouse_x < sl_x + sl_w then
+                -- Find active take and reset
+                local sel_item = reaper.GetSelectedMediaItem(0, 0)
+                local reset_take = sel_item and reaper.GetActiveTake(sel_item)
+                local reset_key = reset_take and tostring(reset_take)
+                if reset_key and midi_sm_state[reset_key] then
+                    if reset_midi_tm(reset_key) then
+                        midi_tm_reset_confirmed_until = os.clock() + 1.5
+                    end
+                else
+                    safe_msgbox("Select the MIDI item with active MIDI SM state.", "No SM State", 0)
+                end
+            end
+        end
+        -- Check click on Nudge to Transients button row (MIDI TOOLS)
+        if mouse_y > nudge_row_y and mouse_y < nudge_row_y + checkbox_size then
+            local nudge_sett_btn_x = sett_simple_btn_x
+            local nudge_sett_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x >= nudge_sett_btn_x and mouse_x < nudge_sett_btn_x + nudge_sett_btn_w then
+                local num_items = reaper.CountSelectedMediaItems(0)
+                if num_items >= 2 then
+                    local count, err = nudge_notes_to_transients()
+                    if count then
+                        nudge_confirmed_until = os.clock() + 1.5
+                    else
+                        safe_msgbox(err or "Nudge failed.", "Nudge Error", 0)
+                    end
+                else
+                    safe_msgbox("Select 2 items: one MIDI item and one audio item with stretch markers.", "Need 2 Items", 0)
+                end
+            end
+        end
+
+        -- Check clicks on INSERT AT MOUSE section checkboxes
+        if mouse_y > iam_stretch_row_y and mouse_y < iam_stretch_row_y + checkbox_size then
+            if mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+                iam_enable_stretch = not iam_enable_stretch
+                reaper.SetExtState("konst_InsertAtMouse", "enable_stretch", iam_enable_stretch and "1" or "0", true)
+            end
+        end
+        if mouse_y > iam_take_tm_row_y and mouse_y < iam_take_tm_row_y + checkbox_size then
+            if mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+                iam_enable_take_tm = not iam_enable_take_tm
+                reaper.SetExtState("konst_InsertAtMouse", "enable_take_tm", iam_enable_take_tm and "1" or "0", true)
+            end
+        end
+        if mouse_y > iam_tempo_row_y and mouse_y < iam_tempo_row_y + checkbox_size then
+            if mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
+                iam_enable_tempo = not iam_enable_tempo
+                reaper.SetExtState("konst_InsertAtMouse", "enable_tempo", iam_enable_tempo and "1" or "0", true)
+            end
+        end
+
         -- Check click on default path radio checkbox
         if mouse_y > defpath_row_y and mouse_y < defpath_row_y + checkbox_size then
             if mouse_x > menu_cb_x and mouse_x < menu_cb_x + checkbox_size then
@@ -7354,6 +13156,13 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             elseif mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
                 path_mode = "last"
                 save_path_mode("last")
+            end
+        end
+        -- Check click on Tips checkbox row
+        if mouse_y > tips_row_y and mouse_y < tips_row_y + checkbox_size then
+            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                tips_enabled = not tips_enabled
+                save_articulation_settings()
             end
         end
         -- Check click on default path text box
@@ -7942,6 +13751,179 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                 wheel_handled = true
             end
         end
+        -- Check if mouse is over import position button
+        if not wheel_handled then
+            local importpos_btn_x_w = sett_simple_btn_x
+            local importpos_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > importpos_btn_x_w and mouse_x < importpos_btn_x_w + importpos_btn_w_w and
+               mouse_y > importpos_row_y and mouse_y < importpos_row_y + checkbox_size then
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                import_position_index = import_position_index + delta
+                if import_position_index < 1 then import_position_index = #import_position_options end
+                if import_position_index > #import_position_options then import_position_index = 1 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over MIDI timebase button
+        if not wheel_handled then
+            local timebase_btn_x_w = sett_simple_btn_x
+            local timebase_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > timebase_btn_x_w and mouse_x < timebase_btn_x_w + timebase_btn_w_w and
+               mouse_y > timebase_row_y and mouse_y < timebase_row_y + checkbox_size then
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                import_timebase_index = import_timebase_index + delta
+                if import_timebase_index < 1 then import_timebase_index = #import_timebase_options end
+                if import_timebase_index > #import_timebase_options then import_timebase_index = 1 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over import duplicate dropdown rows
+        if not wheel_handled then
+            local btn_x_w = sett_simple_btn_x
+            local btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > btn_x_w and mouse_x < btn_x_w + btn_w_w then
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                if mouse_y > imdup.tempofreq and mouse_y < imdup.tempofreq + checkbox_size then
+                    tempo_map_freq_index = tempo_map_freq_index + delta
+                    if tempo_map_freq_index < 1 then tempo_map_freq_index = #tempo_map_freq_options end
+                    if tempo_map_freq_index > #tempo_map_freq_options then tempo_map_freq_index = 1 end
+                    wheel_handled = true
+                elseif mouse_y > imdup.tempotimesig and mouse_y < imdup.tempotimesig + checkbox_size then
+                    tempo_timesig_index = tempo_timesig_index + delta
+                    if tempo_timesig_index < 1 then tempo_timesig_index = #tempo_timesig_options end
+                    if tempo_timesig_index > #tempo_timesig_options then tempo_timesig_index = 1 end
+                    wheel_handled = true
+                elseif mouse_y > imdup.detectmethod and mouse_y < imdup.detectmethod + checkbox_size then
+                    tempo_detect_method_index = tempo_detect_method_index + delta
+                    if tempo_detect_method_index < 1 then tempo_detect_method_index = #tempo_detect_method_options end
+                    if tempo_detect_method_index > #tempo_detect_method_options then tempo_detect_method_index = 1 end
+                    wheel_handled = true
+                end
+            end
+        end
+        -- Check if mouse is over Tempo Map Freq button
+        if not wheel_handled then
+            local tempofreq_btn_x_w = sett_simple_btn_x
+            local tempofreq_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > tempofreq_btn_x_w and mouse_x < tempofreq_btn_x_w + tempofreq_btn_w_w and
+               mouse_y > tempofreq_row_y and mouse_y < tempofreq_row_y + checkbox_size then
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                tempo_map_freq_index = tempo_map_freq_index + delta
+                if tempo_map_freq_index < 1 then tempo_map_freq_index = #tempo_map_freq_options end
+                if tempo_map_freq_index > #tempo_map_freq_options then tempo_map_freq_index = 1 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over Time Signature button
+        if not wheel_handled then
+            local timesig_btn_x_w = sett_simple_btn_x
+            local timesig_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > timesig_btn_x_w and mouse_x < timesig_btn_x_w + timesig_btn_w_w and
+               mouse_y > tempotimesig_row_y and mouse_y < tempotimesig_row_y + checkbox_size then
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                tempo_timesig_index = tempo_timesig_index + delta
+                if tempo_timesig_index < 1 then tempo_timesig_index = #tempo_timesig_options end
+                if tempo_timesig_index > #tempo_timesig_options then tempo_timesig_index = 1 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over Detect Method button
+        if not wheel_handled then
+            local detectmethod_btn_x_w = sett_simple_btn_x
+            local detectmethod_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > detectmethod_btn_x_w and mouse_x < detectmethod_btn_x_w + detectmethod_btn_w_w and
+               mouse_y > detectmethod_row_y and mouse_y < detectmethod_row_y + checkbox_size then
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                tempo_detect_method_index = tempo_detect_method_index + delta
+                if tempo_detect_method_index < 1 then tempo_detect_method_index = #tempo_detect_method_options end
+                if tempo_detect_method_index > #tempo_detect_method_options then tempo_detect_method_index = 1 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over Detect Item button
+        if not wheel_handled then
+            local detectitem_btn_x_w = sett_simple_btn_x
+            local detectitem_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > detectitem_btn_x_w and mouse_x < detectitem_btn_x_w + detectitem_btn_w_w and
+               mouse_y > detectitem_row_y and mouse_y < detectitem_row_y + checkbox_size then
+                refresh_detect_tempo_items()
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                detect_tempo_item_index = detect_tempo_item_index + delta
+                if detect_tempo_item_index < 0 then detect_tempo_item_index = #detect_tempo_item_items end
+                if detect_tempo_item_index > #detect_tempo_item_items then detect_tempo_item_index = 0 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over any stretch marker slider (Threshold, Sensitivity, Retrig, Offset)
+        if not wheel_handled then
+            local slider_x_w = sett_simple_btn_x
+            local slider_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            local sm_wheel_rows = {
+                {y = threshold_row_y, name = "threshold"},
+                {y = sensitivity_row_y, name = "sensitivity"},
+                {y = retrig_row_y, name = "retrig"},
+                {y = offset_row_y, name = "offset"},
+            }
+            for _, wr in ipairs(sm_wheel_rows) do
+                if mouse_x > slider_x_w and mouse_x < slider_x_w + slider_w_w and
+                   mouse_y > wr.y and mouse_y < wr.y + checkbox_size then
+                    local delta = gfx.mouse_wheel > 0 and 1 or -1
+                    local changed = false
+                    if wr.name == "threshold" then
+                        sm_threshold_dB = math.max(0, math.min(60, sm_threshold_dB + delta))
+                        changed = true
+                    elseif wr.name == "sensitivity" then
+                        sm_sensitivity_dB = math.max(1, math.min(20, sm_sensitivity_dB + delta))
+                        changed = true
+                    elseif wr.name == "retrig" then
+                        sm_retrig_ms = math.max(10, math.min(500, sm_retrig_ms + delta * 5))
+                        changed = true
+                    elseif wr.name == "offset" then
+                        sm_offset_ms = math.max(-100, math.min(100, sm_offset_ms + delta))
+                        changed = true
+                    end
+                    if changed then
+                        local sm_item, sm_take = get_detect_tempo_item()
+                        if sm_item and sm_take then
+                            apply_cached_stretch_markers(sm_item, sm_take)
+                        end
+                        save_articulation_settings()
+                    end
+                    wheel_handled = true
+                    break
+                end
+            end
+        end
+        -- Check if mouse is over Detect Tempo Item button
+        if not wheel_handled then
+            local alignstem_btn_x_w = sett_simple_btn_x
+            local alignstem_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > alignstem_btn_x_w and mouse_x < alignstem_btn_x_w + alignstem_btn_w_w and
+               mouse_y > alignstem_row_y and mouse_y < alignstem_row_y + checkbox_size then
+                refresh_align_stem_items()
+                local max_idx = #align_stem_items
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                align_stem_index = align_stem_index + delta
+                if align_stem_index < 0 then align_stem_index = max_idx end
+                if align_stem_index > max_idx then align_stem_index = 0 end
+                wheel_handled = true
+            end
+        end
+        -- Check if mouse is over Onset Item button
+        if not wheel_handled then
+            local onsetitem_btn_x_w = sett_simple_btn_x
+            local onsetitem_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+            if mouse_x > onsetitem_btn_x_w and mouse_x < onsetitem_btn_x_w + onsetitem_btn_w_w and
+               mouse_y > onsetitem_row_y and mouse_y < onsetitem_row_y + checkbox_size then
+                refresh_onset_item_items()
+                local max_idx = #onset_item_items
+                local delta = gfx.mouse_wheel > 0 and -1 or 1
+                onset_item_index = onset_item_index + delta
+                if onset_item_index < 0 then onset_item_index = max_idx end
+                if onset_item_index > max_idx then onset_item_index = 0 end
+                wheel_handled = true
+            end
+        end
         -- Check if mouse is over MIDI bank scrollable button
         local midibank_btn_x_w = sett_simple_btn_x
         local midibank_btn_w_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
@@ -8157,6 +14139,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         end
         gfx.mouse_wheel = 0
     end
+    end -- end scope: click + keyboard + mousewheel handlers
 
     -- Hover states
     settings_import_hovered = (mouse_x > import_btn_x and mouse_x < import_btn_x + btn_width and
@@ -8170,6 +14153,17 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
 
     -- Determine tooltip for current mouse position
     settings_tooltip_text = nil
+    pending_tooltip = nil
+    -- Settings button tooltips
+    if settings_import_hovered then
+        settings_tooltip_text = "Import the selected MusicXML file\nusing current settings."
+    elseif settings_save_hovered then
+        settings_tooltip_text = "Save all current settings as defaults.\nSettings persist across sessions."
+    elseif settings_restore_hovered then
+        settings_tooltip_text = "Restore all settings to their\nfactory default values."
+    elseif settings_close_hovered then
+        settings_tooltip_text = "Close settings and return\nto the main view."
+    end
     -- Column header hover area
     if mouse_y >= col_header_y and mouse_y < list_top then
         if mouse_x >= sym_box_x and mouse_x < sym_box_x + SYM_BOX_WIDTH then
@@ -8305,12 +14299,16 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         end
     end
     -- Last opened path row hover
-    if mouse_y >= lastpath_row_y and mouse_y < export_hdr_y then
+    if mouse_y >= lastpath_row_y and mouse_y < tips_row_y then
         if mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
             settings_tooltip_text = "Use the last imported folder\nwhen opening the file browser."
         elseif mouse_x >= horizontal_margin and mouse_x < gfx.w - horizontal_margin then
             settings_tooltip_text = "Last folder used for importing.\nUpdated automatically after each import."
         end
+    end
+    -- Hover Tips row hover
+    if mouse_y >= tips_row_y and mouse_y < export_hdr_y then
+        settings_tooltip_text = "Hover Tips: show descriptive tooltips\nwhen hovering over UI elements."
     end
     -- Import checkbox rows hover
     for i = 1, #checkboxes_list do
@@ -8320,6 +14318,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
                 settings_tooltip_text = "Show this option in the main menu."
             elseif mouse_x >= prefix_cb_x and mouse_x < prefix_cb_x + checkbox_size then
                 settings_tooltip_text = "Enable/disable this import option."
+            elseif mouse_x >= horizontal_margin and mouse_x < prefix_cb_x and checkboxes_list[i].tip then
+                settings_tooltip_text = checkboxes_list[i].tip
             end
         end
     end
@@ -8328,6 +14328,24 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         if mouse_x >= horizontal_margin and mouse_x < sym_box_x or
            mouse_x >= cb_x and mouse_x < cb_x + checkbox_size then
             settings_tooltip_text = "GM Track Names: use the General MIDI\npreset name (e.g. 'Electric Guitar (clean)')\nas the track name instead of the\noriginal part name from the file."
+        end
+    end
+    -- Import Position row hover
+    if mouse_y >= importpos_row_y and mouse_y < importpos_row_y + checkbox_row_height then
+        if mouse_x >= horizontal_margin then
+            settings_tooltip_text = "Where to place imported content\n(MIDI items, tempo markers, and regions):\n• Start of Project — position 0\n• Edit Cursor — at the current edit cursor\n• Closest Region Start — start of the nearest region\n• Closest Marker — at the nearest project marker"
+        end
+    end
+    -- Auto-load by Region row hover
+    if mouse_y >= autoloadrgn_row_y and mouse_y < autoloadrgn_row_y + checkbox_row_height then
+        if mouse_x >= horizontal_margin then
+            settings_tooltip_text = "Auto-load by Region: when enabled,\nautomatically loads a MusicXML file from\nthe import path if its name contains\nthe region name at the edit cursor.\nE.g. cursor at region 'Heart-Shaped Box'\nmatches 'Nirvana-Heart Shaped Box-06-22-2025.xml'"
+        end
+    end
+    -- MIDI Timebase row hover
+    if mouse_y >= timebase_row_y and mouse_y < timebase_row_y + checkbox_row_height then
+        if mouse_x >= horizontal_margin then
+            settings_tooltip_text = "MIDI item timebase for imported items:\n• Project default — uses the project setting\n• Time — absolute time, notes don't follow tempo\n• Beats (pos, len, rate) — fully beat-based\n• Beats (pos only) — position follows tempo"
         end
     end
     -- Fret number row hover
@@ -8358,24 +14376,66 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         end
     end
 
-    -- Section header helper
-    local function draw_section_hdr(label, y)
-        gfx.set(0.45, 0.45, 0.45, 1)
+    -- Section header helper (with fold triangle)
+    local function draw_section_hdr(label, y, folded)
+        local hovered = (mouse_x >= horizontal_margin and mouse_x < gfx.w - horizontal_margin and
+                         mouse_y >= y and mouse_y < y + section_hdr_h)
+        -- Triangle indicator
+        local tri_size = math.floor(gfx.texth * 0.45)
+        local tri_x = horizontal_margin
+        local tri_cy = y + math.floor(section_hdr_h / 2)
+        if hovered then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        else
+            gfx.set(0.45, 0.45, 0.45, 1)
+        end
+        if folded then
+            -- Right-pointing triangle ▶
+            local tx = tri_x
+            local ty = tri_cy - tri_size
+            for row = 0, tri_size * 2 do
+                local w = math.floor(tri_size * (1 - math.abs(row - tri_size) / tri_size))
+                if w > 0 then gfx.line(tx, ty + row, tx + w, ty + row) end
+            end
+        else
+            -- Down-pointing triangle ▼
+            local tx = tri_x
+            local ty = tri_cy - math.floor(tri_size * 0.5)
+            for row = 0, tri_size do
+                local half_w = tri_size - row
+                if half_w >= 0 then
+                    local cx = tx + tri_size
+                    gfx.line(cx - half_w, ty + row, cx + half_w, ty + row)
+                end
+            end
+        end
+        -- Label (offset past triangle)
+        local label_x = tri_x + tri_size * 2 + 6
         local text_y = y + (section_hdr_h - gfx.texth) / 2
-        gfx.x = horizontal_margin
+        if hovered then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        else
+            gfx.set(0.45, 0.45, 0.45, 1)
+        end
+        gfx.x = label_x
         gfx.y = text_y
         gfx.drawstr(label)
         local lw = gfx.measurestr(label)
         local line_y = y + math.floor(section_hdr_h / 2)
         gfx.set(0.3, 0.3, 0.3, 1)
-        gfx.line(horizontal_margin + lw + 8, line_y, gfx.w - horizontal_margin, line_y)
+        gfx.line(label_x + lw + 8, line_y, gfx.w - horizontal_margin, line_y)
     end
 
     -- Draw section headers
-    draw_section_hdr("GENERAL", general_hdr_y)
-    draw_section_hdr("EXPORT", export_hdr_y)
-    draw_section_hdr("IMPORT", import_hdr_y)
-    draw_section_hdr("ARTICULATION", art_hdr_y)
+    draw_section_hdr("GENERAL", general_hdr_y, settings_fold.general)
+    draw_section_hdr("EXPORT", export_hdr_y, settings_fold.export)
+    draw_section_hdr("IMPORT", import_hdr_y, settings_fold.import)
+    draw_section_hdr("TRANSIENTS", transients_hdr_y, settings_fold.transients)
+    draw_section_hdr("TEMPO MAP", tempomap_hdr_y, settings_fold.tempomap)
+    draw_section_hdr("MIDI TOOLS", miditools_hdr_y, settings_fold.miditools)
+    draw_section_hdr("INSERT AT MOUSE", iam_hdr_y, settings_fold.insertmouse)
+    draw_section_hdr("ARTICULATION", art_hdr_y, settings_fold.articulation)
+    draw_section_hdr("ARTICULATION GRID", artgrid_hdr_y, settings_fold.artgrid)
 
     -- Helper to draw the M (show-in-menu) checkbox
     local function draw_menu_flag_cb(x, y, flag)
@@ -8399,6 +14459,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
         end
     end
 
+    do -- scope: fret + span + hlscan + expreg drawing (free locals)
     -- Draw fret number row
     local fret_text_y = fret_row_y + (checkbox_size - gfx.texth) / 2
     gfx.set(table.unpack(gui.colors.TEXT))
@@ -8461,7 +14522,9 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.drawstr("Export Regions")
     draw_checkbox(cb_x, expreg_row_y, checkbox_size, cb_x, "", export_regions_enabled, gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, expreg_row_y, settings_menu_flags.expreg)
+    end -- end scope: fret + span + hlscan + expreg drawing
 
+    do -- scope: midibank + keysig drawing (free locals)
     -- Draw MIDI program banks row
     local midibank_text_y = midibank_row_y + (checkbox_size - gfx.texth) / 2
     gfx.set(table.unpack(gui.colors.TEXT))
@@ -8623,7 +14686,9 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     -- Enabled checkbox + M flag
     draw_checkbox(cb_x, keysig_row_y, checkbox_size, cb_x, "", export_key_sig_enabled, gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, keysig_row_y, settings_menu_flags.keysig)
+    end -- end scope: midibank + keysig drawing
 
+    do -- scope: openwith + openfolder drawing (free locals)
     -- Draw Open With row
     local openwith_text_y = openwith_row_y + (checkbox_size - gfx.texth) / 2
     gfx.set(table.unpack(gui.colors.TEXT))
@@ -8718,7 +14783,9 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.drawstr("Open Folder")
     draw_checkbox(cb_x, openfolder_row_y, checkbox_size, cb_x, "", export_open_folder_enabled, gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, openfolder_row_y, settings_menu_flags.openfolder)
+    end -- end scope: openwith + openfolder drawing
 
+    do -- scope: autofocus + stayontop + font + docker + winpos + winsize + defpath + lastpath drawing (free locals)
     -- Draw auto-focus row
     local autofocus_text_y = autofocus_row_y + (checkbox_size - gfx.texth) / 2
     gfx.set(table.unpack(gui.colors.TEXT))
@@ -8979,6 +15046,17 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     -- Draw radio checkbox for last opened path
     draw_checkbox(cb_x, lastpath_row_y, checkbox_size, cb_x, "", path_mode == "last", gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, lastpath_row_y, settings_menu_flags.lastpath)
+    end -- end scope: autofocus + stayontop + font + docker + winpos + winsize + defpath + lastpath drawing
+
+    -- Draw Tips checkbox row (General section)
+    do
+    local tips_text_y = tips_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = tips_text_y
+    gfx.drawstr("Hover Tips")
+    draw_checkbox(cb_x, tips_row_y, checkbox_size, cb_x, "", tips_enabled, gui.colors, 0, nil)
+    end
 
     -- Draw import checkbox rows
     for i, cb in ipairs(checkboxes_list) do
@@ -8995,6 +15073,7 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     end
 
     -- Draw GM Track Names row
+    do
     local gmname_text_y = gmname_row_y + (checkbox_size - gfx.texth) / 2
     gfx.set(table.unpack(gui.colors.TEXT))
     gfx.x = horizontal_margin
@@ -9002,11 +15081,1205 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     gfx.drawstr("GM Track Names")
     draw_checkbox(cb_x, gmname_row_y, checkbox_size, cb_x, "", gm_name_tracks_enabled, gui.colors, 0, nil)
     draw_menu_flag_cb(menu_cb_x, gmname_row_y, settings_menu_flags.gmname)
+    end
+
+    do -- scope: importpos + autoloadrgn + timebase + alignstem drawing (free locals)
+    -- Draw Auto-load by Region row
+    local autoloadrgn_text_y = autoloadrgn_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = autoloadrgn_text_y
+    gfx.drawstr("Auto-load by Region")
+    draw_checkbox(cb_x, autoloadrgn_row_y, checkbox_size, cb_x, "", autoload_by_region_enabled, gui.colors, 0, nil)
+    draw_menu_flag_cb(menu_cb_x, autoloadrgn_row_y, settings_menu_flags.autoloadrgn)
+
+    -- Draw MIDI Timebase row (scrollable button, no checkbox)
+    local timebase_text_y = timebase_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = timebase_text_y
+    gfx.drawstr("MIDI Timebase")
+    -- Scrollable button
+    local timebase_btn_x = sett_simple_btn_x
+    local timebase_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local timebase_label = import_timebase_options[import_timebase_index] or "Project default"
+    local timebase_btn_hovered = (mouse_x >= timebase_btn_x and mouse_x < timebase_btn_x + timebase_btn_w and
+                                   mouse_y >= timebase_row_y and mouse_y < timebase_row_y + checkbox_size)
+    if timebase_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(timebase_btn_x, timebase_row_y, timebase_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(timebase_btn_x, timebase_row_y, timebase_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local timebase_lbl_full = timebase_label
+    local timebase_lbl_w = gfx.measurestr(timebase_lbl_full)
+    if timebase_lbl_w > timebase_btn_w - 4 then
+        while #timebase_lbl_full > 1 and gfx.measurestr(timebase_lbl_full .. "..") > timebase_btn_w - 4 do
+            timebase_lbl_full = timebase_lbl_full:sub(1, -2)
+        end
+        timebase_lbl_full = timebase_lbl_full .. ".."
+        timebase_lbl_w = gfx.measurestr(timebase_lbl_full)
+    end
+    gfx.x = timebase_btn_x + (timebase_btn_w - timebase_lbl_w) / 2
+    gfx.y = timebase_text_y
+    gfx.drawstr(timebase_lbl_full)
+    draw_menu_flag_cb(menu_cb_x, timebase_row_y, settings_menu_flags.timebase)
+
+    -- Draw Tempo Map Frequency row (scrollable button, no checkbox)
+    local tempofreq_text_y = tempofreq_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = tempofreq_text_y
+    gfx.drawstr("Tempo Map Freq")
+    local tempofreq_btn_x = sett_simple_btn_x
+    local tempofreq_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local tempofreq_label = tempo_map_freq_options[tempo_map_freq_index] or "Off"
+    local tempofreq_btn_hovered = (mouse_x >= tempofreq_btn_x and mouse_x < tempofreq_btn_x + tempofreq_btn_w and
+                                   mouse_y >= tempofreq_row_y and mouse_y < tempofreq_row_y + checkbox_size)
+    if tempofreq_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(tempofreq_btn_x, tempofreq_row_y, tempofreq_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(tempofreq_btn_x, tempofreq_row_y, tempofreq_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local tempofreq_lbl_w = gfx.measurestr(tempofreq_label)
+    gfx.x = tempofreq_btn_x + (tempofreq_btn_w - tempofreq_lbl_w) / 2
+    gfx.y = tempofreq_text_y
+    gfx.drawstr(tempofreq_label)
+    draw_menu_flag_cb(menu_cb_x, tempofreq_row_y, settings_menu_flags.tempofreq)
+    if tempofreq_btn_hovered and tips_enabled then
+        pending_tooltip = "How often to write tempo markers.\n'Off' disables tempo map writing.\nLower values = more markers, finer tempo changes."
+    end
+
+    -- Draw Time Signature row (scrollable button, no checkbox)
+    local timesig_text_y = tempotimesig_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = timesig_text_y
+    gfx.drawstr("Time Signature")
+    local timesig_btn_x = sett_simple_btn_x
+    local timesig_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local timesig_label = tempo_timesig_options[tempo_timesig_index] or "4/4"
+    local timesig_btn_hovered = (mouse_x >= timesig_btn_x and mouse_x < timesig_btn_x + timesig_btn_w and
+                                  mouse_y >= tempotimesig_row_y and mouse_y < tempotimesig_row_y + checkbox_size)
+    if timesig_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(timesig_btn_x, tempotimesig_row_y, timesig_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(timesig_btn_x, tempotimesig_row_y, timesig_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local timesig_lbl_w = gfx.measurestr(timesig_label)
+    gfx.x = timesig_btn_x + (timesig_btn_w - timesig_lbl_w) / 2
+    gfx.y = timesig_text_y
+    gfx.drawstr(timesig_label)
+    draw_menu_flag_cb(menu_cb_x, tempotimesig_row_y, settings_menu_flags.tempotimesig)
+    if timesig_btn_hovered and tips_enabled then
+        local eff_n, eff_d = get_detect_tempo_timesig()
+        local eff_str = eff_n and (eff_n .. "/" .. eff_d) or "N/A"
+        pending_tooltip = "Base time signature for tempo detection.\nUsed directly when freq >= 1 bar.\nFor sub-bar freq, effective time sig: " .. eff_str
+    end
+
+    do -- scope: detectmethod + detecttempo + 4 sliders + useexisting + firstmarkerbar1 drawing (free locals)
+    -- Draw Detect Method row (scrollable button, no checkbox)
+    local detectmethod_text_y = detectmethod_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = detectmethod_text_y
+    gfx.drawstr("Detect Method")
+    local detectmethod_btn_x = sett_simple_btn_x
+    local detectmethod_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local detectmethod_label = tempo_detect_method_options[tempo_detect_method_index] or "Lua"
+    local detectmethod_btn_hovered = (mouse_x >= detectmethod_btn_x and mouse_x < detectmethod_btn_x + detectmethod_btn_w and
+                                      mouse_y >= detectmethod_row_y and mouse_y < detectmethod_row_y + checkbox_size)
+    if detectmethod_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(detectmethod_btn_x, detectmethod_row_y, detectmethod_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(detectmethod_btn_x, detectmethod_row_y, detectmethod_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local detectmethod_lbl_w = gfx.measurestr(detectmethod_label)
+    gfx.x = detectmethod_btn_x + (detectmethod_btn_w - detectmethod_lbl_w) / 2
+    gfx.y = detectmethod_text_y
+    gfx.drawstr(detectmethod_label)
+    draw_menu_flag_cb(menu_cb_x, detectmethod_row_y, settings_menu_flags.detectmethod)
+    if detectmethod_btn_hovered and tips_enabled then
+        pending_tooltip = "Algorithm for detecting audio transients.\nLua: built-in, no dependencies.\nPython: external, may be more accurate."
+    end
+
+    -- Draw Detect Item row (scrollable button)
+    do
+    local detectitem_text_y = detectitem_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = detectitem_text_y
+    gfx.drawstr("Detect Item")
+    local detectitem_btn_x = sett_simple_btn_x
+    local detectitem_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local detectitem_label
+    if detect_tempo_item_index <= 0 then
+        detectitem_label = "Selected Item"
+    elseif detect_tempo_item_index <= #detect_tempo_item_items then
+        detectitem_label = detect_tempo_item_items[detect_tempo_item_index].name
+    else
+        detectitem_label = "Selected Item"
+    end
+    local detectitem_btn_hovered = (mouse_x >= detectitem_btn_x and mouse_x < detectitem_btn_x + detectitem_btn_w and
+                                    mouse_y >= detectitem_row_y and mouse_y < detectitem_row_y + checkbox_size)
+    if detectitem_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(detectitem_btn_x, detectitem_row_y, detectitem_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(detectitem_btn_x, detectitem_row_y, detectitem_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local detectitem_lbl_w = gfx.measurestr(detectitem_label)
+    if detectitem_lbl_w > detectitem_btn_w - 8 then
+        local trunc = detectitem_label
+        while gfx.measurestr(trunc .. "...") > detectitem_btn_w - 8 and #trunc > 1 do
+            trunc = trunc:sub(1, #trunc - 1)
+        end
+        detectitem_label = trunc .. "..."
+        detectitem_lbl_w = gfx.measurestr(detectitem_label)
+    end
+    gfx.x = detectitem_btn_x + (detectitem_btn_w - detectitem_lbl_w) / 2
+    gfx.y = detectitem_text_y
+    gfx.drawstr(detectitem_label)
+    draw_menu_flag_cb(menu_cb_x, detectitem_row_y, settings_menu_flags.detectitem)
+    if detectitem_btn_hovered and tips_enabled then
+        pending_tooltip = "Which audio item to use for tempo detection.\n'Selected Item' uses whatever is selected in Arrange.\nOr pick a specific item from the region/cursor."
+    end
+    end
+
+    -- Draw Detect Tempo button row (full-width big button, drawn at end of Tempo Map section)
+
+    -- Draw Stretch Markers checkbox row
+    local stretchmarkers_text_y = stretchmarkers_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = stretchmarkers_text_y
+    gfx.drawstr("Stretch Markers")
+    -- Checkbox on the right
+    local sm_cb_hovered = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                           mouse_y >= stretchmarkers_row_y and mouse_y < stretchmarkers_row_y + checkbox_size)
+    if detect_stretch_markers_enabled or sm_cb_hovered then
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+    else
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+    end
+    gfx.rect(cb_x, stretchmarkers_row_y, checkbox_size, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(cb_x, stretchmarkers_row_y, checkbox_size, checkbox_size, 0)
+    gfx.rect(cb_x + 1, stretchmarkers_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+    if detect_stretch_markers_enabled then
+        gfx.set(table.unpack(gui.colors.CHECKMARK))
+        local check_str = "✓"
+        local cw = gfx.measurestr(check_str)
+        gfx.x = cb_x + (checkbox_size - cw) / 2
+        gfx.y = stretchmarkers_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr(check_str)
+    end
+    -- Hover tooltip for entire Stretch Markers row
+    local sm_row_hovered = (mouse_x >= horizontal_margin and mouse_x < cb_x + checkbox_size and
+                            mouse_y >= stretchmarkers_row_y and mouse_y < stretchmarkers_row_y + checkbox_size)
+    if sm_row_hovered and tips_enabled and not pending_tooltip then
+        pending_tooltip = "Insert stretch markers on transients.\nFirst stretch marker defines bar 1 position.\nPlace one before detecting to set the downbeat.\n\nUse 'Remove Stretch Markers' below to clear them\nwithin a razor edit, time selection, or selected items."
+    end
+
+    -- Draw 4 stretch marker slider rows (Threshold, Sensitivity, Retrig, Offset)
+    local sm_slider_defs = {
+        {row_y = threshold_row_y, label = "Threshold", val = sm_threshold_dB, vmin = 0, vmax = 60, unit = " dB", drag_id = "threshold",
+         tip = "Amplitude threshold for transient detection.\nHigher = detect quieter transients.\n0 = only the loudest, 60 = detect everything.\nDrag or scroll to adjust."},
+        {row_y = sensitivity_row_y, label = "Sensitivity", val = sm_sensitivity_dB, vmin = 1, vmax = 20, unit = " dB", drag_id = "sensitivity",
+         tip = "Envelope ratio sensitivity.\nLower = more transients detected.\nHigher = only sharp attacks.\nDrag or scroll to adjust."},
+        {row_y = retrig_row_y, label = "Retrig", val = sm_retrig_ms, vmin = 10, vmax = 500, unit = " ms", drag_id = "retrig",
+         tip = "Minimum time between detected transients.\nLower = allow closely spaced hits.\nHigher = skip rapid repeats.\nDrag or scroll to adjust."},
+        {row_y = offset_row_y, label = "Offset", val = sm_offset_ms, vmin = -100, vmax = 100, unit = " ms", drag_id = "offset",
+         tip = "Shift all placed stretch markers left/right.\nNegative = earlier, Positive = later.\nDoes not re-detect transients.\nDrag or scroll to adjust."},
+    }
+    for _, sd in ipairs(sm_slider_defs) do
+        local sl_text_y = sd.row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin
+        gfx.y = sl_text_y
+        gfx.drawstr(sd.label)
+        local sl_x = sett_simple_btn_x
+        local sl_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+        local sl_h = checkbox_size
+        local sl_track_h = 6
+        local sl_track_y = sd.row_y + (sl_h - sl_track_h) / 2
+        -- Track background
+        gfx.set(0.15, 0.15, 0.15, 1)
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 0)
+        -- Fraction (handle bidirectional offset: center = 0)
+        local sl_frac
+        if sd.vmin < 0 then
+            sl_frac = (sd.val - sd.vmin) / (sd.vmax - sd.vmin)
+        else
+            sl_frac = (sd.vmax - sd.vmin) > 0 and ((sd.val - sd.vmin) / (sd.vmax - sd.vmin)) or 0
+        end
+        sl_frac = math.max(0, math.min(1, sl_frac))
+        -- Teal fill (for offset: fill from center; for others: fill from left)
+        if sd.vmin < 0 then
+            local center_x = sl_x + math.floor(0.5 * sl_w)
+            local thumb_pos = sl_x + math.floor(sl_frac * sl_w)
+            local fill_left = math.min(center_x, thumb_pos)
+            local fill_right = math.max(center_x, thumb_pos)
+            if fill_right - fill_left > 0 then
+                gfx.set(0.17, 0.45, 0.39, 1)
+                gfx.rect(fill_left, sl_track_y, fill_right - fill_left, sl_track_h, 1)
+            end
+        else
+            local sl_fill_w = math.floor(sl_frac * sl_w)
+            if sl_fill_w > 0 then
+                gfx.set(0.17, 0.45, 0.39, 1)
+                gfx.rect(sl_x, sl_track_y, sl_fill_w, sl_track_h, 1)
+            end
+        end
+        -- Thumb
+        local sl_thumb_w = 10
+        local sl_thumb_x = sl_x + math.floor(sl_frac * sl_w) - sl_thumb_w / 2
+        if sl_thumb_x < sl_x then sl_thumb_x = sl_x end
+        if sl_thumb_x + sl_thumb_w > sl_x + sl_w then sl_thumb_x = sl_x + sl_w - sl_thumb_w end
+        local sl_hovered = (mouse_x >= sl_x and mouse_x < sl_x + sl_w and
+                            mouse_y >= sd.row_y and mouse_y < sd.row_y + sl_h)
+        if sl_hovered or sm_slider_dragging == sd.drag_id then
+            gfx.set(0.65, 0.65, 0.65, 1)
+        else
+            gfx.set(0.4, 0.4, 0.4, 1)
+        end
+        gfx.rect(sl_thumb_x, sd.row_y, sl_thumb_w, sl_h, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(sl_thumb_x, sd.row_y, sl_thumb_w, sl_h, 0)
+        -- Value label
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local sl_val_str = tostring(sd.val) .. sd.unit
+        local sl_val_w = gfx.measurestr(sl_val_str)
+        gfx.x = sl_x + (sl_w - sl_val_w) / 2
+        gfx.y = sl_text_y
+        gfx.drawstr(sl_val_str)
+        -- Tooltip
+        if sl_hovered and tips_enabled and not pending_tooltip then
+            pending_tooltip = sd.tip
+        end
+    end
+
+    -- Draw Use Existing Markers checkbox row
+    local uem_text_y = useexisting_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = uem_text_y
+    gfx.drawstr("Use Existing Markers")
+    local uem_cb_hovered = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                             mouse_y >= useexisting_row_y and mouse_y < useexisting_row_y + checkbox_size)
+    if detect_tempo_use_existing_markers or uem_cb_hovered then
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+    else
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+    end
+    gfx.rect(cb_x, useexisting_row_y, checkbox_size, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(cb_x, useexisting_row_y, checkbox_size, checkbox_size, 0)
+    gfx.rect(cb_x + 1, useexisting_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+    if detect_tempo_use_existing_markers then
+        gfx.set(table.unpack(gui.colors.CHECKMARK))
+        local check_str = "✓"
+        local cw = gfx.measurestr(check_str)
+        gfx.x = cb_x + (checkbox_size - cw) / 2
+        gfx.y = useexisting_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr(check_str)
+    end
+    if uem_cb_hovered and tips_enabled and not pending_tooltip then
+        pending_tooltip = "When enabled, Detect Tempo uses the stretch markers\nalready on the item instead of detecting transients.\nPlace markers manually or with the slider above,\nthen detect tempo from them."
+    end
+
+    end -- end scope: detectmethod + detecttempo + 4 sliders + useexisting drawing
+
+    -- Draw Detect Tempo Item row (scrollable button, no checkbox)
+    local alignstem_text_y = alignstem_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = alignstem_text_y
+    gfx.drawstr("Detect Tempo Item")
+    -- Scrollable button
+    local alignstem_btn_x = sett_simple_btn_x
+    local alignstem_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local alignstem_label
+    if align_stem_index == 0 then
+        alignstem_label = "Auto"
+    elseif align_stem_items[align_stem_index] then
+        alignstem_label = align_stem_items[align_stem_index].name
+    else
+        alignstem_label = "Auto"
+    end
+    local alignstem_btn_hovered = (mouse_x >= alignstem_btn_x and mouse_x < alignstem_btn_x + alignstem_btn_w and
+                                   mouse_y >= alignstem_row_y and mouse_y < alignstem_row_y + checkbox_size)
+    if alignstem_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(alignstem_btn_x, alignstem_row_y, alignstem_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(alignstem_btn_x, alignstem_row_y, alignstem_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local alignstem_lbl_full = alignstem_label
+    local alignstem_lbl_w = gfx.measurestr(alignstem_lbl_full)
+    if alignstem_lbl_w > alignstem_btn_w - 4 then
+        while #alignstem_lbl_full > 1 and gfx.measurestr(alignstem_lbl_full .. "..") > alignstem_btn_w - 4 do
+            alignstem_lbl_full = alignstem_lbl_full:sub(1, -2)
+        end
+        alignstem_lbl_full = alignstem_lbl_full .. ".."
+        alignstem_lbl_w = gfx.measurestr(alignstem_lbl_full)
+    end
+    gfx.x = alignstem_btn_x + (alignstem_btn_w - alignstem_lbl_w) / 2
+    gfx.y = alignstem_text_y
+    gfx.drawstr(alignstem_lbl_full)
+    draw_menu_flag_cb(menu_cb_x, alignstem_row_y, settings_menu_flags.alignstem)
+    if alignstem_btn_hovered and tips_enabled then
+        pending_tooltip = "Which audio item to use for tempo detection\nwhen importing MusicXML.\n'Auto' picks the first suitable item."
+    end
+
+    -- Draw Import Position row (scrollable button, no checkbox)
+    do
+    local importpos_text_y = importpos_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = importpos_text_y
+    gfx.drawstr("Import Position")
+    local importpos_btn_x = sett_simple_btn_x
+    local importpos_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local importpos_label = import_position_options[import_position_index] or "Start of Project"
+    local importpos_btn_hovered = (mouse_x >= importpos_btn_x and mouse_x < importpos_btn_x + importpos_btn_w and
+                                   mouse_y >= importpos_row_y and mouse_y < importpos_row_y + checkbox_size)
+    if importpos_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(importpos_btn_x, importpos_row_y, importpos_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(importpos_btn_x, importpos_row_y, importpos_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local importpos_lbl_full = importpos_label
+    local importpos_lbl_w = gfx.measurestr(importpos_lbl_full)
+    if importpos_lbl_w > importpos_btn_w - 4 then
+        while #importpos_lbl_full > 1 and gfx.measurestr(importpos_lbl_full .. "..") > importpos_btn_w - 4 do
+            importpos_lbl_full = importpos_lbl_full:sub(1, -2)
+        end
+        importpos_lbl_full = importpos_lbl_full .. ".."
+        importpos_lbl_w = gfx.measurestr(importpos_lbl_full)
+    end
+    gfx.x = importpos_btn_x + (importpos_btn_w - importpos_lbl_w) / 2
+    gfx.y = importpos_text_y
+    gfx.drawstr(importpos_lbl_full)
+    draw_menu_flag_cb(menu_cb_x, importpos_row_y, settings_menu_flags.importpos)
+    if importpos_btn_hovered and tips_enabled then
+        pending_tooltip = "Where to place imported items in the project.\n'Region Onset': auto-detect onset of audio in closest region.\n'START Marker': use the position of a project marker named START."
+    end
+    end
+
+    -- Draw Onset Item row (scrollable button, no checkbox)
+    local onsetitem_text_y = onsetitem_row_y + (checkbox_size - gfx.texth) / 2
+    gfx.set(table.unpack(gui.colors.TEXT))
+    gfx.x = horizontal_margin
+    gfx.y = onsetitem_text_y
+    gfx.drawstr("Onset Item")
+    -- Scrollable button
+    local onsetitem_btn_x = sett_simple_btn_x
+    local onsetitem_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    local onsetitem_label
+    if onset_item_index == 0 then
+        onsetitem_label = "Auto"
+    elseif onset_item_items[onset_item_index] then
+        onsetitem_label = onset_item_items[onset_item_index].name
+    else
+        onsetitem_label = "Auto"
+    end
+    local onsetitem_btn_hovered = (mouse_x >= onsetitem_btn_x and mouse_x < onsetitem_btn_x + onsetitem_btn_w and
+                                   mouse_y >= onsetitem_row_y and mouse_y < onsetitem_row_y + checkbox_size)
+    if onsetitem_btn_hovered then
+        gfx.set(0.17, 0.45, 0.39, 1)
+    else
+        gfx.set(0.2, 0.2, 0.2, 1)
+    end
+    gfx.rect(onsetitem_btn_x, onsetitem_row_y, onsetitem_btn_w, checkbox_size, 1)
+    gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+    gfx.rect(onsetitem_btn_x, onsetitem_row_y, onsetitem_btn_w, checkbox_size, 0)
+    gfx.set(table.unpack(gui.colors.TEXT))
+    local onsetitem_lbl_full = onsetitem_label
+    local onsetitem_lbl_w = gfx.measurestr(onsetitem_lbl_full)
+    if onsetitem_lbl_w > onsetitem_btn_w - 4 then
+        while #onsetitem_lbl_full > 1 and gfx.measurestr(onsetitem_lbl_full .. "..") > onsetitem_btn_w - 4 do
+            onsetitem_lbl_full = onsetitem_lbl_full:sub(1, -2)
+        end
+        onsetitem_lbl_full = onsetitem_lbl_full .. ".."
+        onsetitem_lbl_w = gfx.measurestr(onsetitem_lbl_full)
+    end
+    gfx.x = onsetitem_btn_x + (onsetitem_btn_w - onsetitem_lbl_w) / 2
+    gfx.y = onsetitem_text_y
+    gfx.drawstr(onsetitem_lbl_full)
+    draw_menu_flag_cb(menu_cb_x, onsetitem_row_y, settings_menu_flags.onsetitem)
+    if onsetitem_btn_hovered and tips_enabled then
+        pending_tooltip = "Which audio item to use for onset detection\n(finding where the song/section starts).\n'Auto' picks the first suitable item."
+    end
+    end -- end scope: importpos + autoloadrgn + timebase + alignstem + onsetitem drawing
+
+    do -- scope: imdup (import section duplicate rows) drawing
+    local r_btn_x = sett_simple_btn_x
+    local r_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+    -- Tempo Map Freq (import duplicate)
+    do
+    local r = imdup.tempofreq
+    if is_row_visible(r) then
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = r + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr("Tempo Map Freq")
+        local lbl = tempo_map_freq_options[tempo_map_freq_index] or "Off"
+        local hov = mouse_x >= r_btn_x and mouse_x < r_btn_x + r_btn_w and
+                    mouse_y >= r and mouse_y < r + checkbox_size
+        if hov then gfx.set(0.17, 0.45, 0.39, 1) else gfx.set(0.2, 0.2, 0.2, 1) end
+        gfx.rect(r_btn_x, r, r_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(r_btn_x, r, r_btn_w, checkbox_size, 0)
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local lbl_w = gfx.measurestr(lbl)
+        gfx.x = r_btn_x + (r_btn_w - lbl_w) / 2; gfx.y = r + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr(lbl)
+        draw_menu_flag_cb(menu_cb_x, r, settings_menu_flags.tempofreq)
+    end
+    end
+    -- Time Signature (import duplicate)
+    do
+    local r = imdup.tempotimesig
+    if is_row_visible(r) then
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = r + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr("Time Signature")
+        local lbl = tempo_timesig_options[tempo_timesig_index] or "4/4"
+        local hov = mouse_x >= r_btn_x and mouse_x < r_btn_x + r_btn_w and
+                    mouse_y >= r and mouse_y < r + checkbox_size
+        if hov then gfx.set(0.17, 0.45, 0.39, 1) else gfx.set(0.2, 0.2, 0.2, 1) end
+        gfx.rect(r_btn_x, r, r_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(r_btn_x, r, r_btn_w, checkbox_size, 0)
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local lbl_w = gfx.measurestr(lbl)
+        gfx.x = r_btn_x + (r_btn_w - lbl_w) / 2; gfx.y = r + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr(lbl)
+        draw_menu_flag_cb(menu_cb_x, r, settings_menu_flags.tempotimesig)
+    end
+    end
+    -- Detect Method (import duplicate)
+    do
+    local r = imdup.detectmethod
+    if is_row_visible(r) then
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = r + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr("Detect Method")
+        local lbl = tempo_detect_method_options[tempo_detect_method_index] or "Lua"
+        local hov = mouse_x >= r_btn_x and mouse_x < r_btn_x + r_btn_w and
+                    mouse_y >= r and mouse_y < r + checkbox_size
+        if hov then gfx.set(0.17, 0.45, 0.39, 1) else gfx.set(0.2, 0.2, 0.2, 1) end
+        gfx.rect(r_btn_x, r, r_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(r_btn_x, r, r_btn_w, checkbox_size, 0)
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local lbl_w = gfx.measurestr(lbl)
+        gfx.x = r_btn_x + (r_btn_w - lbl_w) / 2; gfx.y = r + (checkbox_size - gfx.texth) / 2
+        gfx.drawstr(lbl)
+        draw_menu_flag_cb(menu_cb_x, r, settings_menu_flags.detectmethod)
+    end
+    end
+    end -- end scope: imdup drawing
+
+    do -- scope: remap + nudge buttons drawing
+    -- Draw Remap button row
+    if is_row_visible(remap_row_y) then
+        local remap_text_y = remap_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin
+        gfx.y = remap_text_y
+        gfx.drawstr("Remap to Tempo")
+        local remap_sett_btn_x = sett_simple_btn_x
+        local remap_sett_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+        local remap_sett_label = "Remap"
+        if os.clock() < remap_confirmed_until then remap_sett_label = "Remapped!" end
+        remap_btn_hovered = (mouse_x >= remap_sett_btn_x and mouse_x < remap_sett_btn_x + remap_sett_btn_w and
+                             mouse_y >= remap_row_y and mouse_y < remap_row_y + checkbox_size)
+        if remap_btn_hovered then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        elseif os.clock() < remap_confirmed_until then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(remap_sett_btn_x, remap_row_y, remap_sett_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(remap_sett_btn_x, remap_row_y, remap_sett_btn_w, checkbox_size, 0)
+        if os.clock() < remap_confirmed_until then
+            gfx.set(0.3, 0.85, 0.5, 1)
+        else
+            gfx.set(table.unpack(gui.colors.TEXT))
+        end
+        local remap_lbl_w = gfx.measurestr(remap_sett_label)
+        gfx.x = remap_sett_btn_x + (remap_sett_btn_w - remap_lbl_w) / 2
+        gfx.y = remap_text_y
+        gfx.drawstr(remap_sett_label)
+        if remap_btn_hovered and tips_enabled then
+            pending_tooltip = "Re-position MIDI notes on selected items\nto match the current project tempo map.\nOnly works on items imported with this script."
+        end
+    end
+
+    -- Draw Delete Tempo Markers button row
+    if is_row_visible(del_tempo_row_y) then
+        local del_tempo_text_y = del_tempo_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin
+        gfx.y = del_tempo_text_y
+        gfx.drawstr("Delete Tempo Markers")
+        local del_tempo_btn_x = sett_simple_btn_x
+        local del_tempo_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+        local del_tempo_label = "Delete"
+        if os.clock() < del_tempo_confirmed_until then del_tempo_label = "Deleted!" end
+        del_tempo_btn_hovered = (mouse_x >= del_tempo_btn_x and mouse_x < del_tempo_btn_x + del_tempo_btn_w and
+                                 mouse_y >= del_tempo_row_y and mouse_y < del_tempo_row_y + checkbox_size)
+        if del_tempo_btn_hovered then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        elseif os.clock() < del_tempo_confirmed_until then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(del_tempo_btn_x, del_tempo_row_y, del_tempo_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(del_tempo_btn_x, del_tempo_row_y, del_tempo_btn_w, checkbox_size, 0)
+        if os.clock() < del_tempo_confirmed_until then
+            gfx.set(0.3, 0.85, 0.5, 1)
+        else
+            gfx.set(table.unpack(gui.colors.TEXT))
+        end
+        local del_tempo_lbl_w = gfx.measurestr(del_tempo_label)
+        gfx.x = del_tempo_btn_x + (del_tempo_btn_w - del_tempo_lbl_w) / 2
+        gfx.y = del_tempo_text_y
+        gfx.drawstr(del_tempo_label)
+        if del_tempo_btn_hovered and tips_enabled then
+            pending_tooltip = "Delete tempo markers within the active range.\nRange priority: razor edit → time selection\n→ bounding box of selected items."
+        end
+    end
+
+    -- Draw Nudge Tempo slider row (full-width, ±500 ms; snaps to SM when Snap Tempo to SM is ON)
+    if is_row_visible(tempo_nudge_row_y) then
+        local sl_x = sett_simple_btn_x
+        local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+        local sl_text_y = tempo_nudge_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = sl_text_y
+        gfx.drawstr("Nudge Tempo")
+        -- Teal tint on track when snap is enabled
+        if tempo_snap_to_sm_enabled then
+            gfx.set(0.12, 0.28, 0.24, 1)
+        else
+            gfx.set(0.15, 0.15, 0.15, 1)
+        end
+        local sl_track_h = 6
+        local sl_track_y = tempo_nudge_row_y + (checkbox_size - sl_track_h) / 2
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 0)
+        local tn_frac = (tempo_nudge_value + 500) / 1000
+        tn_frac = math.max(0, math.min(1, tn_frac))
+        local center_tx = sl_x + math.floor(0.5 * sl_w)
+        local thumb_tx = sl_x + math.floor(tn_frac * sl_w)
+        local fill_tl = math.min(center_tx, thumb_tx)
+        local fill_tr = math.max(center_tx, thumb_tx)
+        if fill_tr - fill_tl > 0 then
+            gfx.set(0.17, 0.45, 0.39, 1)
+            gfx.rect(fill_tl, sl_track_y, fill_tr - fill_tl, sl_track_h, 1)
+        end
+        local thumb_tw = 10
+        local thumb_tpx = sl_x + math.floor(tn_frac * sl_w) - thumb_tw / 2
+        thumb_tpx = math.max(sl_x, math.min(sl_x + sl_w - thumb_tw, thumb_tpx))
+        local tsl_hov = (mouse_x >= sl_x and mouse_x < sl_x + sl_w and mouse_y >= tempo_nudge_row_y and mouse_y < tempo_nudge_row_y + checkbox_size)
+        local tthumb_bright = (tsl_hov or tempo_nudge_slider_dragging) and 0.65 or 0.4
+        gfx.set(tthumb_bright, tthumb_bright, tthumb_bright, 1)
+        gfx.rect(thumb_tpx, tempo_nudge_row_y, thumb_tw, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(thumb_tpx, tempo_nudge_row_y, thumb_tw, checkbox_size, 0)
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local tnu_str = tostring(tempo_nudge_value) .. " ms"
+        if tempo_snap_to_sm_enabled and tempo_nudge_slider_dragging then
+            tnu_str = tostring(tempo_nudge_value) .. " ms →SM"
+        end
+        local tnu_w = gfx.measurestr(tnu_str)
+        gfx.x = sl_x + (sl_w - tnu_w) / 2; gfx.y = sl_text_y
+        gfx.drawstr(tnu_str)
+        if tsl_hov and tips_enabled and not pending_tooltip then
+            local tip = "Drag to move the tempo marker nearest the\nedit cursor by ±500 ms."
+            if tempo_snap_to_sm_enabled then
+                tip = tip .. "\nSnap mode ON: snaps to nearest stretch marker."
+            end
+            pending_tooltip = tip
+        end
+    end
+
+    -- Draw Snap Tempo to SM checkbox row
+    if is_row_visible(tempo_snap_row_y) then
+        local snap_text_y = tempo_snap_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = snap_text_y
+        gfx.drawstr("Snap Tempo to SM")
+        -- Value checkbox
+        local snap_tm_cb_hov = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                                mouse_y >= tempo_snap_row_y and mouse_y < tempo_snap_row_y + checkbox_size)
+        if tempo_snap_to_sm_enabled or snap_tm_cb_hov then
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+        else
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+        end
+        gfx.rect(cb_x, tempo_snap_row_y, checkbox_size, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(cb_x, tempo_snap_row_y, checkbox_size, checkbox_size, 0)
+        gfx.rect(cb_x + 1, tempo_snap_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+        if tempo_snap_to_sm_enabled then
+            gfx.set(table.unpack(gui.colors.CHECKMARK))
+            local cw = gfx.measurestr("✓")
+            gfx.x = cb_x + (checkbox_size - cw) / 2
+            gfx.y = snap_text_y
+            gfx.drawstr("✓")
+        end
+        draw_menu_flag_cb(menu_cb_x, tempo_snap_row_y, settings_menu_flags.temposnap)
+        if snap_tm_cb_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "When ON, the Nudge Tempo slider snaps\nthe tempo marker incrementally to stretch markers.\nDrag further to step to the next SM.\nM: show this toggle in the main view."
+        end
+    end
+
+    -- Draw Detect Tempo big button (full-width, file_info_height, last in Tempo Map)
+    if detecttempo_row_y > -9000 and detecttempo_row_y + file_info_height > content_top and detecttempo_row_y < content_bottom then
+        local dtt_hov = (mouse_y >= detecttempo_row_y and mouse_y < detecttempo_row_y + file_info_height)
+        if dtt_hov then gfx.set(0.17, 0.45, 0.39, 1) else gfx.set(0.2, 0.2, 0.2, 1) end
+        gfx.rect(0, detecttempo_row_y, gfx.w, file_info_height, 1)
+        gfx.set(table.unpack(gui.colors.BORDER))
+        gfx.rect(0, detecttempo_row_y, gfx.w, file_info_height, 0)
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local dtt_lbl_w = gfx.measurestr("Detect Tempo")
+        gfx.x = (gfx.w - dtt_lbl_w) / 2
+        gfx.y = detecttempo_row_y + (file_info_height - gfx.texth) / 2
+        gfx.drawstr("Detect Tempo")
+        if dtt_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Detect tempo from audio transients\nand write a tempo map to the project.\nUses grid-fit scoring for accuracy."
+        end
+    end
+
+    -- Draw Remove Stretch Markers button row
+    if is_row_visible(del_sm_row_y) then
+        local del_sm_text_y = del_sm_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin
+        gfx.y = del_sm_text_y
+        gfx.drawstr("Remove Stretch Markers")
+        local del_sm_btn_x = sett_simple_btn_x
+        local del_sm_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+        local del_sm_label = "Remove"
+        if os.clock() < del_sm_confirmed_until then del_sm_label = "Removed!" end
+        del_sm_btn_hovered = (mouse_x >= del_sm_btn_x and mouse_x < del_sm_btn_x + del_sm_btn_w and
+                              mouse_y >= del_sm_row_y and mouse_y < del_sm_row_y + checkbox_size)
+        if del_sm_btn_hovered then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        elseif os.clock() < del_sm_confirmed_until then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(del_sm_btn_x, del_sm_row_y, del_sm_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(del_sm_btn_x, del_sm_row_y, del_sm_btn_w, checkbox_size, 0)
+        if os.clock() < del_sm_confirmed_until then
+            gfx.set(0.3, 0.85, 0.5, 1)
+        else
+            gfx.set(table.unpack(gui.colors.TEXT))
+        end
+        local del_sm_lbl_w = gfx.measurestr(del_sm_label)
+        gfx.x = del_sm_btn_x + (del_sm_btn_w - del_sm_lbl_w) / 2
+        gfx.y = del_sm_text_y
+        gfx.drawstr(del_sm_label)
+        if del_sm_btn_hovered and tips_enabled then
+            pending_tooltip = "Remove stretch markers from audio items\nwithin the active range.\nRange: razor edit → time selection → selected items.\nNo item selection needed when a range is set."
+        end
+    end
+
+    -- Draw Nudge SM slider row (full-width, ±500 ms offset slider, no rate change)
+    if is_row_visible(sm_nudge_row_y) then
+        local sl_x = sett_simple_btn_x
+        local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+        local sl_text_y = sm_nudge_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = sl_text_y
+        gfx.drawstr("Nudge SM")
+        -- Slider track
+        local sl_track_h = 6
+        local sl_track_y = sm_nudge_row_y + (checkbox_size - sl_track_h) / 2
+        gfx.set(0.15, 0.15, 0.15, 1)
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 0)
+        -- Fill from center (bidirectional)
+        local sm_nu_frac = (sm_nudge_value + 500) / 1000
+        sm_nu_frac = math.max(0, math.min(1, sm_nu_frac))
+        local center_x = sl_x + math.floor(0.5 * sl_w)
+        local thumb_x = sl_x + math.floor(sm_nu_frac * sl_w)
+        local fill_l = math.min(center_x, thumb_x)
+        local fill_r = math.max(center_x, thumb_x)
+        if fill_r - fill_l > 0 then
+            gfx.set(0.17, 0.45, 0.39, 1)
+            gfx.rect(fill_l, sl_track_y, fill_r - fill_l, sl_track_h, 1)
+        end
+        -- Thumb
+        local thumb_w = 10
+        local thumb_px = sl_x + math.floor(sm_nu_frac * sl_w) - thumb_w / 2
+        thumb_px = math.max(sl_x, math.min(sl_x + sl_w - thumb_w, thumb_px))
+        local sl_hov = (mouse_x >= sl_x and mouse_x < sl_x + sl_w and mouse_y >= sm_nudge_row_y and mouse_y < sm_nudge_row_y + checkbox_size)
+        local sm_thumb_bright = (sl_hov or sm_nudge_slider_dragging) and 0.65 or 0.4
+        gfx.set(sm_thumb_bright, sm_thumb_bright, sm_thumb_bright, 1)
+        gfx.rect(thumb_px, sm_nudge_row_y, thumb_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(thumb_px, sm_nudge_row_y, thumb_w, checkbox_size, 0)
+        -- Value label
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local nu_str = tostring(sm_nudge_value) .. " ms"
+        local nu_w = gfx.measurestr(nu_str)
+        gfx.x = sl_x + (sl_w - nu_w) / 2; gfx.y = sl_text_y
+        gfx.drawstr(nu_str)
+        if sl_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Drag to slide the stretch marker nearest the edit cursor\nby ±500 ms. Both timeline and source position move\ntogether — no audio rate change."
+        end
+    end
+
+    -- Draw Snap SM to Grid checkbox row
+    if is_row_visible(sm_snap_row_y) then
+        local snap_text_y = sm_snap_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = snap_text_y
+        gfx.drawstr("Snap SM to Grid")
+        -- Value checkbox
+        local snap_sm_cb_hov = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                                mouse_y >= sm_snap_row_y and mouse_y < sm_snap_row_y + checkbox_size)
+        if sm_snap_to_grid_enabled or snap_sm_cb_hov then
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+        else
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+        end
+        gfx.rect(cb_x, sm_snap_row_y, checkbox_size, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(cb_x, sm_snap_row_y, checkbox_size, checkbox_size, 0)
+        gfx.rect(cb_x + 1, sm_snap_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+        if sm_snap_to_grid_enabled then
+            gfx.set(table.unpack(gui.colors.CHECKMARK))
+            local cw = gfx.measurestr("✓")
+            gfx.x = cb_x + (checkbox_size - cw) / 2
+            gfx.y = snap_text_y
+            gfx.drawstr("✓")
+        end
+        draw_menu_flag_cb(menu_cb_x, sm_snap_row_y, settings_menu_flags.smsnap)
+        if snap_sm_cb_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "When ON, 'Snap Grid' button snaps the nearest\nstretch marker to the project grid.\nM: show this toggle in the main view."
+        end
+    end
+
+    -- Draw Detect Transients big button (full-width, file_info_height, last in Transients)
+    if detect_transients_row_y > -9000 and detect_transients_row_y + file_info_height > content_top and detect_transients_row_y < content_bottom then
+        local dt_hov = (mouse_y >= detect_transients_row_y and mouse_y < detect_transients_row_y + file_info_height)
+        local dt_confirmed = (os.clock() < detect_transients_confirmed_until)
+        if dt_confirmed then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        elseif dt_hov then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(0, detect_transients_row_y, gfx.w, file_info_height, 1)
+        gfx.set(table.unpack(gui.colors.BORDER))
+        gfx.rect(0, detect_transients_row_y, gfx.w, file_info_height, 0)
+        local dt_lbl = dt_confirmed and "Detected!" or "Detect Transients"
+        if dt_confirmed then gfx.set(0.3, 0.85, 0.5, 1) else gfx.set(table.unpack(gui.colors.TEXT)) end
+        local dt_lbl_w = gfx.measurestr(dt_lbl)
+        gfx.x = (gfx.w - dt_lbl_w) / 2
+        gfx.y = detect_transients_row_y + (file_info_height - gfx.texth) / 2
+        gfx.drawstr(dt_lbl)
+        if dt_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Detect audio transients and write stretch markers\nusing the current slider settings.\nRange: time selection or razor edit on item's track."
+        end
+    end
+
+    -- Draw MIDI SM Mode checkbox row (MIDI TOOLS section)
+    if is_row_visible(midi_sm_row_y) then
+        local msm_text_y = midi_sm_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = msm_text_y
+        gfx.drawstr("MIDI SM Mode")
+        local msm_cb_hov = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                            mouse_y >= midi_sm_row_y and mouse_y < midi_sm_row_y + checkbox_size)
+        if midi_sm_enabled or msm_cb_hov then
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+        else
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+        end
+        gfx.rect(cb_x, midi_sm_row_y, checkbox_size, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(cb_x, midi_sm_row_y, checkbox_size, checkbox_size, 0)
+        gfx.rect(cb_x + 1, midi_sm_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+        if midi_sm_enabled then
+            gfx.set(table.unpack(gui.colors.CHECKMARK))
+            local cw = gfx.measurestr("✓")
+            gfx.x = cb_x + (checkbox_size - cw) / 2
+            gfx.y = msm_text_y
+            gfx.drawstr("✓")
+        end
+        draw_menu_flag_cb(menu_cb_x, midi_sm_row_y, settings_menu_flags.midism)
+        if msm_cb_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "MIDI Stretch Markers mode.\nManually add take markers to a MIDI item in REAPER.\nWhen ON, moving a take marker proportionally\nstretches or shrinks the MIDI notes in that region.\nMarker names show the segment rate (e.g. 1.00x).\nM: show this toggle in the main view."
+        end
+    end
+
+    -- Draw Insert TM at cursor button row (MIDI TOOLS)
+    if is_row_visible(midi_tm_insert_row_y) then
+        local sl_x = sett_simple_btn_x
+        local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+        local ins_hov = (mouse_x >= sl_x and mouse_x < sl_x + sl_w and
+                         mouse_y >= midi_tm_insert_row_y and mouse_y < midi_tm_insert_row_y + checkbox_size)
+        -- Label on left
+        local ins_text_y = midi_tm_insert_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = ins_text_y
+        gfx.drawstr("Insert TM at cursor")
+        -- Button
+        if ins_hov then gfx.set(table.unpack(gui.colors.BTN_HOVER))
+        else           gfx.set(table.unpack(gui.colors.BTN)) end
+        gfx.rect(sl_x, midi_tm_insert_row_y, sl_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.BORDER))
+        gfx.rect(sl_x, midi_tm_insert_row_y, sl_w, checkbox_size, 0)
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local btn_lbl = "Insert 1.00x"
+        local btn_lbl_w = gfx.measurestr(btn_lbl)
+        gfx.x = sl_x + (sl_w - btn_lbl_w) / 2; gfx.y = ins_text_y
+        gfx.drawstr(btn_lbl)
+        if ins_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Inserts a '1.00x' take marker at the edit cursor\non the currently selected MIDI item.\nOnly markers with a rate label (e.g. 1.00x) are\nrecognized by the Move and Stretch sliders."
+        end
+    end
+
+    -- Draw MIDI TM Move slider row (MIDI TOOLS)
+    if is_row_visible(midi_tm_move_row_y) then
+        local sl_x = sett_simple_btn_x
+        local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+        local sl_track_h = 4
+        local sl_text_y = midi_tm_move_row_y + (checkbox_size - gfx.texth) / 2
+        local sl_track_y = midi_tm_move_row_y + (checkbox_size - sl_track_h) / 2
+        -- Label
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = sl_text_y
+        gfx.drawstr("Shift TM")
+        -- Track
+        gfx.set(0.15, 0.15, 0.15, 1)
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 0)
+        -- Fill from centre
+        local mv_frac = (midi_tm_move_value + 500) / 1000
+        mv_frac = math.max(0, math.min(1, mv_frac))
+        local center_x = sl_x + math.floor(0.5 * sl_w)
+        local thumb_x  = sl_x + math.floor(mv_frac * sl_w)
+        local fill_l = math.min(center_x, thumb_x)
+        local fill_r = math.max(center_x, thumb_x)
+        if fill_r - fill_l > 0 then
+            gfx.set(0.17, 0.45, 0.39, 1)
+            gfx.rect(fill_l, sl_track_y, fill_r - fill_l, sl_track_h, 1)
+        end
+        -- Thumb
+        local thumb_w = 10
+        local thumb_px = sl_x + math.floor(mv_frac * sl_w) - thumb_w / 2
+        thumb_px = math.max(sl_x, math.min(sl_x + sl_w - thumb_w, thumb_px))
+        local mv_sl_hov = (mouse_x >= sl_x and mouse_x < sl_x + sl_w and
+                           mouse_y >= midi_tm_move_row_y and mouse_y < midi_tm_move_row_y + checkbox_size)
+        local mv_bright = (mv_sl_hov or midi_tm_move_dragging) and 0.65 or 0.4
+        gfx.set(mv_bright, mv_bright, mv_bright, 1)
+        gfx.rect(thumb_px, midi_tm_move_row_y, thumb_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(thumb_px, midi_tm_move_row_y, thumb_w, checkbox_size, 0)
+        -- Value label
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local mv_str = midi_tm_move_value == 0 and "0 qn" or string.format("%+.2f qn", midi_tm_move_value / 250)
+        local mv_str_w = gfx.measurestr(mv_str)
+        gfx.x = sl_x + (sl_w - mv_str_w) / 2; gfx.y = sl_text_y
+        gfx.drawstr(mv_str)
+        if mv_sl_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Drag to move the rated take marker (e.g. 1.00x)\nnearest the edit cursor by ±500 ms.\nNote positions are NOT changed."
+        end
+    end
+
+    -- Draw MIDI TM Stretch slider row (MIDI TOOLS)
+    if is_row_visible(midi_tm_stretch_row_y) then
+        local sl_x = sett_simple_btn_x
+        local sl_w = math.max(20, cb_x - COL_SPACING - sl_x)
+        local sl_track_h = 4
+        local sl_text_y = midi_tm_stretch_row_y + (checkbox_size - gfx.texth) / 2
+        local sl_track_y = midi_tm_stretch_row_y + (checkbox_size - sl_track_h) / 2
+        -- Label
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = sl_text_y
+        gfx.drawstr("Warp TM")
+        -- Track
+        gfx.set(0.15, 0.15, 0.15, 1)
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(sl_x, sl_track_y, sl_w, sl_track_h, 0)
+        -- Fill from centre
+        local st_frac = (midi_tm_stretch_value + 500) / 1000
+        st_frac = math.max(0, math.min(1, st_frac))
+        local center_x = sl_x + math.floor(0.5 * sl_w)
+        local thumb_x  = sl_x + math.floor(st_frac * sl_w)
+        local fill_l = math.min(center_x, thumb_x)
+        local fill_r = math.max(center_x, thumb_x)
+        if fill_r - fill_l > 0 then
+            gfx.set(0.17, 0.45, 0.39, 1)
+            gfx.rect(fill_l, sl_track_y, fill_r - fill_l, sl_track_h, 1)
+        end
+        -- Thumb
+        local thumb_w = 10
+        local thumb_px = sl_x + math.floor(st_frac * sl_w) - thumb_w / 2
+        thumb_px = math.max(sl_x, math.min(sl_x + sl_w - thumb_w, thumb_px))
+        local st_sl_hov = (mouse_x >= sl_x and mouse_x < sl_x + sl_w and
+                           mouse_y >= midi_tm_stretch_row_y and mouse_y < midi_tm_stretch_row_y + checkbox_size)
+        local st_bright = (st_sl_hov or midi_tm_stretch_dragging) and 0.65 or 0.4
+        gfx.set(st_bright, st_bright, st_bright, 1)
+        gfx.rect(thumb_px, midi_tm_stretch_row_y, thumb_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(thumb_px, midi_tm_stretch_row_y, thumb_w, checkbox_size, 0)
+        -- Value label
+        gfx.set(table.unpack(gui.colors.TEXT))
+        local st_str = midi_tm_stretch_display_str
+        local st_str_w = gfx.measurestr(st_str)
+        gfx.x = sl_x + (sl_w - st_str_w) / 2; gfx.y = sl_text_y
+        gfx.drawstr(st_str)
+        if st_sl_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Drag to warp the take marker nearest the edit\ncursor by up to \xC2\xB12 beats AND proportionally\nstretch/shrink the MIDI notes in adjacent regions.\nRecommended: open the inline MIDI editor\n(double-click item) to see note changes\nin real time while dragging."
+        end
+    end
+
+    -- Draw TM Grid Snap checkbox row (MIDI TOOLS)
+    if is_row_visible(midi_tm_snap_row_y) then
+        local sn_text_y = midi_tm_snap_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = sn_text_y
+        gfx.drawstr("TM Grid Snap")
+        local sn_cb_hov = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                           mouse_y >= midi_tm_snap_row_y and mouse_y < midi_tm_snap_row_y + checkbox_size)
+        if midi_tm_snap_enabled or sn_cb_hov then
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+        else
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+        end
+        gfx.rect(cb_x, midi_tm_snap_row_y, checkbox_size, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(cb_x, midi_tm_snap_row_y, checkbox_size, checkbox_size, 0)
+        gfx.rect(cb_x + 1, midi_tm_snap_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+        if midi_tm_snap_enabled then
+            gfx.set(table.unpack(gui.colors.CHECKMARK))
+            local cw = gfx.measurestr("\xE2\x9C\x93")
+            gfx.x = cb_x + (checkbox_size - cw) / 2; gfx.y = sn_text_y
+            gfx.drawstr("\xE2\x9C\x93")
+        end
+        if sn_cb_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "When ON, the Shift TM and Warp TM sliders\nsnap the marker position to the project grid.\nOff by default -- turn on if you want\ngrid-locked marker positioning."
+        end
+    end
+
+    -- Draw Snap TM to Note button row (MIDI TOOLS)
+    if is_row_visible(midi_tm_snap_note_row_y) then
+        local snn_text_y = midi_tm_snap_note_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = snn_text_y
+        gfx.drawstr("Snap TM to Note")
+        local snn_sl_x = sett_simple_btn_x
+        local snn_sl_w = math.max(20, cb_x - COL_SPACING - snn_sl_x)
+        local snn_label = os.clock() < midi_tm_snap_to_note_confirmed_until and "Snapped!" or "Snap"
+        local snn_btn_hov = (mouse_x >= snn_sl_x and mouse_x < snn_sl_x + snn_sl_w and
+                             mouse_y >= midi_tm_snap_note_row_y and mouse_y < midi_tm_snap_note_row_y + checkbox_size)
+        if snn_btn_hov then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        elseif os.clock() < midi_tm_snap_to_note_confirmed_until then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(snn_sl_x, midi_tm_snap_note_row_y, snn_sl_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(snn_sl_x, midi_tm_snap_note_row_y, snn_sl_w, checkbox_size, 0)
+        if os.clock() < midi_tm_snap_to_note_confirmed_until then
+            gfx.set(0.3, 0.85, 0.5, 1)
+        else
+            gfx.set(table.unpack(gui.colors.TEXT))
+        end
+        local snn_lbl_w = gfx.measurestr(snn_label)
+        gfx.x = snn_sl_x + (snn_sl_w - snn_lbl_w) / 2; gfx.y = snn_text_y
+        gfx.drawstr(snn_label)
+        if snn_btn_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Snap the nearest rated take marker to the\nclosest note start or end in the MIDI item.\nUseful for aligning markers to note boundaries."
+        end
+    end
+
+    -- Draw Auto-snap TM to note edge checkbox row (MIDI TOOLS)
+    if is_row_visible(midi_tm_autosnap_row_y) then
+        local as_text_y = midi_tm_autosnap_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = as_text_y
+        gfx.drawstr("Auto-snap TM")
+        local as_cb_hov = (mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                           mouse_y >= midi_tm_autosnap_row_y and mouse_y < midi_tm_autosnap_row_y + checkbox_size)
+        if midi_tm_autosnap_note_enabled or as_cb_hov then
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+        else
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+        end
+        gfx.rect(cb_x, midi_tm_autosnap_row_y, checkbox_size, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(cb_x, midi_tm_autosnap_row_y, checkbox_size, checkbox_size, 0)
+        gfx.rect(cb_x + 1, midi_tm_autosnap_row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+        if midi_tm_autosnap_note_enabled then
+            gfx.set(table.unpack(gui.colors.CHECKMARK))
+            local cw = gfx.measurestr("\xE2\x9C\x93")
+            gfx.x = cb_x + (checkbox_size - cw) / 2; gfx.y = as_text_y
+            gfx.drawstr("\xE2\x9C\x93")
+        end
+        if as_cb_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "When ON, every Shift TM or Warp TM drag\nautomatically snaps the marker to the\nclosest note start or end while dragging.\nUseful for snapping to notes in real time."
+        end
+    end
+
+    -- Draw Reset TM button row (MIDI TOOLS)
+    if is_row_visible(midi_tm_reset_row_y) then
+        local rst_text_y = midi_tm_reset_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin; gfx.y = rst_text_y
+        gfx.drawstr("Reset TM")
+        local rst_sl_x = sett_simple_btn_x
+        local rst_sl_w = math.max(20, cb_x - COL_SPACING - rst_sl_x)
+        local rst_label = os.clock() < midi_tm_reset_confirmed_until and "Reset!" or "Reset"
+        local rst_btn_hov = (mouse_x >= rst_sl_x and mouse_x < rst_sl_x + rst_sl_w and
+                             mouse_y >= midi_tm_reset_row_y and mouse_y < midi_tm_reset_row_y + checkbox_size)
+        if rst_btn_hov then
+            gfx.set(0.45, 0.18, 0.18, 1)  -- dark red hover
+        elseif os.clock() < midi_tm_reset_confirmed_until then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(rst_sl_x, midi_tm_reset_row_y, rst_sl_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(rst_sl_x, midi_tm_reset_row_y, rst_sl_w, checkbox_size, 0)
+        if os.clock() < midi_tm_reset_confirmed_until then
+            gfx.set(0.3, 0.85, 0.5, 1)
+        else
+            gfx.set(table.unpack(gui.colors.TEXT))
+        end
+        local rst_lbl_w = gfx.measurestr(rst_label)
+        gfx.x = rst_sl_x + (rst_sl_w - rst_lbl_w) / 2; gfx.y = rst_text_y
+        gfx.drawstr(rst_label)
+        if rst_btn_hov and tips_enabled and not pending_tooltip then
+            pending_tooltip = "Restore all notes to their original (pre-warp)\npositions and reset all take markers to 1.00x.\nRequires the selected MIDI item to have\nan active MIDI SM state."
+        end
+    end
+
+    -- Draw Nudge to Transients button row (MIDI TOOLS)
+    if is_row_visible(nudge_row_y) then
+        local nudge_text_y = nudge_row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin
+        gfx.y = nudge_text_y
+        gfx.drawstr("Nudge to Transients")
+        local nudge_sett_btn_x = sett_simple_btn_x
+        local nudge_sett_btn_w = math.max(20, cb_x - COL_SPACING - sett_simple_btn_x)
+        local nudge_sett_label = "Nudge"
+        if os.clock() < nudge_confirmed_until then nudge_sett_label = "Nudged!" end
+        nudge_btn_hovered = (mouse_x >= nudge_sett_btn_x and mouse_x < nudge_sett_btn_x + nudge_sett_btn_w and
+                             mouse_y >= nudge_row_y and mouse_y < nudge_row_y + checkbox_size)
+        if nudge_btn_hovered then
+            gfx.set(0.17, 0.45, 0.39, 1)
+        elseif os.clock() < nudge_confirmed_until then
+            gfx.set(0.15, 0.35, 0.2, 1)
+        else
+            gfx.set(0.2, 0.2, 0.2, 1)
+        end
+        gfx.rect(nudge_sett_btn_x, nudge_row_y, nudge_sett_btn_w, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(nudge_sett_btn_x, nudge_row_y, nudge_sett_btn_w, checkbox_size, 0)
+        if os.clock() < nudge_confirmed_until then
+            gfx.set(0.3, 0.85, 0.5, 1)
+        else
+            gfx.set(table.unpack(gui.colors.TEXT))
+        end
+        local nudge_lbl_w = gfx.measurestr(nudge_sett_label)
+        gfx.x = nudge_sett_btn_x + (nudge_sett_btn_w - nudge_lbl_w) / 2
+        gfx.y = nudge_text_y
+        gfx.drawstr(nudge_sett_label)
+        if nudge_btn_hovered and tips_enabled then
+            pending_tooltip = "Snap note starts to nearest stretch markers,\npreserving note lengths. No overlap on same pitch.\nSelect 2 items: MIDI + audio with stretch markers."
+        end
+    end
+    end -- end scope: remap + nudge buttons drawing
+
+    -- INSERT AT MOUSE section rows
+    do
+    local function draw_iam_cb(row_y, label, checked)
+        if not is_row_visible(row_y) then return end
+        local ty = row_y + (checkbox_size - gfx.texth) / 2
+        gfx.set(table.unpack(gui.colors.TEXT))
+        gfx.x = horizontal_margin
+        gfx.y = ty
+        gfx.drawstr(label)
+        local hov = mouse_x >= cb_x and mouse_x < cb_x + checkbox_size and
+                    mouse_y >= row_y and mouse_y < row_y + checkbox_size
+        if checked or hov then
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
+        else
+            gfx.set(table.unpack(gui.colors.CHECKBOX_BG))
+        end
+        gfx.rect(cb_x, row_y, checkbox_size, checkbox_size, 1)
+        gfx.set(table.unpack(gui.colors.CHECKBOX_BORDER))
+        gfx.rect(cb_x, row_y, checkbox_size, checkbox_size, 0)
+        gfx.rect(cb_x + 1, row_y + 1, checkbox_size - 2, checkbox_size - 2, 0)
+        if checked then
+            gfx.set(table.unpack(gui.colors.CHECKMARK))
+            gfx.x = cb_x + (checkbox_size - gfx.measurestr("\xE2\x9C\x93")) / 2
+            gfx.y = ty
+            gfx.drawstr("\xE2\x9C\x93")
+        end
+    end
+    draw_iam_cb(iam_stretch_row_y, "Insert: Stretch markers (audio)", iam_enable_stretch)
+    draw_iam_cb(iam_take_tm_row_y, "Insert: Take markers (MIDI)",     iam_enable_take_tm)
+    draw_iam_cb(iam_tempo_row_y,   "Insert: Tempo markers (ruler)",   iam_enable_tempo)
+    end -- end INSERT AT MOUSE rows
 
     -- Separator line
     gfx.set(0.3, 0.3, 0.3, 1)
     gfx.line(horizontal_margin, separator_y, gfx.w - horizontal_margin, separator_y)
 
+    do -- scope: column headers + articulation rows drawing (free locals)
     -- Column headers
     gfx.set(0.5, 0.5, 0.5, 1)
     local function draw_col_header(x, w, label)
@@ -9159,8 +16432,8 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             end
 
             -- 5) Draw prefix checkbox (checked = uses _ prefix = no_prefix is false)
-            local pfx_checked = not get_art_no_prefix(art_name)
-            local pfx_is_override = (articulation_no_prefix_override[art_name] ~= nil)
+            pfx_checked = not get_art_no_prefix(art_name)
+            pfx_is_override = (articulation_no_prefix_override[art_name] ~= nil)
             if pfx_checked then
                 gfx.set(table.unpack(gui.colors.CHECKBOX_BG_HOVER))
             else
@@ -9192,14 +16465,17 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
             draw_menu_flag_cb(menu_cb_x, row_y, settings_menu_flags[art_name])
         end
     end
+    end -- end scope: column headers + articulation rows drawing
 
     -- Masking rectangles (cover content overflow into header and button areas)
-    local clear_r = (gfx.clear & 0xFF) / 255
-    local clear_g = ((gfx.clear >> 8) & 0xFF) / 255
-    local clear_b = ((gfx.clear >> 16) & 0xFF) / 255
-    gfx.set(clear_r, clear_g, clear_b, 1)
+    do
+    local cr = (gfx.clear & 0xFF) / 255
+    local cg = ((gfx.clear >> 8) & 0xFF) / 255
+    local cb_c = ((gfx.clear >> 16) & 0xFF) / 255
+    gfx.set(cr, cg, cb_c, 1)
     gfx.rect(0, 0, gfx.w, content_top, 1)
     gfx.rect(0, content_bottom, gfx.w, gfx.h - content_bottom, 1)
+    end
 
     -- Re-draw header on top of mask
     draw_header("SETTINGS", header_height, gui.colors)
@@ -9244,8 +16520,12 @@ function draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, scr
     draw_and_handle_gui_msgbox(mouse_x, mouse_y, mouse_clicked, char_input)
 
     -- Draw tooltip (on top of everything)
-    if not dark_menu.active and not gui_msgbox.active then
-        draw_tooltip(settings_tooltip_text, mouse_x, mouse_y)
+    if not dark_menu.active and not gui_msgbox.active and tips_enabled then
+        if settings_tooltip_text then
+            draw_tooltip(settings_tooltip_text, mouse_x, mouse_y)
+        elseif pending_tooltip then
+            draw_tooltip(pending_tooltip, mouse_x, mouse_y)
+        end
     end
 end
 
@@ -9319,6 +16599,28 @@ function main_loop()
         draw_settings_view(mouse_x, mouse_y, mouse_clicked, mouse_released, screen_x, screen_y, mouse_down, char_input)
         -- Resize handle (drawn on top)
         draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released, mouse_down, screen_x, screen_y)
+        -- Draw import progress overlay (on top of everything)
+        if import_progress.active then
+            draw_import_progress()
+            if import_progress.done then
+                local card_w = math.max(300, math.floor(gfx.w * 0.7))
+                local log_lines = math.min(#import_progress.log, 8)
+                local extra = (#import_progress.log > 8) and 1 or 0
+                local card_h = math.max(120, 16 + gfx.texth + 10 + (log_lines + extra) * gfx.texth + 12 + 26 + 16)
+                local card_x = math.floor((gfx.w - card_w) / 2)
+                local card_y = math.floor((gfx.h - card_h) / 2)
+                local btn_x = card_x + 16
+                local btn_y = card_y + card_h - 16 - 26
+                local hov = mouse_x >= btn_x and mouse_x < btn_x + 80 and mouse_y >= btn_y and mouse_y < btn_y + 26
+                if (mouse_clicked and hov) or char_input == 13 or char_input == 27 then
+                    import_progress.active = false
+                    save_window_position()
+                    save_window_size("settings")
+                    gfx.quit()
+                    return
+                end
+            end
+        end
         gfx.update()
         last_mouse_cap = gfx.mouse_cap
         if char >= 0 then
@@ -9334,10 +16636,19 @@ function main_loop()
     -- Handle dropped files (drag-and-drop from Explorer / Flow Launcher / etc.)
     local char = gfx.getchar()
     local char_input = (char > 0) and char or nil
+
+    -- Auto-load by region: check if cursor moved to a new region
+    try_autoload_by_region()
+
+    -- MIDI Stretch Markers: detect moved take markers and stretch notes
+    if midi_sm_enabled then check_midi_sm_changes() end
+
     local retval, drop_file = gfx.getdropfile(0)
     if retval > 0 and drop_file and drop_file ~= "" then
         gfx.getdropfile(-1)  -- clear the drop list
         if drop_file:lower():match("%.xml$") then
+            autoload_region_start_pos = nil  -- manual selection clears auto-load override
+            autoload_last_region_name = nil
             selected_file_path = drop_file
             selected_file_name = get_filename_from_path(drop_file)
             save_last_import_path(drop_file)
@@ -9412,10 +16723,91 @@ function main_loop()
         local new_y = math.floor(screen_y - drag_offset_y)
         reaper.JS_Window_Move(window_script, new_x, new_y)
     end
-    
+
+    -- Track drag-to-arrange: confirm drag after threshold, import and hand off to arrange
+    if track_drag.active and mouse_down then
+        local dx = math.abs(mouse_x - track_drag.start_x)
+        local dy = math.abs(mouse_y - track_drag.start_y)
+        if not track_drag.confirmed and (dx > DRAG_THRESHOLD or dy > DRAG_THRESHOLD) then
+            is_dragging = false
+            -- Import the track immediately and hand off drag to REAPER arrange view
+            do
+                local tcb = track_checkboxes[track_drag.track_index]
+                if tcb and selected_file_path then
+                    local track_name = get_track_display_name(tcb)
+                    local saved_autoload = autoload_region_start_pos
+                    local import_pos = reaper.GetCursorPosition()
+                    autoload_region_start_pos = import_pos
+                    -- Count items on all tracks before import so we can find the new one
+                    local items_before = reaper.CountMediaItems(0)
+                    local options = {
+                        import_markers = false,
+                        import_regions = false,
+                        import_midi_banks = checkboxes_list[3].checked,
+                        import_key_sigs = false,
+                        insert_on_new_tracks = false,
+                        insert_on_existing_tracks = false,
+                        insert_on_tracks_by_name = true,
+                        selected_tracks = { track_name }
+                    }
+                    local pre_import_state = capture_pre_import_state()
+                    ImportMusicXMLWithOptions(selected_file_path, options)
+                    capture_post_import_history(pre_import_state, selected_file_path)
+                    autoload_region_start_pos = saved_autoload
+                    -- Find newly created item(s) by comparing item count
+                    local items_after = reaper.CountMediaItems(0)
+                    local new_item = nil
+                    if items_after > items_before then
+                        -- Deselect all items, then select only the new one(s)
+                        for i = 0, items_after - 1 do
+                            reaper.SetMediaItemSelected(reaper.GetMediaItem(0, i), false)
+                        end
+                        -- The new items are at the end of the item list
+                        for i = items_before, items_after - 1 do
+                            local item = reaper.GetMediaItem(0, i)
+                            if item then
+                                reaper.SetMediaItemSelected(item, true)
+                                if not new_item then new_item = item end
+                            end
+                        end
+                        reaper.UpdateArrange()
+                    end
+                    -- Move mouse to the new item's center and hand off drag
+                    if new_item then
+                        local item_pos = reaper.GetMediaItemInfo_Value(new_item, "D_POSITION")
+                        local item_len = reaper.GetMediaItemInfo_Value(new_item, "D_LENGTH")
+                        local item_track = reaper.GetMediaItem_Track(new_item)
+                        local main_hwnd = reaper.GetMainHwnd()
+                        local arrange_hwnd = reaper.JS_Window_FindChildByID(main_hwnd, 1000)
+                        if arrange_hwnd then
+                            local start_time, end_time = reaper.GetSet_ArrangeView2(0, false, 0, 0)
+                            local _, arr_l, arr_t, arr_r = reaper.JS_Window_GetClientRect(arrange_hwnd)
+                            local arr_w = arr_r - arr_l
+                            local zoom = arr_w / (end_time - start_time)
+                            local item_cx = math.floor((item_pos + item_len / 2 - start_time) * zoom)
+                            local track_y = reaper.GetMediaTrackInfo_Value(item_track, "I_TCPY")
+                            local track_h = reaper.GetMediaTrackInfo_Value(item_track, "I_TCPH")
+                            local item_cy = math.floor(track_y + track_h / 2)
+                            -- Move mouse to item center in arrange view
+                            reaper.JS_Mouse_SetPosition(arr_l + item_cx, arr_t + item_cy)
+                            -- Hand off drag to REAPER: simulate mouse-down on item
+                            reaper.JS_WindowMessage_Post(arrange_hwnd, "WM_LBUTTONDOWN", 1, 0, item_cx, item_cy)
+                        end
+                    end
+                end
+            end
+            reset_track_drag()
+        end
+    end
+
     -- Handle drag end
     if mouse_released then
         is_dragging = false
+
+        -- Track drag: reset if released without confirming (click without movement)
+        if track_drag.active then
+            reset_track_drag()
+        end
         
         -- File info click: open dialog only if no significant drag occurred
         if file_info_click_pending then
@@ -9445,6 +16837,8 @@ function main_loop()
                     reaper.JS_Window_SetZOrder(window_script, "TOPMOST")
                 end
                 if retval then
+                    autoload_region_start_pos = nil  -- manual selection clears auto-load override
+                    autoload_last_region_name = nil
                     selected_file_path = filepath
                     selected_file_name = get_filename_from_path(filepath)
                     save_last_import_path(filepath)
@@ -9477,11 +16871,11 @@ function main_loop()
         end
     end
 
-    -- Button area - bottom with four buttons side by side
+    -- Button area - bottom with five buttons side by side
     local btn_height = 30
     local btn_spacing = 10
-    local btn_width = math.min(110, math.max(40, math.floor((gfx.w - horizontal_margin * 2 - btn_spacing * 3) / 4)))
-    local total_btn_width = btn_width * 4 + btn_spacing * 3
+    local btn_width = math.min(110, math.max(40, math.floor((gfx.w - horizontal_margin * 2 - btn_spacing * 4) / 5)))
+    local total_btn_width = btn_width * 5 + btn_spacing * 4
     local btn_y = gfx.h - btn_height - 10
     local btn_start_x = math.floor((gfx.w - total_btn_width) / 2)
     
@@ -9493,8 +16887,12 @@ function main_loop()
     local export_btn_x = import_btn_x + btn_width + btn_spacing
     local export_btn_y = btn_y
     
+    -- Undo button
+    local undo_btn_x = export_btn_x + btn_width + btn_spacing
+    local undo_btn_y = btn_y
+    
     -- Settings button
-    local settings_btn_x = export_btn_x + btn_width + btn_spacing
+    local settings_btn_x = undo_btn_x + btn_width + btn_spacing
     local settings_btn_y = btn_y
     
     -- Cancel button
@@ -9502,11 +16900,13 @@ function main_loop()
     local cancel_btn_y = btn_y
     
     -- File info area for clicking to select file
-    local visible_checkboxes = 0
-    for _, cb in ipairs(checkboxes_list) do
-        if cb.show_in_menu ~= false then visible_checkboxes = visible_checkboxes + 1 end
+    local visible_checkboxes = 1  -- SETTINGS fold header row (always visible)
+    if not main_settings_folded then
+        for _, cb in ipairs(checkboxes_list) do
+            if cb.show_in_menu ~= false then visible_checkboxes = visible_checkboxes + 1 end
+        end
+        visible_checkboxes = visible_checkboxes + #get_visible_extra_settings()
     end
-    visible_checkboxes = visible_checkboxes + #get_visible_extra_settings()
     
     -- Compute main settings scroll state
     local settings_area_top = header_height + vertical_margin
@@ -9530,6 +16930,14 @@ function main_loop()
     end
     local file_info_hovered = (mouse_x > 0 and mouse_x < gfx.w and
                                mouse_y > file_info_y and mouse_y < file_info_y + file_info_height)
+    -- File info tooltip
+    if file_info_hovered and not pending_tooltip then
+        if selected_file_path then
+            pending_tooltip = "Click to browse for a different MusicXML file.\nOr drag and drop a file here."
+        else
+            pending_tooltip = "Click to browse for a MusicXML file.\nOr drag and drop a file here."
+        end
+    end
 
     -- Detect external drag-over: mouse is inside the window with left button held
     -- externally (Explorer drag) but gfx.mouse_cap doesn't see it
@@ -9543,9 +16951,10 @@ function main_loop()
     local is_drag_over_file_info = is_external_drag and file_info_hovered
 
     -- Handle clicks
-    if mouse_clicked and not dark_menu.active and not gui_msgbox.active then
+    if mouse_clicked and not dark_menu.active and not gui_msgbox.active and not import_progress.active then
         -- Cancel button
         if cancel_btn_hovered then
+            reset_track_drag()
             save_window_position()
             save_window_size(settings_mode and "settings" or "main")
             gfx.quit()
@@ -9578,13 +16987,27 @@ function main_loop()
                     insert_on_new_tracks = checkboxes_list[5].checked,
                     insert_on_existing_tracks = checkboxes_list[6].checked,
                     insert_on_tracks_by_name = checkboxes_list[7].checked,
+                    align_to_audio = (import_timebase_index == 6),
+                    align_notes_to_transients = checkboxes_list[8].checked,
+                    tempo_map_freq = tempo_map_freq_index,
                     selected_tracks = selected_tracks
                 }
                 -- Execute import with selected options
+                import_progress.active = true
+                import_progress.pct = 0
+                import_progress.status = "Starting..."
+                import_progress.start_time = reaper.time_precise()
+                import_progress.log = {}
+                import_progress.done = false
+                update_import_progress(0, "Parsing MusicXML...")
+                local pre_import_state = capture_pre_import_state()
+                autoload_region_start_pos = nil  -- manual import: honour import_position_index, not autoload override
                 ImportMusicXMLWithOptions(selected_file_path, options)
-                save_window_position()
-                save_window_size("main")
-                gfx.quit()
+                capture_post_import_history(pre_import_state, selected_file_path)
+                import_progress.done = true
+                import_progress.end_time = reaper.time_precise()
+                import_progress.pct = 1
+                update_import_progress(1, "Done")
             else
                 safe_msgbox("Please select a MusicXML file first.", "No File Selected", 0)
             end
@@ -9624,6 +17047,68 @@ function main_loop()
                 end
             else
                 safe_msgbox("Please select one or more MIDI items to export.", "No Items Selected", 0)
+            end
+        end
+
+        -- Undo button
+        if undo_btn_hovered then
+            if #import_history == 0 then
+                safe_msgbox("No import history to undo.", "Nothing to Undo", 0)
+            else
+                -- Build menu of import history entries
+                local menu_str = ""
+                for i = #import_history, 1, -1 do
+                    local entry = import_history[i]
+                    if i < #import_history then menu_str = menu_str .. "|" end
+                    local label = entry.label or ("Import #" .. i)
+                    menu_str = menu_str .. label
+                end
+                open_dark_menu(menu_str, undo_btn_x, undo_btn_y, function(choice)
+                    if choice > 0 then
+                        local actual_idx = #import_history - choice + 1
+                        local entry = import_history[actual_idx]
+                        if entry then
+                            reaper.Undo_BeginBlock()
+                            reaper.PreventUIRefresh(1)
+                            -- Delete created items
+                            if entry.item_guids then
+                                for _, guid in ipairs(entry.item_guids) do
+                                    local item = reaper.BR_GetMediaItemByGUID(0, guid)
+                                    if item then
+                                        local track = reaper.GetMediaItemTrack(item)
+                                        reaper.DeleteTrackMediaItem(track, item)
+                                    end
+                                end
+                            end
+                            -- Delete created tracks (in reverse to preserve indices)
+                            if entry.track_guids then
+                                for i = #entry.track_guids, 1, -1 do
+                                    local track = reaper.BR_GetMediaTrackByGUID(0, entry.track_guids[i])
+                                    if track then
+                                        reaper.DeleteTrack(track)
+                                    end
+                                end
+                            end
+                            -- Delete created regions
+                            if entry.region_indices then
+                                for i = #entry.region_indices, 1, -1 do
+                                    reaper.DeleteProjectMarker(0, entry.region_indices[i], true)
+                                end
+                            end
+                            -- Delete tempo markers
+                            if entry.tempo_marker_indices then
+                                for i = #entry.tempo_marker_indices, 1, -1 do
+                                    reaper.DeleteTempoTimeSigMarker(0, entry.tempo_marker_indices[i])
+                                end
+                            end
+                            reaper.UpdateTimeline()
+                            reaper.PreventUIRefresh(-1)
+                            reaper.Undo_EndBlock("Undo MusicXML Import: " .. (entry.label or ""), -1)
+                            table.remove(import_history, actual_idx)
+                            save_import_history()
+                        end
+                    end
+                end)
             end
         end
 
@@ -9688,8 +17173,27 @@ function main_loop()
             end
         end
 
-        -- Checkboxes (vertical layout - aligned, filtered by show_in_menu)
+        -- Fold header click (row 0)
         local vis_idx = 0
+        local main_click_handled = false
+        local extras = get_visible_extra_settings()
+        local main_clicked_sym_box = false
+        local main_clicked_defpath_box = false
+        do
+            local hdr_scrolled = vis_idx - main_scroll_offset
+            local hdr_y = header_height + vertical_margin + hdr_scrolled * checkbox_row_height
+            if hdr_scrolled >= 0 and (not main_needs_scroll or hdr_scrolled < main_display_rows) and
+               mouse_y >= hdr_y and mouse_y < hdr_y + checkbox_row_height and
+               mouse_x >= horizontal_margin and mouse_x < gfx.w - horizontal_margin then
+                main_settings_folded = not main_settings_folded
+                save_fold_state()
+                main_click_handled = true
+            end
+            vis_idx = vis_idx + 1
+        end
+
+        -- Checkboxes (vertical layout - aligned, filtered by show_in_menu)
+        if not main_settings_folded and not main_click_handled then
         for i, cb in ipairs(checkboxes_list) do
             if cb.show_in_menu ~= false then
                 local scrolled_i = vis_idx - main_scroll_offset
@@ -9710,16 +17214,16 @@ function main_loop()
                         -- Regular toggle for other options
                         checkboxes_list[i].checked = not checkboxes_list[i].checked
                     end
+                    main_click_handled = true
                     break
                 end
                 vis_idx = vis_idx + 1
             end
         end
+        end -- end if not folded and not clicked
 
         -- Extra settings (from M flags) - full-featured for articulations
-        local extras = get_visible_extra_settings()
-        local main_clicked_sym_box = false
-        local main_clicked_defpath_box = false
+        if not main_settings_folded and not main_click_handled then
         for j, item in ipairs(extras) do
             local scrolled_j = vis_idx - main_scroll_offset
             local cb_y = header_height + vertical_margin + scrolled_j * checkbox_row_height
@@ -9957,19 +17461,19 @@ function main_loop()
                 local mk = item.key
                 local cb_x = gfx.w - horizontal_margin - checkbox_size
 
-                if mk == "docker" or mk == "font" or mk == "midibank" then
+                if mk == "docker" or mk == "font" or mk == "midibank" or mk == "importpos" or mk == "timebase" or mk == "alignstem" or mk == "onsetitem" or mk == "tempofreq" or mk == "detectmethod" or mk == "detectitem" then
                     -- Calculate button bounds (same as drawing)
                     local lbl_w = gfx.measurestr(item.label .. "  ")
                     local btn_x = horizontal_margin + lbl_w
                     local btn_w
-                    if mk == "font" then
+                    if mk == "font" or mk == "importpos" or mk == "timebase" or mk == "alignstem" or mk == "onsetitem" or mk == "tempofreq" or mk == "detectmethod" or mk == "detectitem" then
                         btn_w = gfx.w - horizontal_margin - btn_x
                     else
                         btn_w = cb_x - COL_SPACING - btn_x
                     end
                     if btn_w < 20 then btn_w = 20 end
                     -- Check checkbox click (docker/midibank only)
-                    if mk ~= "font" and mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
+                    if mk ~= "font" and mk ~= "importpos" and mk ~= "timebase" and mk ~= "alignstem" and mk ~= "onsetitem" and mk ~= "tempofreq" and mk ~= "detectmethod" and mk ~= "detectitem" and mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
                        mouse_y > cb_y and mouse_y < cb_y + checkbox_size then
                         toggle_extra_setting(mk)
                         break
@@ -10003,6 +17507,96 @@ function main_loop()
                                 if choice > 0 then
                                     current_font_index = choice
                                     gfx.setfont(1, font_list[current_font_index], gui.settings.font_size)
+                                end
+                            end)
+                        elseif mk == "importpos" then
+                            local menu_str = ""
+                            for j, v in ipairs(import_position_options) do
+                                if j > 1 then menu_str = menu_str .. "|" end
+                                if j == import_position_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. v
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    import_position_index = choice
+                                end
+                            end)
+                        elseif mk == "timebase" then
+                            local menu_str = ""
+                            for j, v in ipairs(import_timebase_options) do
+                                if j > 1 then menu_str = menu_str .. "|" end
+                                if j == import_timebase_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. v
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    import_timebase_index = choice
+                                end
+                            end)
+                        elseif mk == "alignstem" then
+                            refresh_align_stem_items()
+                            local menu_str = "Auto"
+                            if align_stem_index == 0 then menu_str = "!Auto" end
+                            for j, si in ipairs(align_stem_items) do
+                                menu_str = menu_str .. "|"
+                                if j == align_stem_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. si.name
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    align_stem_index = choice - 1
+                                end
+                            end)
+                        elseif mk == "onsetitem" then
+                            refresh_onset_item_items()
+                            local menu_str = "Auto"
+                            if onset_item_index == 0 then menu_str = "!Auto" end
+                            for j, si in ipairs(onset_item_items) do
+                                menu_str = menu_str .. "|"
+                                if j == onset_item_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. si.name
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    onset_item_index = choice - 1
+                                end
+                            end)
+                        elseif mk == "tempofreq" then
+                            local menu_str = ""
+                            for j, v in ipairs(tempo_map_freq_options) do
+                                if j > 1 then menu_str = menu_str .. "|" end
+                                if j == tempo_map_freq_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. v
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    tempo_map_freq_index = choice
+                                end
+                            end)
+                        elseif mk == "detectmethod" then
+                            local menu_str = ""
+                            for j, v in ipairs(tempo_detect_method_options) do
+                                if j > 1 then menu_str = menu_str .. "|" end
+                                if j == tempo_detect_method_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. v
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    tempo_detect_method_index = choice
+                                end
+                            end)
+                        elseif mk == "detectitem" then
+                            refresh_detect_tempo_items()
+                            local menu_str = "Selected Item"
+                            if detect_tempo_item_index == 0 then menu_str = "!Selected Item" end
+                            for j, si in ipairs(detect_tempo_item_items) do
+                                menu_str = menu_str .. "|"
+                                if j == detect_tempo_item_index then menu_str = menu_str .. "!" end
+                                menu_str = menu_str .. si.name
+                            end
+                            open_dark_menu(menu_str, btn_x, cb_y + checkbox_size, function(choice)
+                                if choice > 0 then
+                                    detect_tempo_item_index = choice - 1
                                 end
                             end)
                         elseif mk == "midibank" then
@@ -10106,6 +17700,7 @@ function main_loop()
             end
             vis_idx = vis_idx + 1
         end
+        end -- end if not main_settings_folded
 
         -- Commit main view symbol edit when clicking outside
         if not main_clicked_sym_box and main_sym_edit_active then
@@ -10151,17 +17746,54 @@ function main_loop()
                     local scrolled_i = i - track_scroll_offset
                     if scrolled_i >= 1 and scrolled_i <= max_visible_tracks then
                         local tcb_y = tracks_area_top + (scrolled_i - 1) * checkbox_row_height
-                        if mouse_x > cb_x and mouse_x < cb_x + checkbox_size and
-                           mouse_y > tcb_y and mouse_y < tcb_y + checkbox_size then
-                            tcb.checked = not tcb.checked
-                            -- Update "Import All" state based on individual checkboxes
-                            local all_checked = true
-                            for _, t in ipairs(track_checkboxes) do
-                                if not t.checked then all_checked = false; break end
+                        if mouse_y > tcb_y and mouse_y < tcb_y + checkbox_size then
+                            if mouse_x > cb_x and mouse_x < cb_x + checkbox_size then
+                                -- Checkbox area: toggle
+                                tcb.checked = not tcb.checked
+                                local all_checked = true
+                                for _, t in ipairs(track_checkboxes) do
+                                    if not t.checked then all_checked = false; break end
+                                end
+                                import_all_checked = all_checked
+                                if highlight_scan_enabled then scan_articulations_in_xml() end
+                                break
+                            elseif mouse_x >= horizontal_margin and mouse_x < cb_x and selected_file_path then
+                                -- Label area: check for double-click → import at edit cursor
+                                local now = os.clock()
+                                if track_drag.last_click_index == i and (now - track_drag.last_click_time) < 0.4 then
+                                    -- Double-click: import this track at edit cursor
+                                    track_drag.last_click_index = nil
+                                    track_drag.last_click_time = 0
+                                    local track_name = get_track_display_name(tcb)
+                                    local saved_autoload = autoload_region_start_pos
+                                    autoload_region_start_pos = reaper.GetCursorPosition()
+                                    local options = {
+                                        import_markers = false,
+                                        import_regions = false,
+                                        import_midi_banks = checkboxes_list[3].checked,
+                                        import_key_sigs = false,
+                                        insert_on_new_tracks = false,
+                                        insert_on_existing_tracks = false,
+                                        insert_on_tracks_by_name = true,
+                                        selected_tracks = { track_name }
+                                    }
+                                    local pre_import_state = capture_pre_import_state()
+                                    ImportMusicXMLWithOptions(selected_file_path, options)
+                                    capture_post_import_history(pre_import_state, selected_file_path)
+                                    autoload_region_start_pos = saved_autoload
+                                    break
+                                else
+                                    -- First click: record for double-click and start drag
+                                    track_drag.last_click_index = i
+                                    track_drag.last_click_time = now
+                                    track_drag.active = true
+                                    track_drag.track_index = i
+                                    track_drag.start_x = mouse_x
+                                    track_drag.start_y = mouse_y
+                                    track_drag.confirmed = false
+                                    break
+                                end
                             end
-                            import_all_checked = all_checked
-                            if highlight_scan_enabled then scan_articulations_in_xml() end
-                            break
                         end
                     end
                 end
@@ -10177,10 +17809,11 @@ function main_loop()
             local mw_handled_scroll = false
             -- Check art row type buttons first (they consume mousewheel too)
             local mw_extras = get_visible_extra_settings()
-            local mw_vis_idx = 0
+            local mw_vis_idx = 1 -- row 0 is fold header
             for _, cb in ipairs(checkboxes_list) do
                 if cb.show_in_menu ~= false then mw_vis_idx = mw_vis_idx + 1 end
             end
+            if not main_settings_folded then
             for _, mw_item in ipairs(mw_extras) do
                 local mw_scrolled = mw_vis_idx - main_scroll_offset
                 local mw_cb_y = header_height + vertical_margin + mw_scrolled * checkbox_row_height
@@ -10195,11 +17828,11 @@ function main_loop()
                     end
                 end
                 if mw_scrolled >= 0 and mw_scrolled < main_display_rows and
-                   (mw_item.key == "docker" or mw_item.key == "font") then
+                   (mw_item.key == "docker" or mw_item.key == "font" or mw_item.key == "importpos" or mw_item.key == "timebase" or mw_item.key == "alignstem" or mw_item.key == "onsetitem" or mw_item.key == "tempofreq" or mw_item.key == "detectmethod" or mw_item.key == "detectitem") then
                     local lbl_w = gfx.measurestr(mw_item.label .. "  ")
                     local btn_x = horizontal_margin + lbl_w
                     local m_cb_x = gfx.w - horizontal_margin - checkbox_size
-                    local btn_w = (mw_item.key == "font") and (gfx.w - horizontal_margin - btn_x) or (m_cb_x - COL_SPACING - btn_x)
+                    local btn_w = (mw_item.key == "font" or mw_item.key == "importpos" or mw_item.key == "timebase" or mw_item.key == "alignstem" or mw_item.key == "onsetitem" or mw_item.key == "tempofreq" or mw_item.key == "detectmethod" or mw_item.key == "detectitem") and (gfx.w - horizontal_margin - btn_x) or (m_cb_x - COL_SPACING - btn_x)
                     if btn_w < 20 then btn_w = 20 end
                     if mouse_x >= btn_x and mouse_x < btn_x + btn_w and
                        mouse_y >= mw_cb_y and mouse_y < mw_cb_y + checkbox_size then
@@ -10208,6 +17841,7 @@ function main_loop()
                 end
                 mw_vis_idx = mw_vis_idx + 1
             end
+            end -- end if not main_settings_folded
             if not mw_handled_scroll then
                 local scroll_delta = -math.floor(gfx.mouse_wheel / 120)
                 main_scroll_offset = main_scroll_offset + scroll_delta
@@ -10221,11 +17855,12 @@ function main_loop()
     -- Handle mousewheel for type buttons on art rows in main view
     if gfx.mouse_wheel ~= 0 and not dark_menu.active and not gui_msgbox.active then
         local mw_extras = get_visible_extra_settings()
-        local mw_vis_idx = 0
+        local mw_vis_idx = 1 -- row 0 is fold header
         for _, cb in ipairs(checkboxes_list) do
             if cb.show_in_menu ~= false then mw_vis_idx = mw_vis_idx + 1 end
         end
         local mw_handled = false
+        if not main_settings_folded then
         for _, mw_item in ipairs(mw_extras) do
             local mw_scrolled = mw_vis_idx - main_scroll_offset
             local mw_cb_y = header_height + vertical_margin + mw_scrolled * checkbox_row_height
@@ -10255,12 +17890,12 @@ function main_loop()
                     break
                 end
             elseif mw_scrolled >= 0 and (not main_needs_scroll or mw_scrolled < main_display_rows) and
-                   (mw_item.key == "docker" or mw_item.key == "font") then
+                   (mw_item.key == "docker" or mw_item.key == "font" or mw_item.key == "importpos" or mw_item.key == "timebase" or mw_item.key == "alignstem" or mw_item.key == "onsetitem" or mw_item.key == "tempofreq" or mw_item.key == "detectmethod" or mw_item.key == "detectitem") then
                 local lbl_w = gfx.measurestr(mw_item.label .. "  ")
                 local btn_x = horizontal_margin + lbl_w
                 local m_cb_x = gfx.w - horizontal_margin - checkbox_size
                 local btn_w
-                if mw_item.key == "font" then
+                if mw_item.key == "font" or mw_item.key == "importpos" or mw_item.key == "timebase" or mw_item.key == "alignstem" or mw_item.key == "onsetitem" or mw_item.key == "tempofreq" or mw_item.key == "detectmethod" or mw_item.key == "detectitem" then
                     btn_w = gfx.w - horizontal_margin - btn_x
                 else
                     btn_w = m_cb_x - COL_SPACING - btn_x
@@ -10276,6 +17911,39 @@ function main_loop()
                         if docker_enabled then
                             gfx.dock(docker_dock_values[docker_position] or 1)
                         end
+                    elseif mw_item.key == "importpos" then
+                        import_position_index = import_position_index + delta
+                        if import_position_index < 1 then import_position_index = #import_position_options end
+                        if import_position_index > #import_position_options then import_position_index = 1 end
+                    elseif mw_item.key == "timebase" then
+                        import_timebase_index = import_timebase_index + delta
+                        if import_timebase_index < 1 then import_timebase_index = #import_timebase_options end
+                        if import_timebase_index > #import_timebase_options then import_timebase_index = 1 end
+                    elseif mw_item.key == "alignstem" then
+                        refresh_align_stem_items()
+                        local max_idx = #align_stem_items
+                        align_stem_index = align_stem_index + delta
+                        if align_stem_index < 0 then align_stem_index = max_idx end
+                        if align_stem_index > max_idx then align_stem_index = 0 end
+                    elseif mw_item.key == "onsetitem" then
+                        refresh_onset_item_items()
+                        local max_idx = #onset_item_items
+                        onset_item_index = onset_item_index + delta
+                        if onset_item_index < 0 then onset_item_index = max_idx end
+                        if onset_item_index > max_idx then onset_item_index = 0 end
+                    elseif mw_item.key == "tempofreq" then
+                        tempo_map_freq_index = tempo_map_freq_index + delta
+                        if tempo_map_freq_index < 1 then tempo_map_freq_index = #tempo_map_freq_options end
+                        if tempo_map_freq_index > #tempo_map_freq_options then tempo_map_freq_index = 1 end
+                    elseif mw_item.key == "detectmethod" then
+                        tempo_detect_method_index = tempo_detect_method_index + delta
+                        if tempo_detect_method_index < 1 then tempo_detect_method_index = #tempo_detect_method_options end
+                        if tempo_detect_method_index > #tempo_detect_method_options then tempo_detect_method_index = 1 end
+                    elseif mw_item.key == "detectitem" then
+                        refresh_detect_tempo_items()
+                        detect_tempo_item_index = detect_tempo_item_index + delta
+                        if detect_tempo_item_index < 0 then detect_tempo_item_index = #detect_tempo_item_items end
+                        if detect_tempo_item_index > #detect_tempo_item_items then detect_tempo_item_index = 0 end
                     else
                         current_font_index = current_font_index + delta
                         if current_font_index < 1 then current_font_index = #font_list end
@@ -10288,6 +17956,8 @@ function main_loop()
             end
             mw_vis_idx = mw_vis_idx + 1
         end
+        end -- end if not main_settings_folded
+
         if mw_handled then gfx.mouse_wheel = 0 end
     end
 
@@ -10314,10 +17984,25 @@ function main_loop()
                           mouse_y > import_btn_y and mouse_y < import_btn_y + btn_height)
     export_btn_hovered = (mouse_x > export_btn_x and mouse_x < export_btn_x + btn_width and
                           mouse_y > export_btn_y and mouse_y < export_btn_y + btn_height)
+    undo_btn_hovered = (mouse_x > undo_btn_x and mouse_x < undo_btn_x + btn_width and
+                        mouse_y > undo_btn_y and mouse_y < undo_btn_y + btn_height)
     settings_btn_hovered = (mouse_x > settings_btn_x and mouse_x < settings_btn_x + btn_width and
                             mouse_y > settings_btn_y and mouse_y < settings_btn_y + btn_height)
     cancel_btn_hovered = (mouse_x > cancel_btn_x and mouse_x < cancel_btn_x + btn_width and
                           mouse_y > cancel_btn_y and mouse_y < cancel_btn_y + btn_height)
+    
+    -- Button tooltips
+    if import_btn_hovered then
+        pending_tooltip = "Import the selected MusicXML file\ninto the project using current settings."
+    elseif export_btn_hovered then
+        pending_tooltip = "Export selected MIDI items to\na MusicXML file."
+    elseif undo_btn_hovered then
+        pending_tooltip = "Undo the last import operation\n(removes imported items, tempo, and regions)."
+    elseif settings_btn_hovered then
+        pending_tooltip = "Open settings to configure import/export\noptions, articulations, and preferences."
+    elseif cancel_btn_hovered then
+        pending_tooltip = "Close the script window."
+    end
     
     -- Periodic MIDI articulation scan (when art rows visible in main view)
     local main_extras = get_visible_extra_settings()
@@ -10404,6 +18089,16 @@ function main_loop()
             local scrolled_i = i - track_scroll_offset
             if scrolled_i >= 1 and scrolled_i <= max_visible_tracks then
                 local tcb_y = tracks_area_top + (scrolled_i - 1) * checkbox_row_height
+                -- Hover highlight on label area (draggable indicator)
+                if not track_drag.active and selected_file_path
+                       and mouse_x >= horizontal_margin and mouse_x < cb_x
+                       and mouse_y >= tcb_y and mouse_y < tcb_y + checkbox_size then
+                    gfx.set(0.17, 0.45, 0.39, 0.12)
+                    gfx.rect(horizontal_margin, tcb_y, cb_x - horizontal_margin, checkbox_size, 1)
+                    if not pending_tooltip then
+                        pending_tooltip = "Drag to arrange view or double-click to import at edit cursor"
+                    end
+                end
                 draw_checkbox(cb_x, tcb_y, checkbox_size, horizontal_margin,
                               get_track_display_name(tcb), tcb.checked, gui.colors, trunc_w, "track_" .. i)
             end
@@ -10425,12 +18120,14 @@ function main_loop()
             gfx.rect(scrollbar_x, thumb_y, scrollbar_width, thumb_height, 1)
         end
     end
-    
-    -- Draw buttons (Import, Export, Settings, and Cancel)
+
+    -- Draw buttons (Import, Export, Undo, Settings, and Cancel)
     draw_button(import_btn_x, import_btn_y, btn_width, btn_height, "Import",
                 import_btn_hovered, "IMPORT_BTN", gui.colors.BORDER, gui.colors.TEXT)
     draw_button(export_btn_x, export_btn_y, btn_width, btn_height, "Export",
                 export_btn_hovered, "BTN", gui.colors.BORDER, gui.colors.TEXT)
+    draw_button(undo_btn_x, undo_btn_y, btn_width, btn_height, "Undo",
+                undo_btn_hovered, "BTN", gui.colors.BORDER, gui.colors.TEXT)
     draw_button(settings_btn_x, settings_btn_y, btn_width, btn_height, "Settings",
                 settings_btn_hovered, "BTN", gui.colors.BORDER, gui.colors.TEXT)
     draw_button(cancel_btn_x, cancel_btn_y, btn_width, btn_height, "Cancel",
@@ -10585,8 +18282,32 @@ function main_loop()
     draw_and_handle_resize(mouse_x, mouse_y, mouse_clicked, mouse_released, mouse_down, screen_x, screen_y)
 
     -- Draw tooltip (on top of everything, before update)
-    if pending_tooltip and not dark_menu.active and not gui_msgbox.active then
+    if pending_tooltip and tips_enabled and not dark_menu.active and not gui_msgbox.active then
         draw_tooltip(pending_tooltip, mouse_x, mouse_y)
+    end
+
+    -- Draw import progress overlay (on top of everything)
+    if import_progress.active then
+        draw_import_progress()
+        -- Handle dismiss
+        if import_progress.done then
+            local card_w = math.max(300, math.floor(gfx.w * 0.7))
+            local log_lines = math.min(#import_progress.log, 8)
+            local extra = (#import_progress.log > 8) and 1 or 0
+            local card_h = math.max(120, 16 + gfx.texth + 10 + (log_lines + extra) * gfx.texth + 12 + 26 + 16)
+            local card_x = math.floor((gfx.w - card_w) / 2)
+            local card_y = math.floor((gfx.h - card_h) / 2)
+            local btn_x = card_x + 16
+            local btn_y = card_y + card_h - 16 - 26
+            local hov = mouse_x >= btn_x and mouse_x < btn_x + 80 and mouse_y >= btn_y and mouse_y < btn_y + 26
+            if (mouse_clicked and hov) or char_input == 13 or char_input == 27 then
+                import_progress.active = false
+                save_window_position()
+                save_window_size(settings_mode and "settings" or "main")
+                gfx.quit()
+                return
+            end
+        end
     end
 
     gfx.update()
@@ -10600,6 +18321,7 @@ function main_loop()
     if char >= 0 then
         reaper.defer(main_loop)
     else
+        reset_track_drag()
         save_window_position()
         save_window_size("main")
         gfx.quit()
