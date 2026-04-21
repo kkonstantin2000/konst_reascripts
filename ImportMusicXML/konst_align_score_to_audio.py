@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# @version 1.5.0
+# @description Score-to-audio alignment helper for konst_Import MusicXML
+# @author kkonstantin2000
 """
 konst_align_score_to_audio.py — Align MusicXML score to audio.
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# @version 1.5.0
+# @description Transient detection helper for konst_Import MusicXML
+# @author kkonstantin2000
 """
 konst_transient_detect.py — High-precision transient detection for drum audio.
 
